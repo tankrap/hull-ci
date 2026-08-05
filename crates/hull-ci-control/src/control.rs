@@ -29,7 +29,7 @@ use crate::callback::{deliver, CallbackRequest, CallbackTransport, Delivery, Ret
 use crate::ids::new_step_id;
 use crate::model::{Job, JobId, JobState, Step, StepId, StepSpec, StepState};
 use crate::seams::{
-    Fetcher, FetchRequest, Membership, NodeError, NodeSink, Planner,
+    Fetcher, FetchRequest, Membership, NodeError, NodeSink, Planner, VerifiedTree,
 };
 use crate::store::{Admit, JobStore};
 use crate::timeouts::{expiry_verdict, next_step_deadline, sweep, Expiry, Timeouts};
@@ -281,7 +281,9 @@ impl Control {
 
     // ── Phases ───────────────────────────────────────────────────────────────────────────────────
 
-    async fn phase_fetch(&self, job_id: &str, dispatch: &Dispatch) -> Result<(), Verdict> {
+    /// Materialize the dispatched tree, and answer with *where the broker put it* — the value every
+    /// later phase needs and only this one can produce (see [`VerifiedTree`]).
+    async fn phase_fetch(&self, job_id: &str, dispatch: &Dispatch) -> Result<VerifiedTree, Verdict> {
         self.set_state(job_id, JobState::Fetching);
         let req = FetchRequest {
             tenant: dispatch.tenant().to_string(),
@@ -289,20 +291,34 @@ impl Control {
             source_url: dispatch.source_url.clone(),
             fetch_token: dispatch.fetch_token.clone(),
         };
-        match tokio::time::timeout(self.config.timeouts.fetch, self.deps.fetcher.fetch(&req)).await {
-            Err(_elapsed) => Err(expiry_verdict(Expiry::Fetch, self.config.timeouts.fetch)),
+        let tree = match tokio::time::timeout(self.config.timeouts.fetch, self.deps.fetcher.fetch(&req)).await {
+            Err(_elapsed) => return Err(expiry_verdict(Expiry::Fetch, self.config.timeouts.fetch)),
             // The source never arrived, so we know nothing about the code: `errored`, not `red`.
-            Ok(Err(e)) => Err(Verdict::errored(
+            Ok(Err(e)) => {
+                return Err(Verdict::errored(
+                    Reason::Infra,
+                    sanitize_summary(&format!("could not fetch the source tree: {e}"), SUMMARY_MAX_CHARS),
+                ))
+            }
+            Ok(Ok(tree)) => tree,
+        };
+
+        // A broker that answered with a *different* tree than the one dispatched would send every
+        // downstream decision — the plan, the steps, Hull's memo keyed by `tree_id` — off the tree
+        // under test. Cheap to check here, and the only place both ids are in hand.
+        if !tree.tree_id.eq_ignore_ascii_case(dispatch.tree_id.trim()) {
+            tracing::error!(job_id, dispatched = %dispatch.tree_id, materialized = %tree.tree_id, "broker returned a different tree");
+            return Err(Verdict::errored(
                 Reason::Infra,
-                sanitize_summary(&format!("could not fetch the source tree: {e}"), SUMMARY_MAX_CHARS),
-            )),
-            Ok(Ok(())) => Ok(()),
+                "the fetch broker materialized a different tree than the one dispatched",
+            ));
         }
+        Ok(tree)
     }
 
-    async fn phase_plan(&self, job_id: &str, dispatch: &Dispatch) -> Result<Vec<StepSpec>, Verdict> {
+    async fn phase_plan(&self, job_id: &str, tree: &VerifiedTree) -> Result<Vec<StepSpec>, Verdict> {
         self.set_state(job_id, JobState::Planning);
-        match self.deps.planner.plan(&dispatch.tree_id).await {
+        match self.deps.planner.plan(tree).await {
             Ok(specs) if specs.is_empty() => {
                 // "Nothing detectable to run" — design D§4.4. `fold` owns the wording so there is
                 // one no_tests message in the system.
@@ -316,7 +332,13 @@ impl Control {
         }
     }
 
-    async fn phase_run(&self, job_id: &str, dispatch: &Dispatch, specs: Vec<StepSpec>) {
+    async fn phase_run(
+        &self,
+        job_id: &str,
+        dispatch: &Dispatch,
+        tree: &VerifiedTree,
+        specs: Vec<StepSpec>,
+    ) {
         let now = Instant::now();
         self.with_job_mut(job_id, |job| {
             let _ = job.transition(JobState::Running);
@@ -330,7 +352,7 @@ impl Control {
             }
         });
 
-        self.schedule_ready(job_id, dispatch);
+        self.schedule_ready(job_id, dispatch, tree);
         let notify = self.waker(job_id);
 
         enum Next {
@@ -391,7 +413,7 @@ impl Control {
                         _ = tokio::time::sleep(dur) => {}
                     }
                     // Capacity may have freed up while we waited.
-                    self.schedule_ready(job_id, dispatch);
+                    self.schedule_ready(job_id, dispatch, tree);
                 }
             }
         }
@@ -401,7 +423,7 @@ impl Control {
     ///
     /// `NoCapacity` is **not** a failure — the step keeps its queue position and only the queue-wait
     /// clock can turn the wait into a verdict (design D§4.5: "over cap is a wait, not a failure").
-    fn schedule_ready(&self, job_id: &str, dispatch: &Dispatch) {
+    fn schedule_ready(&self, job_id: &str, dispatch: &Dispatch, tree: &VerifiedTree) {
         let assignments: Vec<(StepId, Assignment)> = self
             .with_job(job_id, |job| {
                 job.steps
@@ -441,7 +463,7 @@ impl Control {
         for (step_id, assignment) in assignments {
             // Outside the store lock: the fleet is somebody else's process, and blocking every
             // job's bookkeeping on it would be a self-inflicted outage.
-            let result = self.deps.node.assign(&assignment);
+            let result = self.deps.node.assign(&assignment, tree);
             let now = Instant::now();
             self.with_job_mut(job_id, |job| {
                 let ttl = self.config.lease_ttl;
@@ -561,18 +583,23 @@ impl Control {
 async fn drive(ctrl: Arc<Control>, job_id: JobId) {
     let Some(dispatch) = ctrl.with_job(&job_id, |j| j.dispatch.clone()) else { return };
 
-    if let Err(verdict) = ctrl.phase_fetch(&job_id, &dispatch).await {
-        ctrl.finish(&job_id, verdict).await;
-        return;
-    }
-    let specs = match ctrl.phase_plan(&job_id, &dispatch).await {
+    // The broker's answer is the thread the rest of the pipeline hangs from: the planner reads the
+    // tree at this path and the fleet materializes a workspace from it (design D§4.4, D§6.2).
+    let tree = match ctrl.phase_fetch(&job_id, &dispatch).await {
+        Ok(tree) => tree,
+        Err(verdict) => {
+            ctrl.finish(&job_id, verdict).await;
+            return;
+        }
+    };
+    let specs = match ctrl.phase_plan(&job_id, &tree).await {
         Ok(specs) => specs,
         Err(verdict) => {
             ctrl.finish(&job_id, verdict).await;
             return;
         }
     };
-    ctrl.phase_run(&job_id, &dispatch, specs).await;
+    ctrl.phase_run(&job_id, &dispatch, &tree, specs).await;
 }
 
 #[cfg(test)]
@@ -580,7 +607,7 @@ mod tests {
     use super::*;
     use crate::testing::{
         dispatch, fast_config, harness, step_report, wait_until, FailingFetcher, HangingFetcher,
-        NodeMode, OkFetcher, StaticPlanner,
+        NodeMode, OkFetcher, StaticPlanner, WrongTreeFetcher,
     };
     use hull_ci_proto::{Status, StepOutcome};
 
@@ -744,6 +771,29 @@ mod tests {
         let verdict = live.settled().await;
         assert_eq!(verdict.status, Status::Errored);
         assert_eq!(verdict.reason, Some(Reason::NoTests));
+    }
+
+    #[tokio::test]
+    async fn the_fleet_is_told_where_the_broker_put_the_tree() {
+        // The workspace path is produced by the broker and threaded to the fleet unaltered: nothing
+        // downstream re-derives it from the store's layout (seams::VerifiedTree).
+        let live = start(fast_config(), Arc::new(OkFetcher), Arc::new(StaticPlanner::steps(1)), NodeMode::Accept);
+        live.steps_leased().await;
+        let trees = live.node.trees();
+        assert_eq!(trees.len(), 1);
+        assert_eq!(trees[0].tree_id, "tree1");
+        assert_eq!(trees[0].path, std::path::PathBuf::from("/nonexistent/control-plane-never-opens-this"));
+    }
+
+    #[tokio::test]
+    async fn a_broker_that_materializes_a_different_tree_errors_the_job() {
+        // Every downstream decision — the plan, the steps, Hull's memo — is keyed to the dispatched
+        // tree. Running a different one would attach a verdict to bytes nobody asked about.
+        let live = start(fast_config(), Arc::new(WrongTreeFetcher), Arc::new(StaticPlanner::steps(1)), NodeMode::Accept);
+        let verdict = live.settled().await;
+        assert_eq!(verdict.status, Status::Errored);
+        assert_eq!(verdict.reason, Some(Reason::Infra));
+        assert!(live.node.assigned().is_empty(), "nothing runs against a tree we did not ask for");
     }
 
     #[tokio::test]

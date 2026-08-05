@@ -11,7 +11,10 @@ use hull_ci_proto::{Assignment, AuthorClass, Dispatch, StepOutcome, StepReport};
 use crate::callback::{BoxFuture, CallbackRequest, CallbackResponse, CallbackTransport, TransportError};
 use crate::control::{Control, ControlConfig, Deps};
 use crate::model::StepSpec;
-use crate::seams::{FetchError, FetchRequest, Fetcher, Membership, NodeError, NodeSink, PlanError, Planner};
+use crate::seams::{
+    FetchError, FetchRequest, Fetcher, Membership, NodeError, NodeSink, PlanError, Planner,
+    VerifiedTree,
+};
 
 /// A dispatch with the shape spec §5 documents.
 pub fn dispatch(repo: &str, tree_id: &str) -> Dispatch {
@@ -81,16 +84,28 @@ impl CallbackTransport for ScriptedTransport {
 
 // ── Fetcher ──────────────────────────────────────────────────────────────────────────────────────
 
+/// Reports the tree materialized at a path nothing in this crate opens.
+///
+/// The control plane never reads the workspace — that is the planner's and the node's business, both
+/// of which are fakes here — so a path that does not exist is the honest fixture: if a test ever
+/// starts failing because this directory is missing, the control plane has grown a filesystem
+/// dependency it is not supposed to have (§14.1).
 pub struct OkFetcher;
 impl Fetcher for OkFetcher {
-    fn fetch<'a>(&'a self, _req: &'a FetchRequest) -> BoxFuture<'a, Result<(), FetchError>> {
-        Box::pin(async { Ok(()) })
+    fn fetch<'a>(&'a self, req: &'a FetchRequest) -> BoxFuture<'a, Result<VerifiedTree, FetchError>> {
+        Box::pin(async move {
+            Ok(VerifiedTree {
+                tree_id: req.tree_id.clone(),
+                path: std::path::PathBuf::from("/nonexistent/control-plane-never-opens-this"),
+                cached: false,
+            })
+        })
     }
 }
 
 pub struct FailingFetcher;
 impl Fetcher for FailingFetcher {
-    fn fetch<'a>(&'a self, _req: &'a FetchRequest) -> BoxFuture<'a, Result<(), FetchError>> {
+    fn fetch<'a>(&'a self, _req: &'a FetchRequest) -> BoxFuture<'a, Result<VerifiedTree, FetchError>> {
         Box::pin(async { Err(FetchError::TreeMismatch) })
     }
 }
@@ -98,10 +113,28 @@ impl Fetcher for FailingFetcher {
 /// Never returns — the only way to test the fetch clock.
 pub struct HangingFetcher;
 impl Fetcher for HangingFetcher {
-    fn fetch<'a>(&'a self, _req: &'a FetchRequest) -> BoxFuture<'a, Result<(), FetchError>> {
-        Box::pin(async {
+    fn fetch<'a>(&'a self, req: &'a FetchRequest) -> BoxFuture<'a, Result<VerifiedTree, FetchError>> {
+        Box::pin(async move {
             futures_forever().await;
-            Ok(())
+            Ok(VerifiedTree {
+                tree_id: req.tree_id.clone(),
+                path: std::path::PathBuf::from("/nonexistent/control-plane-never-opens-this"),
+                cached: false,
+            })
+        })
+    }
+}
+
+/// Answers with a tree id that is not the one dispatched — the "wrong tree" guard in `phase_fetch`.
+pub struct WrongTreeFetcher;
+impl Fetcher for WrongTreeFetcher {
+    fn fetch<'a>(&'a self, _req: &'a FetchRequest) -> BoxFuture<'a, Result<VerifiedTree, FetchError>> {
+        Box::pin(async {
+            Ok(VerifiedTree {
+                tree_id: "some-other-tree".into(),
+                path: std::path::PathBuf::from("/nonexistent/control-plane-never-opens-this"),
+                cached: true,
+            })
         })
     }
 }
@@ -127,7 +160,7 @@ impl StaticPlanner {
 }
 
 impl Planner for StaticPlanner {
-    fn plan<'a>(&'a self, _tree_id: &'a str) -> BoxFuture<'a, Result<Vec<StepSpec>, PlanError>> {
+    fn plan<'a>(&'a self, _tree: &'a VerifiedTree) -> BoxFuture<'a, Result<Vec<StepSpec>, PlanError>> {
         Box::pin(async move { Ok(self.0.clone()) })
     }
 }
@@ -145,7 +178,7 @@ pub enum NodeMode {
 pub struct RecordingNode {
     pub node_id: String,
     pub mode: NodeMode,
-    assigned: Mutex<Vec<Assignment>>,
+    assigned: Mutex<Vec<(Assignment, VerifiedTree)>>,
     cancelled: Mutex<Vec<(String, String)>>,
 }
 
@@ -159,7 +192,11 @@ impl RecordingNode {
         }
     }
     pub fn assigned(&self) -> Vec<Assignment> {
-        self.assigned.lock().unwrap().clone()
+        self.assigned.lock().unwrap().iter().map(|(a, _)| a.clone()).collect()
+    }
+    /// What the fleet was told about the materialized tree — the broker's answer, unaltered.
+    pub fn trees(&self) -> Vec<VerifiedTree> {
+        self.assigned.lock().unwrap().iter().map(|(_, t)| t.clone()).collect()
     }
     pub fn cancelled(&self) -> Vec<(String, String)> {
         self.cancelled.lock().unwrap().clone()
@@ -167,8 +204,8 @@ impl RecordingNode {
 }
 
 impl NodeSink for RecordingNode {
-    fn assign(&self, assignment: &Assignment) -> Result<String, NodeError> {
-        self.assigned.lock().unwrap().push(assignment.clone());
+    fn assign(&self, assignment: &Assignment, tree: &VerifiedTree) -> Result<String, NodeError> {
+        self.assigned.lock().unwrap().push((assignment.clone(), tree.clone()));
         match self.mode {
             NodeMode::Accept => Ok(self.node_id.clone()),
             NodeMode::NoCapacity => Err(NodeError::NoCapacity),

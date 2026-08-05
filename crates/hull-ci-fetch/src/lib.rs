@@ -214,8 +214,31 @@ impl FetchBroker {
     /// step therefore costs one Hull→broker transfer, not twelve.
     pub async fn ensure(&self, dispatch: &Dispatch) -> Result<StoredTree, FetchError> {
         dispatch.validate()?;
-        let tenant = dispatch.tenant();
-        let tree_id = verify::normalize_tree_id(&dispatch.tree_id).map_err(|e| FetchError::BadTreeId(e.to_string()))?;
+        self.ensure_tree(
+            dispatch.tenant(),
+            &dispatch.tree_id,
+            &dispatch.source_url,
+            dispatch.fetch_token.as_deref(),
+        )
+        .await
+    }
+
+    /// [`ensure`](Self::ensure) without a [`Dispatch`].
+    ///
+    /// These four values are everything the broker uses; the rest of a dispatch (`change`, `intent`,
+    /// `callback_url`) is the control plane's business and is deliberately not in scope here — the
+    /// broker is the component that must be able to hold the least. Exposed because a caller that has
+    /// already destructured the dispatch would otherwise have to *rebuild* one to call us, inventing
+    /// values for fields it does not have so that `validate()` passes. A fabricated `callback_url` is
+    /// exactly the kind of fiction that later gets used.
+    pub async fn ensure_tree(
+        &self,
+        tenant: &str,
+        tree_id: &str,
+        source_url: &str,
+        fetch_token: Option<&str>,
+    ) -> Result<StoredTree, FetchError> {
+        let tree_id = verify::normalize_tree_id(tree_id).map_err(|e| FetchError::BadTreeId(e.to_string()))?;
 
         if self.store.has(tenant, &tree_id) {
             tracing::debug!(tenant, tree_id, "tree already in the content store — no fetch");
@@ -223,13 +246,19 @@ impl FetchBroker {
         }
 
         let budget = self.limits.budget;
-        match tokio::time::timeout(budget, self.fetch_uncached(dispatch, tenant, &tree_id)).await {
+        match tokio::time::timeout(budget, self.fetch_uncached(source_url, fetch_token, tenant, &tree_id)).await {
             Ok(result) => result,
             Err(_) => Err(FetchError::Timeout { secs: budget.as_secs() }),
         }
     }
 
-    async fn fetch_uncached(&self, dispatch: &Dispatch, tenant: &str, tree_id: &str) -> Result<StoredTree, FetchError> {
+    async fn fetch_uncached(
+        &self,
+        source_url: &str,
+        fetch_token: Option<&str>,
+        tenant: &str,
+        tree_id: &str,
+    ) -> Result<StoredTree, FetchError> {
         let staging = self.store.staging_dir(tenant)?;
         // One `open(2)`, so it runs inline rather than on a blocking worker — and deliberately not
         // `block_in_place`, which panics outside a multi-thread runtime and would make the broker
@@ -237,7 +266,7 @@ impl FetchBroker {
         let archive = tempfile::NamedTempFile::new_in(&staging)
             .map_err(|e| FetchError::Store(StoreError::Io(e.to_string())))?;
 
-        self.download(dispatch, archive.path()).await?;
+        self.download(source_url, fetch_token, archive.path()).await?;
 
         // Extraction, hashing and the rename are all blocking filesystem work on potentially
         // gigabytes; keeping them off the async workers is not a nicety when one broker serves the
@@ -256,12 +285,17 @@ impl FetchBroker {
     /// The token, if present, is set as a **sensitive** header value so no middleware or trace layer
     /// can print it, and it is never copied anywhere else: it dies with this request (spec §14.2 —
     /// it must not enter a sandbox, and a node never sees it because a node never fetches).
-    async fn download(&self, dispatch: &Dispatch, dest: &Path) -> Result<u64, FetchError> {
+    async fn download(
+        &self,
+        source_url: &str,
+        fetch_token: Option<&str>,
+        dest: &Path,
+    ) -> Result<u64, FetchError> {
         use tokio::io::AsyncWriteExt;
 
-        let safe_url = redact_url(&dispatch.source_url);
-        let mut req = self.client.get(&dispatch.source_url);
-        if let Some(token) = dispatch.fetch_token.as_deref() {
+        let safe_url = redact_url(source_url);
+        let mut req = self.client.get(source_url);
+        if let Some(token) = fetch_token {
             let mut value = reqwest::header::HeaderValue::from_str(&format!("Bearer {token}"))
                 .map_err(|_| FetchError::BadFetchToken)?;
             value.set_sensitive(true);

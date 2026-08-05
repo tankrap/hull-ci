@@ -556,6 +556,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "hull-ci-server"
+version = "0.0.1"
+dependencies = [
+ "axum",
+ "hull-ci-control",
+ "hull-ci-fetch",
+ "hull-ci-node",
+ "hull-ci-proto",
+ "keel-store",
+ "reqwest",
+ "serde_json",
+ "tar",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "hyper"
 version = "1.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

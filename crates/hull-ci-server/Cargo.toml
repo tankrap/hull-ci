@@ -1,0 +1,29 @@
+[package]
+name = "hull-ci-server"
+description = "The M1 runner: one process wiring ingest → fetch broker → planner → an in-process node agent → callback."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+hull-ci-proto = { path = "../hull-ci-proto" }
+hull-ci-control = { path = "../hull-ci-control" }
+hull-ci-fetch = { path = "../hull-ci-fetch" }
+hull-ci-node = { path = "../hull-ci-node" }
+thiserror.workspace = true
+# `net` on top of the workspace feature set, for the listener this binary binds.
+tokio = { workspace = true, features = ["net"] }
+tracing.workspace = true
+tracing-subscriber.workspace = true
+axum.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+tar.workspace = true
+serde_json.workspace = true
+reqwest.workspace = true
+# The end-to-end suite has to name a *real* `tree_id`, which means computing one the way keel does.
+# Same git rev hull-ci-fetch pins, so both sides of the verification agree by construction rather
+# than by two crates happening to be on compatible revisions.
+keel-store = { git = "https://github.com/tankrap/keel", rev = "6827a3443de3c9be2e66887c8038310e32dddc37", package = "keel-store" }

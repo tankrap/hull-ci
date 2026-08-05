@@ -48,6 +48,7 @@ untrusted code or parsing attacker-controlled archives next to the secrets.
 | `hull-ci-fetch` | The fetch broker: GET `source_url`, verify the archive re-hashes to `tree_id`, extract with a hardened tar reader, store content-addressed. |
 | `hull-ci-control` | Ingest, job/step state, scheduling, aggregation, idempotent verdict delivery. |
 | `hull-ci-node` | The node agent and its sandbox backends. All job execution happens here. |
+| `hull-ci-server` | The M1 binary: the composition root that wires the four crates into one running service. |
 
 ## Two axes that are not the same axis
 
@@ -83,6 +84,24 @@ admin grant rather than a string a pipeline can claim.
 
 The ordering is deliberate: multi-tenancy is the product, so isolation precedes the performance layer
 rather than following it.
+
+## Running it (M1)
+
+```bash
+HULL_CI_SECRET=…                  # spec §8 — checked on dispatch, echoed on the callback
+HULL_CI_TRUSTED_TENANTS=acme      # whose authors count as members; empty means nobody, so nothing runs
+HULL_CI_SANDBOX=container         # the default. `local` additionally needs HULL_CI_ALLOW_UNSANDBOXED=1
+cargo run -p hull-ci-server
+```
+
+Point Hull's `ci-config` at `POST http://<host>/hull`. Full variable reference in the crate's docs
+(`cargo doc -p hull-ci-server --open`).
+
+**M1 refuses rather than degrades.** No sandbox backend in this milestone can contain untrusted code
+(`BackendCapabilities::admits_untrusted()` is `false` for all of them), so work from an author who is
+not a member of a configured tenant comes back `errored` instead of running, and the container
+backend fails to start rather than falling back to the host when no runtime answers. Both are
+deliberate: see §14.1 of the spec.
 
 ## Development
 
