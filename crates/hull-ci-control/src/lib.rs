@@ -1,1 +1,142 @@
-//! placeholder — filled in by the M1 build-out.
+//! **hull-ci-control** — the control plane: ingest, the job/step model, aggregation, and idempotent
+//! verdict delivery.
+//!
+//! It is the half of the system that talks to Hull, and the half that **never runs job code**. Spec
+//! §14.1 is categorical: "the runner MUST NEVER execute job code on the control-plane host or on any
+//! host with access to Hull's secrets, the CI shared secret, or cloud-provider credentials." This
+//! process holds the CI shared secret, so it parses JSON and nothing else — no tar extraction, no
+//! git, no `sh -c`, no repository on disk. Everything that touches attacker-controlled bytes lives
+//! behind a seam in [`seams`] and runs in another crate.
+//!
+//! ## The shape of a job
+//!
+//! ```text
+//! Hull ──POST /hull──▶ [ingest]  auth → version → parse → record (repo, tree_id)
+//!                          │                                   └─ 202 {"accepted":true,…}
+//!                          ▼
+//!                      [driver]  fetching → planning → running
+//!                          │        (fetch broker)   (planner)   (node fleet)
+//!                          ▼
+//!                    [aggregate]  one verdict: green | red | errored+reason
+//!                          ▼
+//!                     [callback]  POST callback_url verbatim, retried, or parked + alerted
+//! ```
+//!
+//! ## What M1 is, and is not
+//!
+//! State is in memory: one replica, no Postgres (design D§13 — M1 is a single-tenant bring-up
+//! scaffold). The idempotency decision has the same shape it will have against `INSERT … ON CONFLICT
+//! DO NOTHING`, so moving it later does not move any logic. There is no DAG (`needs` arrives with
+//! the Starlark planner in M2), no step memo, and no fair-share queue — the queue-wait *clock*
+//! exists (design D§10.2) even though the queue it guards is M3's.
+//!
+//! ## Conformance (spec §11)
+//!
+//! | Clause | Where |
+//! |---|---|
+//! | Accepts `POST`, returns 2xx on receipt | [`ingest`] |
+//! | Verifies `X-Hull-CI-Secret` | [`auth`] — constant-time |
+//! | Fetches `source_url`, no git | [`seams::Fetcher`] (broker crate) |
+//! | POSTs to the exact `callback_url`, echoing the secret | [`callback`] |
+//! | `errored`, not `red`, for infrastructure failures | [`aggregate`], [`timeouts`] |
+//! | Ignores unknown dispatch fields | `hull_ci_proto::Dispatch` |
+//! | Safe under duplicate dispatch and duplicate callback | [`store`], [`callback`] |
+
+pub mod aggregate;
+pub mod auth;
+pub mod callback;
+pub mod control;
+pub mod ids;
+pub mod ingest;
+pub mod model;
+pub mod seams;
+pub mod store;
+pub mod timeouts;
+
+#[cfg(test)]
+mod testing;
+
+use std::net::SocketAddr;
+use std::sync::Arc;
+use std::time::Duration;
+
+pub use control::{Accepted, Control, ControlConfig, Deps, ReportRejected};
+pub use timeouts::Timeouts;
+
+use callback::{CallbackTransport, HttpCallback};
+use seams::{LeastPrivilege, UnwiredFetcher, UnwiredNodes, UnwiredPlanner, UnwiredTransport};
+
+impl Default for Deps {
+    /// Everything unwired except the callback transport, which is the one collaborator this crate
+    /// legitimately owns end to end.
+    ///
+    /// The unwired defaults **fail** rather than no-op. A control plane with no fetcher that
+    /// reported `green` would have Hull memoize a passing verdict for a tree nobody ever built
+    /// (spec §7); `errored` is not memoized, so failing loudly costs a re-check and nothing else.
+    fn default() -> Self {
+        let transport: Arc<dyn CallbackTransport> = match HttpCallback::new(Duration::from_secs(30)) {
+            Ok(http) => Arc::new(http),
+            Err(e) => {
+                tracing::error!(error = %e, "could not build the HTTP callback client");
+                Arc::new(UnwiredTransport)
+            }
+        };
+        Deps {
+            fetcher: Arc::new(UnwiredFetcher),
+            planner: Arc::new(UnwiredPlanner),
+            node: Arc::new(UnwiredNodes),
+            transport,
+            membership: Arc::new(LeastPrivilege),
+        }
+    }
+}
+
+/// How to start the control plane.
+pub struct Opts {
+    /// Where to listen. Loopback by default: this endpoint holds the CI shared secret, so exposing
+    /// it is a deliberate act rather than a default.
+    pub addr: SocketAddr,
+    pub config: ControlConfig,
+    pub deps: Deps,
+}
+
+impl Default for Opts {
+    fn default() -> Self {
+        Opts {
+            addr: SocketAddr::from(([127, 0, 0, 1], 8080)),
+            config: ControlConfig::default(),
+            deps: Deps::default(),
+        }
+    }
+}
+
+impl Opts {
+    pub fn new(addr: SocketAddr) -> Self {
+        Opts { addr, ..Opts::default() }
+    }
+
+    /// The shared secret (spec §8). Configuring one is a SHOULD in the spec and a MUST in practice —
+    /// without it, anyone who can reach this port can queue work on the fleet.
+    pub fn with_secret(mut self, secret: impl Into<String>) -> Self {
+        self.config.secret = Some(secret.into());
+        self
+    }
+
+    pub fn with_deps(mut self, deps: Deps) -> Self {
+        self.deps = deps;
+        self
+    }
+}
+
+/// Bind and serve until the process ends.
+pub async fn run(opts: Opts) -> std::io::Result<()> {
+    let addr = opts.addr;
+    if opts.config.secret.is_none() {
+        tracing::warn!("no shared secret configured — every dispatch will be accepted (spec §8)");
+    }
+    let control = Control::new(opts.config, opts.deps);
+    let app = ingest::router(Arc::clone(&control));
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    tracing::info!(%addr, "hull-ci control plane listening on POST /hull");
+    axum::serve(listener, app).await
+}
