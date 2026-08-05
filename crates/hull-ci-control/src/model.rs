@@ -302,6 +302,13 @@ pub struct Job {
     /// was delivered somewhere else. §9's own wording is the hint — be idempotent "per `(tree_id)`
     /// **or** per `callback_url`": the tree keys the *work*, the callback keys the *answer*.
     pub callback_urls: Vec<String>,
+    /// When this job first reached a terminal state, for retention (see [`JobStore::evict`]).
+    ///
+    /// `None` while the job is live, which is what makes eviction safe by construction: there is no
+    /// value to compare against, so a running job cannot be swept out from under its own driver.
+    ///
+    /// [`JobStore::evict`]: crate::store::JobStore::evict
+    pub settled_at: Option<Instant>,
 }
 
 impl Job {
@@ -338,6 +345,7 @@ impl Job {
             deadline_at: now + job_timeout,
             report_attempts: 0,
             callback_urls,
+            settled_at: None,
         }
     }
 
@@ -347,10 +355,22 @@ impl Job {
     }
 
     pub fn transition(&mut self, next: JobState) -> Result<(), StateError> {
+        self.transition_at(next, Instant::now())
+    }
+
+    /// [`transition`](Self::transition) with an explicit clock, so retention is testable without
+    /// sleeping.
+    pub fn transition_at(&mut self, next: JobState, now: Instant) -> Result<(), StateError> {
         if !self.state.can_transition_to(next) {
             return Err(StateError::Job { from: self.state.as_str(), to: next.as_str() });
         }
         self.state = next;
+        // Stamped on the first terminal transition only. A `ReportFailed → Reported` recovery must
+        // not restart the retention clock, or a job that keeps retrying delivery keeps renewing its
+        // own lease on memory.
+        if next.is_finished() && self.settled_at.is_none() {
+            self.settled_at = Some(now);
+        }
         Ok(())
     }
 

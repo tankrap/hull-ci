@@ -109,6 +109,66 @@ impl JobStore {
     pub fn is_empty(&self) -> bool {
         self.by_id.is_empty()
     }
+
+    /// Drop settled jobs that are older than `retention`, then, if still over `max_jobs`, the oldest
+    /// settled ones until the cap is met. Returns how many were removed.
+    ///
+    /// **A live job is never evicted**, at any pressure. That is enforced structurally rather than by
+    /// a check: eviction candidates are those with a `settled_at`, and only a terminal transition
+    /// sets one. If every job in the store is live we go over the cap and say so — refusing to evict
+    /// is the correct failure, because dropping a running job would strand its driver, lose its
+    /// verdict, and leave Hull waiting on a callback that can no longer be sent.
+    ///
+    /// What eviction costs, stated plainly: the `(repo, tree_id)` index goes with the job, so a
+    /// duplicate dispatch arriving after eviction re-runs the work instead of re-reporting the
+    /// recorded verdict. That is a wasted run, not a wrong answer — spec §9 puts memoization in Hull
+    /// and describes our re-report as a convenience that heals a lost callback. Trading it for a
+    /// bounded process is the right way round; the alternative is a store that grows until the
+    /// process dies, which loses every verdict rather than one.
+    pub fn evict(&mut self, now: Instant, retention: Duration, max_jobs: usize) -> usize {
+        let mut settled: Vec<(Instant, JobId)> = self
+            .by_id
+            .values()
+            .filter_map(|j| j.settled_at.map(|t| (t, j.id.clone())))
+            .collect();
+        // Oldest first, so both passes below take from the same end.
+        settled.sort_by_key(|(t, _)| *t);
+
+        let mut removed = 0;
+        let mut i = 0;
+        while i < settled.len() {
+            let (settled_at, id) = &settled[i];
+            let too_old = now.duration_since(*settled_at) >= retention;
+            let over_cap = self.by_id.len() - removed > max_jobs;
+            if !too_old && !over_cap {
+                break;
+            }
+            self.remove(id);
+            removed += 1;
+            i += 1;
+        }
+
+        if self.by_id.len() > max_jobs {
+            tracing::warn!(
+                jobs = self.by_id.len(),
+                max_jobs,
+                "job store is over its cap with nothing settled to evict — every job is still live"
+            );
+        }
+        removed
+    }
+
+    fn remove(&mut self, job_id: &str) {
+        if let Some(job) = self.by_id.remove(job_id) {
+            // Only clear the index if it still points at *this* job. A later job for the same
+            // (repo, tree_id) — which exists precisely because an earlier one was evicted — must not
+            // have its index entry removed by its predecessor's cleanup.
+            let key = job.key();
+            if self.by_key.get(&key).map(|id| id == job_id).unwrap_or(false) {
+                self.by_key.remove(&key);
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -180,5 +240,99 @@ mod tests {
         let a = s.admit(dispatch("t/r", "tree1"), AuthorClass::Outsider, now, Duration::from_secs(60));
         let b = s.admit(d2, AuthorClass::Outsider, now, Duration::from_secs(60));
         assert_eq!(a.job_id(), b.job_id());
+    }
+}
+
+#[cfg(test)]
+mod retention_tests {
+    use super::*;
+    use crate::model::JobState;
+    use crate::testing::dispatch;
+
+    fn settled_job(store: &mut JobStore, repo: &str, tree: &str, at: Instant) -> JobId {
+        let admit = store.admit(dispatch(repo, tree), AuthorClass::Member, at, Duration::from_secs(60));
+        let id = admit.job_id().to_string();
+        let job = store.get_mut(&id).unwrap();
+        for s in [JobState::Fetching, JobState::Planning, JobState::Running, JobState::Green, JobState::Reported] {
+            job.transition_at(s, at).unwrap();
+        }
+        id
+    }
+
+    #[test]
+    fn a_live_job_is_never_evicted_however_much_pressure_there_is() {
+        // The invariant that matters. Dropping a running job strands its driver, loses its verdict,
+        // and leaves Hull waiting on a callback that can never be sent — worse than being over the
+        // cap. It holds structurally: only a terminal transition sets `settled_at`, and only jobs
+        // with one are candidates.
+        let mut store = JobStore::new();
+        let t0 = Instant::now();
+        for i in 0..5 {
+            store.admit(dispatch("t/r", &format!("tree{i}")), AuthorClass::Member, t0, Duration::from_secs(60));
+        }
+        let removed = store.evict(t0 + Duration::from_secs(86_400), Duration::from_secs(1), 1);
+        assert_eq!(removed, 0, "no live job may be evicted");
+        assert_eq!(store.len(), 5, "and the store stays over its cap rather than losing work");
+    }
+
+    #[test]
+    fn settled_jobs_older_than_retention_are_dropped() {
+        let mut store = JobStore::new();
+        let t0 = Instant::now();
+        settled_job(&mut store, "t/r", "old", t0);
+        settled_job(&mut store, "t/r", "new", t0 + Duration::from_secs(50));
+
+        let removed = store.evict(t0 + Duration::from_secs(60), Duration::from_secs(30), usize::MAX);
+        assert_eq!(removed, 1, "only the one past retention");
+        assert_eq!(store.len(), 1);
+    }
+
+    #[test]
+    fn the_cap_evicts_oldest_first_even_inside_retention() {
+        let mut store = JobStore::new();
+        let t0 = Instant::now();
+        let oldest = settled_job(&mut store, "t/r", "a", t0);
+        settled_job(&mut store, "t/r", "b", t0 + Duration::from_secs(1));
+        settled_job(&mut store, "t/r", "c", t0 + Duration::from_secs(2));
+
+        let removed = store.evict(t0 + Duration::from_secs(3), Duration::from_secs(3600), 2);
+        assert_eq!(removed, 1);
+        assert!(store.get(&oldest).is_none(), "the oldest settled job goes first");
+        assert_eq!(store.len(), 2);
+    }
+
+    #[test]
+    fn an_evicted_tree_dispatched_again_is_new_work_not_a_half_found_duplicate() {
+        // The cost of eviction, asserted rather than assumed: the index goes with the job, so this
+        // re-runs instead of re-reporting. A wasted run, not a wrong answer — Hull owns the real memo
+        // (spec §9). What must NOT happen is `Admit::Finished` pointing at a job that no longer
+        // exists, which is why `remove` clears both maps together.
+        let mut store = JobStore::new();
+        let t0 = Instant::now();
+        settled_job(&mut store, "t/r", "tree1", t0);
+        store.evict(t0 + Duration::from_secs(7200), Duration::from_secs(3600), usize::MAX);
+
+        let again = store.admit(dispatch("t/r", "tree1"), AuthorClass::Member, t0, Duration::from_secs(60));
+        assert!(matches!(again, Admit::Created { .. }), "got {again:?}");
+        assert!(store.get(again.job_id()).is_some(), "and the new job is really there");
+    }
+
+    #[test]
+    fn a_delivery_retry_does_not_renew_a_jobs_lease_on_memory() {
+        // ReportFailed → Reported is a recovery path. If it restamped `settled_at`, a job whose
+        // delivery keeps failing and retrying would keep postponing its own eviction — exactly the
+        // job least worth holding on to.
+        let mut store = JobStore::new();
+        let t0 = Instant::now();
+        let admit = store.admit(dispatch("t/r", "tree1"), AuthorClass::Member, t0, Duration::from_secs(60));
+        let id = admit.job_id().to_string();
+        let job = store.get_mut(&id).unwrap();
+        for s in [JobState::Fetching, JobState::Planning, JobState::Running, JobState::Green] {
+            job.transition_at(s, t0).unwrap();
+        }
+        job.transition_at(JobState::ReportFailed, t0).unwrap();
+        let first = job.settled_at.unwrap();
+        job.transition_at(JobState::Reported, t0 + Duration::from_secs(600)).unwrap();
+        assert_eq!(job.settled_at.unwrap(), first, "the retention clock starts once");
     }
 }

@@ -50,6 +50,16 @@ pub struct ControlConfig {
     /// Base for `details_url` (design G4). Only our own hex job id is ever appended — never a byte
     /// that came from a dispatch or from job output (spec §14.5).
     pub details_base_url: Option<String>,
+    /// How long a settled job stays in the store so a duplicate dispatch can be re-reported from it
+    /// (design D§4.1) before it is evicted.
+    ///
+    /// This is the only thing bounding the store's size over time. Longer means more duplicates
+    /// answered without re-running; shorter means less memory. It is not a correctness knob — after
+    /// eviction a duplicate simply re-runs, and Hull owns the real memo (spec §9).
+    pub job_retention: Duration,
+    /// Hard ceiling on jobs held in memory. Settled jobs are evicted oldest-first to meet it; live
+    /// jobs never are, so this can be exceeded by a burst of concurrent work rather than by history.
+    pub max_jobs: usize,
 }
 
 impl Default for ControlConfig {
@@ -61,6 +71,10 @@ impl Default for ControlConfig {
             tier: IsolationTier::Container,
             lease_ttl: Duration::from_secs(30),
             details_base_url: None,
+            // An hour comfortably outlaps the callback retry budget, so a job cannot be evicted while
+            // its own delivery is still being attempted.
+            job_retention: Duration::from_secs(60 * 60),
+            max_jobs: 10_000,
         }
     }
 }
@@ -139,8 +153,17 @@ impl Control {
         let tree_id = dispatch.tree_id.clone();
 
         let admit = {
+            let now = Instant::now();
             let mut jobs = self.lock_jobs();
-            jobs.admit(dispatch, author_class, Instant::now(), self.config.timeouts.job)
+            // Amortized retention: eviction pressure is applied where new work arrives, so the store
+            // is bounded without a background task to own, supervise, and shut down. Cheap — it is a
+            // scan of settled jobs under a lock we are already holding — and it runs before `admit`
+            // so a duplicate of a just-evicted tree is treated as new rather than half-found.
+            let evicted = jobs.evict(now, self.config.job_retention, self.config.max_jobs);
+            if evicted > 0 {
+                tracing::debug!(evicted, remaining = jobs.len(), "evicted settled jobs");
+            }
+            jobs.admit(dispatch, author_class, now, self.config.timeouts.job)
         };
 
         let job_id = admit.job_id().to_string();
@@ -522,8 +545,22 @@ impl Control {
 
     fn cancel_steps(&self, job_id: &str, step_ids: &[StepId]) {
         for step_id in step_ids {
-            // Revoke the lease and destroy the sandbox (design D§6.6).
-            self.deps.node.cancel(job_id, step_id);
+            // Only tell the fleet about steps it was actually given. A `Pending` step behind a
+            // cancelled branch has no lease and no sandbox, so a cancel for it is a message about
+            // work the node has never heard of — harmless, but it makes `cancelled()` mean "we sent
+            // a cancel" rather than "a sandbox was destroyed", and that is the sort of imprecision
+            // that later gets read as a metric.
+            let in_flight = self
+                .with_job(job_id, |job| {
+                    job.step(step_id)
+                        .map(|s| matches!(s.state, StepState::Leased | StepState::Running))
+                        .unwrap_or(false)
+                })
+                .unwrap_or(false);
+            if in_flight {
+                // Revoke the lease and destroy the sandbox (design D§6.6).
+                self.deps.node.cancel(job_id, step_id);
+            }
             self.with_job_mut(job_id, |job| {
                 if let Some(step) = job.step_mut(step_id) {
                     let _ = step.transition(StepState::Skipped);
@@ -928,6 +965,28 @@ mod tests {
         assert_eq!(sent[1].url, sent[0].url);
         assert_eq!(sent[1].verdict.status, first.status);
         assert_eq!(live.node.assigned().len(), 1, "a duplicate must not re-run a single step");
+    }
+
+    #[tokio::test]
+    async fn only_steps_the_fleet_actually_holds_are_cancelled() {
+        // `a → b`, and `a` fails. `b` was never assigned — it was still Pending behind the edge — so
+        // there is no lease to revoke and no sandbox to destroy. Sending a cancel for it would make
+        // `cancelled()` mean "we sent a message" rather than "a sandbox died", which is the kind of
+        // imprecision that later gets read as a metric.
+        let plan = StaticPlanner::graph(&[("a", &[]), ("b", &["a"])]);
+        let live = start(fast_config(), Arc::new(OkFetcher), Arc::new(plan), NodeMode::Accept);
+        assert!(live.wait_leased("a").await, "the root should reach the fleet");
+        assert_eq!(live.state_of("b"), StepState::Pending, "`b` waits behind the edge");
+
+        live.report("a", StepOutcome::Failed);
+        live.settled().await;
+
+        assert!(
+            live.node.cancelled().is_empty(),
+            "nothing was in flight to cancel; got {:?}",
+            live.node.cancelled()
+        );
+        assert_eq!(live.assigned_names(), ["a"], "and `b` never ran");
     }
 
     #[tokio::test]
