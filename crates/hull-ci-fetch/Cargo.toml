@@ -1,0 +1,30 @@
+[package]
+name = "hull-ci-fetch"
+description = "The fetch broker: GET source_url, verify the archive re-hashes to tree_id, extract with a hardened tar reader. Holds no ambient credentials and never runs job code."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+hull-ci-proto = { path = "../hull-ci-proto" }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+reqwest.workspace = true
+tar.workspace = true
+blake3.workspace = true
+hex.workspace = true
+tempfile.workspace = true
+# keel's REAL object encoder, pinned to the same rev hull-server embeds. Verification is only
+# meaningful if it recomputes `tree_id` the way keel does; a local re-implementation of the
+# canonical encoding would be a second source of truth that can silently drift from the first.
+keel-store = { git = "https://github.com/tankrap/keel", rev = "6827a3443de3c9be2e66887c8038310e32dddc37", package = "keel-store" }
+# Unicode normalization, so two archive entries that differ only in NFC/NFD form (`café` composed
+# vs decomposed) are caught as the collision they become on a normalizing filesystem (APFS/HFS+).
+unicode-normalization = "0.1"
+
+[dev-dependencies]
+tempfile.workspace = true

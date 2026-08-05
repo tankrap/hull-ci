@@ -1,0 +1,18 @@
+[package]
+name = "hull-ci-node"
+description = "The node agent and its sandbox backends. All job execution happens here, inside a single-use sandbox."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+hull-ci-proto = { path = "../hull-ci-proto" }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
