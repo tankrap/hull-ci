@@ -44,6 +44,7 @@ pub mod config;
 pub mod fetch;
 pub mod membership;
 pub mod node;
+pub mod pipeline;
 pub mod plan;
 pub mod workspace;
 
@@ -59,7 +60,7 @@ use hull_ci_proto::IsolationTier;
 pub use config::{Config, ConfigError, SandboxChoice};
 use fetch::BrokerFetcher;
 use node::InProcessFleet;
-use plan::AutodetectPlanner;
+use pipeline::PipelinePlanner;
 
 /// Why the runner would not start.
 ///
@@ -129,7 +130,7 @@ pub async fn assemble(config: &Config) -> Result<Runner, StartupError> {
     // error rather than a runner that reports `errored` on every job because its planner is a stub.
     let deps = Deps {
         fetcher: Arc::new(BrokerFetcher::new(broker)),
-        planner: Arc::new(AutodetectPlanner::new(config.image.clone())),
+        planner: Arc::new(PipelinePlanner::new(config.image.clone())),
         node: Arc::clone(&fleet) as Arc<dyn hull_ci_control::seams::NodeSink>,
         // Built here rather than taken from `Deps::default` so that failing to construct the HTTP
         // client is a startup error, not a silently unwired verdict sender.

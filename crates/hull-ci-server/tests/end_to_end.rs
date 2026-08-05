@@ -355,3 +355,77 @@ async fn a_duplicate_dispatch_is_one_job_and_one_run() {
     let v = hull.verdict().await;
     assert_eq!(v.status(), "green", "{}", v.summary());
 }
+
+// ── M2: the pipeline is on the live path ─────────────────────────────────────────────────────────
+
+/// A tree carrying a real `.hull/ci.star` with a dependency edge, plus the marker file the M1
+/// autodetect path would have used. The marker is there on purpose: if the pipeline were ignored and
+/// we silently fell back, the job would still go green and the test would pass for the wrong reason.
+/// The step *names* in the verdict are what distinguish the two paths.
+fn pipeline_tree(star: &str) -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join(".hull")).unwrap();
+    std::fs::write(dir.path().join(".hull/ci.star"), star).unwrap();
+    std::fs::write(dir.path().join("Makefile"), "test:\n\t@echo autodetect-would-have-run\n").unwrap();
+    dir
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_pipeline_with_an_edge_runs_both_steps_in_order_and_reports_green() {
+    let tree = pipeline_tree(
+        r#"
+b = step("build", run = "true")
+step("check", run = "true", needs = [b])
+"#,
+    );
+    let v = run_one("acme/widget", "acme", tree.path(), None).await;
+    assert_eq!(v.status(), "green", "both steps should pass: {}", v.summary());
+    // Two steps, not the one the autodetect fallback would have produced.
+    assert!(
+        v.summary().contains("2 steps") || v.summary().contains("2 step"),
+        "the verdict should account for both pipeline steps: {}",
+        v.summary()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failing_pipeline_step_names_itself_in_the_verdict() {
+    // Spec §14.5: the summary is built from untrusted job output, so it is constructed rather than
+    // concatenated — but it must still say which step failed, or a red verdict is unactionable.
+    let tree = pipeline_tree(
+        r#"
+step("unit", run = "false")
+"#,
+    );
+    let v = run_one("acme/widget", "acme", tree.path(), None).await;
+    assert_eq!(v.status(), "red", "a failing pipeline step is a statement about the code: {}", v.summary());
+    assert!(v.summary().contains("unit"), "the failing step should be named: {}", v.summary());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_dependent_of_a_failed_step_does_not_run_and_the_job_is_red() {
+    // D§6.6 fail-fast plus the skip cascade, end to end: `after` must never execute.
+    let tree = pipeline_tree(
+        r#"
+b = step("root", run = "false")
+step("after", run = "true", needs = [b])
+"#,
+    );
+    let v = run_one("acme/widget", "acme", tree.path(), None).await;
+    assert_eq!(v.status(), "red", "{}", v.summary());
+    assert!(v.summary().contains("root"), "the actual failure should be named: {}", v.summary());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_malformed_pipeline_is_errored_and_never_silently_autodetected() {
+    // The tree has a working Makefile, so a silent fallback would report green and the author would
+    // never learn their pipeline does not parse.
+    let tree = pipeline_tree("step(\n");
+    let v = run_one("acme/widget", "acme", tree.path(), None).await;
+    assert_eq!(v.status(), "errored", "a pipeline that does not parse is not a verdict about the code");
+    assert!(
+        v.summary().contains("ci.star"),
+        "the summary should name the file the author has to fix: {}",
+        v.summary()
+    );
+}

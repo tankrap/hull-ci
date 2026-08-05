@@ -7,8 +7,11 @@ contract — queueing, scheduling, caching, isolation, scale — is this reposit
 speaks Hull's [CI Integration Standard](https://github.com/tankrap/hull/blob/main/CI-SPEC.md)
 (contract v1) and implements a **central orchestrator + fleet of execution nodes** behind it.
 
-**Status: pre-alpha.** The contract crate is real; the rest is being built out. Not usable yet, and
-**not safe for multi-tenant or untrusted input** until the isolation milestone lands (see below).
+**Status: pre-alpha.** M1 and M2 are done — it runs a real pipeline end to end and passes the
+contract's conformance checklist. It is **not safe for multi-tenant or untrusted input** until M3
+lands, and it says so at startup rather than in a footnote: no sandbox backend here can contain
+hostile code, so the server names every unenforced §14 clause when it boots and refuses work from
+authors it cannot vouch for.
 
 ## The idea
 
@@ -48,7 +51,8 @@ untrusted code or parsing attacker-controlled archives next to the secrets.
 | `hull-ci-fetch` | The fetch broker: GET `source_url`, verify the archive re-hashes to `tree_id`, extract with a hardened tar reader, store content-addressed. |
 | `hull-ci-control` | Ingest, job/step state, scheduling, aggregation, idempotent verdict delivery. |
 | `hull-ci-node` | The node agent and its sandbox backends. All job execution happens here. |
-| `hull-ci-server` | The M1 binary: the composition root that wires the four crates into one running service. |
+| `hull-ci-plan` | `.hull/ci.star` → a validated, acyclic DAG. Hermetic Starlark, with the *parser* bounded before it ever sees the source. |
+| `hull-ci-server` | The binary: the composition root that wires the other crates into one running service. |
 
 ## Two axes that are not the same axis
 
@@ -72,9 +76,13 @@ admin grant rather than a string a pipeline can claim.
 
 ## Milestones
 
-- **M1 — conforming skeleton.** Ingest → fetch broker → one node → single-use container → callback.
-  Single-tenant, trusted input only. Passes the spec's §11 checklist.
-- **M2 — pipelines.** `.hull/ci.star` (hermetic Starlark) → DAG, parallel steps, fail-fast.
+- **M1 — conforming skeleton. ✅ Done.** Ingest → fetch broker → one node → single-use sandbox →
+  callback. Single-tenant, trusted input only. Passes the spec's §11 checklist — the black-box
+  conformance suite scores **27/27** against the running service, including two STRICT cases the
+  spec's own reference CI fails.
+- **M2 — pipelines. ✅ Done.** `.hull/ci.star` (hermetic Starlark) → DAG, parallel branches,
+  cascading skips, fail-fast cancel. A tree without a pipeline still autodetects exactly as M1 did,
+  so pointing an existing repo here does not change what its CI does.
 - **M3 — the multi-tenant untrusted core.** Firecracker default tier, node partitioning, fair-share +
   admission control, egress-deny, package proxy, secret broker. **One instance safely serves many
   tenants only after M3.**

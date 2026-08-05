@@ -11,6 +11,7 @@ hull-ci-proto = { path = "../hull-ci-proto" }
 hull-ci-control = { path = "../hull-ci-control" }
 hull-ci-fetch = { path = "../hull-ci-fetch" }
 hull-ci-node = { path = "../hull-ci-node" }
+hull-ci-plan = { path = "../hull-ci-plan" }
 thiserror.workspace = true
 # `net` on top of the workspace feature set, for the listener this binary binds.
 tokio = { workspace = true, features = ["net"] }
