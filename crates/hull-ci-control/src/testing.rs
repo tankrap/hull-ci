@@ -230,6 +230,9 @@ pub fn step_report(job_id: &str, step_id: &str, outcome: StepOutcome, detail: &s
         job_id: job_id.into(),
         step_id: step_id.into(),
         outcome,
+        // A node that errors always names a reason; `Infra` is the conservative default a report
+        // without one is read as, so the fixture models the same convention.
+        reason: (outcome == StepOutcome::Errored).then_some(hull_ci_proto::Reason::Infra),
         exit_code: Some(if outcome == StepOutcome::Passed { 0 } else { 1 }),
         log_key: None,
         detail: detail.into(),

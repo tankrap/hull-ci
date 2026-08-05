@@ -75,15 +75,21 @@ impl NodeErrorKind {
         }
     }
 
+    /// The proto `Reason` this kind reports on the wire.
+    pub fn reason(self) -> hull_ci_proto::Reason {
+        match self {
+            NodeErrorKind::NoTests => hull_ci_proto::Reason::NoTests,
+            NodeErrorKind::Timeout => hull_ci_proto::Reason::Timeout,
+            NodeErrorKind::Infra => hull_ci_proto::Reason::Infra,
+        }
+    }
+
     /// Decode the kind from a `StepReport::detail`. Returns `None` for a detail that carries no marker
     /// (which the control plane should treat as `Infra`, the conservative default).
+    ///
+    /// Superseded by [`StepReport::reason`] as the primary channel; retained as a fallback.
     pub fn from_detail(detail: &str) -> Option<NodeErrorKind> {
-        for kind in [NodeErrorKind::NoTests, NodeErrorKind::Timeout, NodeErrorKind::Infra] {
-            if detail.starts_with(kind.prefix()) {
-                return Some(kind);
-            }
-        }
-        None
+        [NodeErrorKind::NoTests, NodeErrorKind::Timeout, NodeErrorKind::Infra].into_iter().find(|&kind| detail.starts_with(kind.prefix()))
     }
 }
 
@@ -158,7 +164,7 @@ impl NodeAgent {
     pub fn note_warm_tree(&self, tree_id: impl Into<String>) {
         let tree_id = tree_id.into();
         let mut trees = self.warm_trees.lock().expect("warm_trees poisoned");
-        if !trees.iter().any(|t| *t == tree_id) {
+        if !trees.contains(&tree_id) {
             trees.push(tree_id);
         }
     }
@@ -333,18 +339,24 @@ fn report(a: &Assignment, outcome: StepOutcome, exit_code: Option<i32>, detail: 
         job_id: a.job_id.clone(),
         step_id: a.step_id.clone(),
         outcome,
+        reason: None,
         exit_code,
-        // D§11's log key is `tenant/repo/tree_id/step/attempt`, and an `Assignment` carries neither
-        // tenant nor repo, so the node cannot construct it. Left `None` until the log shipper lands
-        // (M2) rather than inventing a key that would not match the object store's layout.
-        log_key: None,
+        // D§11's key is `tenant/repo/tree_id/step/attempt`. `Assignment` now carries tenant and repo,
+        // so the node can name the object rather than leaving the control plane to guess. The attempt
+        // number is not on the assignment; until it is, `1` is the honest value for a report the node
+        // produced on its own single execution of this step.
+        log_key: Some(format!("{}/{}/{}/{}/1", a.tenant, a.repo, a.tree_id, a.step_name)),
         detail: sanitize_summary(detail, SUMMARY_MAX_CHARS),
     }
 }
 
 fn errored(a: &Assignment, kind: NodeErrorKind, detail: &str) -> StepReport {
     let mut r = report(a, StepOutcome::Errored, None, detail);
-    // The prefix is the reason channel `StepReport` lacks — see [`NodeErrorKind`].
+    // `StepReport` now carries a typed `reason`, so this is the real channel rather than a marker
+    // parsed back out of prose. The prefix is kept in `detail` as well: it costs nothing, it keeps
+    // the human-readable line self-describing in a log, and `NodeErrorKind::from_detail` remains a
+    // working fallback for a report that predates the typed field.
+    r.reason = Some(kind.reason());
     r.detail = format!("{}{}", kind.prefix(), r.detail);
     r
 }
@@ -405,6 +417,8 @@ mod tests {
             job_id: "job-1".into(),
             step_id: "step-1".into(),
             step_name: "test".into(),
+            tenant: "acme".into(),
+            repo: "acme/widget".into(),
             tree_id: "tree-1".into(),
             argv: argv.iter().map(|s| s.to_string()).collect(),
             image: "n/a".into(),

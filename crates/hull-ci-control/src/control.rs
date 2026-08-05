@@ -414,6 +414,12 @@ impl Control {
                                 job_id: job.id.clone(),
                                 step_id: s.id.clone(),
                                 step_name: s.spec.name.clone(),
+                                // Tenancy travels with the work. The node needs it to scope the
+                                // workspace, the cache namespace, and the log key (D§1, D§11) —
+                                // derived here once, from the dispatch, rather than re-parsed
+                                // `tenant/repo` at each use on the far side.
+                                tenant: dispatch.tenant().to_string(),
+                                repo: dispatch.repo.clone(),
                                 tree_id: dispatch.tree_id.clone(),
                                 argv: s.spec.argv.clone(),
                                 image: s.spec.image.clone(),

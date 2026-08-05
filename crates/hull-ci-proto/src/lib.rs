@@ -143,7 +143,7 @@ pub enum Reason {
 ///
 /// Construct with [`Verdict::green`] / [`Verdict::red`] / [`Verdict::errored`] rather than by struct
 /// literal: those enforce that `reason` accompanies exactly the `errored` case.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Verdict {
     pub status: Status,
     /// One-line human summary. **Built from untrusted job output** (spec §14.5) — always run it
@@ -324,6 +324,15 @@ pub struct Assignment {
     pub job_id: String,
     pub step_id: String,
     pub step_name: String,
+    /// Owning tenant — the hard isolation boundary (design D§1).
+    ///
+    /// Carried explicitly rather than re-derived from `repo` at each use, because every
+    /// tenant-scoped decision on the node (cache namespace, log key, workspace path) reads it, and a
+    /// field that must be parsed out of another field is a field that will eventually be parsed
+    /// wrong. Without it the node cannot construct [`StepReport::log_key`] at all.
+    pub tenant: String,
+    /// `tenant/repo`, as it arrived on the dispatch. Routing and log-key construction only.
+    pub repo: String,
     /// Verified tree to materialize the workspace from.
     pub tree_id: String,
     /// argv, executed inside the sandbox only — never interpolated into a host command line.
@@ -342,6 +351,16 @@ pub struct StepReport {
     pub job_id: String,
     pub step_id: String,
     pub outcome: StepOutcome,
+    /// Why, when `outcome` is [`StepOutcome::Errored`].
+    ///
+    /// The internal wire needs this for the same reason the outward callback does (design G4): spec
+    /// §9.1 makes "no pre-existing test exercises this change" a statement about *coverage*
+    /// (`self_attested`), which an infrastructure flake must not be able to impersonate. Without a
+    /// typed channel here the node has to smuggle the distinction through free text and the control
+    /// plane has to parse it back out — a lossy round-trip through prose, in the one place where the
+    /// difference decides whether a human gets pulled into a review.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<Reason>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exit_code: Option<i32>,
     /// Object-store key of the captured log, `tenant/repo/tree_id/step/attempt` (design D§11).
