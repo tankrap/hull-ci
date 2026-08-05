@@ -1,0 +1,18 @@
+[package]
+name = "hull-ci-plan"
+description = "The pipeline evaluator: hermetic Starlark (.hull/ci.star) → a validated, acyclic step DAG. Evaluates attacker-controlled input on the control plane, so the dialect is the security boundary."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+serde.workspace = true
+thiserror.workspace = true
+starlark = "0.14"
+# Named directly because `starlark`'s builtin ABI returns `anyhow::Result`; we need the type to
+# construct the error that unwinds an evaluation.
+anyhow = "1"
+# For `IsolationTier` only: the tier a pipeline *requests* has to map onto the one the scheduler
+# already speaks, and restating the enum here would be a second opinion about a security boundary.
+hull-ci-proto = { path = "../hull-ci-proto" }

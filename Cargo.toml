@@ -5,6 +5,7 @@ members = [
     "crates/hull-ci-fetch",
     "crates/hull-ci-control",
     "crates/hull-ci-node",
+    "crates/hull-ci-plan",
     "crates/hull-ci-server",
 ]
 
