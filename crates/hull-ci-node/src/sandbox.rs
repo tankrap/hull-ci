@@ -253,6 +253,18 @@ pub trait SandboxBackend: Send + Sync {
     /// The long-form, per-clause enforcement facts for this host and configuration.
     fn controls(&self) -> EnforcedControls;
 
+    /// The `PATH` a job on this backend should see.
+    ///
+    /// Defaults to [`crate::env::SANDBOX_PATH`], which is what a real sandbox wants: the image
+    /// supplies the toolchain at standard locations, and a host-inherited PATH would be meaningless
+    /// inside the guest. Only the unsandboxed development backend overrides it — on a developer's
+    /// machine the toolchain lives wherever `nvm` or `rustup` put it, and a fixed PATH turns every
+    /// autodetected command into an `ENOENT` that gets reported as an infrastructure failure about a
+    /// tree that was perfectly fine.
+    fn job_path(&self) -> String {
+        crate::env::SANDBOX_PATH.to_string()
+    }
+
     /// The wire capability answer the scheduler acts on. Derived from [`controls`](Self::controls) —
     /// a backend must not be able to report a capability it does not enforce (D§7.2).
     fn capabilities(&self) -> BackendCapabilities {

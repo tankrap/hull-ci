@@ -253,7 +253,7 @@ impl NodeAgent {
             workspace: workspace.to_path_buf(),
             workdir: self.config.workdir.clone(),
             limits: self.config.limits,
-            env: crate::env::base_env("/tmp"),
+            env: crate::env::base_env_with_path("/tmp", &self.backend.job_path()),
             author_class: a.author_class,
         };
 

@@ -78,6 +78,22 @@ impl SandboxBackend for LocalProcessBackend {
         Self::controls_reported()
     }
 
+    /// The host's own `PATH`, unlike every real backend.
+    ///
+    /// This backend runs jobs as plain host subprocesses, so the toolchain is wherever the developer
+    /// installed it — an `nvm`-managed `npm`, a `rustup` `cargo`. Under the fixed
+    /// [`SANDBOX_PATH`](crate::env::SANDBOX_PATH) those resolve to nothing and every autodetected
+    /// command dies with `ENOENT`, which the node then reports as `errored`/infra: a claim that *our
+    /// infrastructure* failed, about a tree that was fine. Wrong, and misleading in the direction
+    /// that wastes someone's afternoon.
+    ///
+    /// Conceding the host PATH here gives away nothing: this backend already reports every §14
+    /// control unmet, and a subprocess with no namespace, no cgroup, and no rootfs could read the
+    /// host's filesystem regardless of what PATH we handed it. Real backends keep the fixed one.
+    fn job_path(&self) -> String {
+        std::env::var("PATH").unwrap_or_else(|_| crate::env::SANDBOX_PATH.to_string())
+    }
+
     fn spawn<'a>(
         &'a self,
         spec: &'a SandboxSpec,

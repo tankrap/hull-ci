@@ -123,7 +123,20 @@ impl StubHull {
         let change = tree::change_id(tree_id, &token);
         JobSpec {
             token: token.clone(),
-            repo: "tankrap/hull".to_string(),
+            // One repo per job, not one repo for the suite.
+            //
+            // A conforming runner is *expected* to deduplicate work by `(repo, tree_id)` — spec §9
+            // tells it to be idempotent per tree, and Hull's own memo is tree-keyed. In `keel` mode
+            // the tree_id is a genuine content address, so every test built from the same fixture
+            // produces the *same* tree, and a correct endpoint collapses the whole suite into one
+            // job: later tests then observe no fetch, no run, and a verdict delivered against an
+            // earlier test's callback. That is the endpoint behaving properly and the harness
+            // measuring itself.
+            //
+            // Each scenario is logically a different repository, so say so. Tests that mean to
+            // exercise de-duplication re-send the *same* `JobSpec`, which keeps its repo and its
+            // tree, and so still collide on purpose.
+            repo: format!("tankrap/hull-{token}"),
             change: change.clone(),
             tree_id: tree_id.to_string(),
             intent: "conformance: exercise the CI integration contract".to_string(),

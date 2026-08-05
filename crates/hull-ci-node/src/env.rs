@@ -18,11 +18,31 @@
 /// A single environment entry destined for the sandbox.
 pub type EnvVar = (String, String);
 
+/// The `PATH` a sandboxed job sees: fixed, minimal, and independent of the node's own environment.
+///
+/// Correct for a real sandbox, where the *image* supplies the toolchain at standard locations and a
+/// host-inherited PATH would be both meaningless inside the guest and a small leak of the host's
+/// layout.
+pub const SANDBOX_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+
 /// The base environment every job gets. Nothing here is a credential, and nothing here comes from the
 /// node's own process environment.
 pub fn base_env(home: &str) -> Vec<EnvVar> {
+    base_env_with_path(home, SANDBOX_PATH)
+}
+
+/// [`base_env`] with an explicit `PATH`.
+///
+/// Exists for exactly one caller: the development local-process backend, which runs jobs as plain
+/// host subprocesses. There [`SANDBOX_PATH`] is not a hardening measure but a bug — the toolchain
+/// lives wherever the developer's machine put it (an `nvm`-managed `npm`, a `rustup` `cargo`), so a
+/// fixed PATH makes every autodetected command fail with `ENOENT`, which then gets reported as an
+/// *infrastructure* error about a tree that was perfectly fine. That backend already declares every
+/// §14 control unmet, so inheriting the host `PATH` there concedes nothing that running unsandboxed
+/// on the host has not already conceded.
+pub fn base_env_with_path(home: &str, path: &str) -> Vec<EnvVar> {
     vec![
-        ("PATH".into(), "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".into()),
+        ("PATH".into(), path.into()),
         ("HOME".into(), home.into()),
         ("LANG".into(), "C.UTF-8".into()),
         // Conventional, and load-bearing for many test suites (`CI=true` disables watch modes and
