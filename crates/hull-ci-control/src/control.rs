@@ -26,6 +26,7 @@ use tokio::sync::Notify;
 
 use crate::aggregate::{fold, Decision, Fold};
 use crate::callback::{deliver, CallbackRequest, CallbackTransport, Delivery, RetryPolicy};
+use crate::graph;
 use crate::ids::new_step_id;
 use crate::model::{Job, JobId, JobState, Step, StepId, StepSpec, StepState};
 use crate::seams::{
@@ -339,20 +340,17 @@ impl Control {
         tree: &VerifiedTree,
         specs: Vec<StepSpec>,
     ) {
-        let now = Instant::now();
         self.with_job_mut(job_id, |job| {
             let _ = job.transition(JobState::Running);
             for (i, spec) in specs.into_iter().enumerate() {
-                let mut step = Step::new(new_step_id(i), spec);
-                // M1 has no DAG: every step is schedulable at once. `needs` edges arrive with the
-                // planner in M2 and become the `pending → ready` gate.
-                step.state = StepState::Ready;
-                step.ready_at = Some(now);
-                job.steps.push(step);
+                // Every step enters `pending`. Which of them are schedulable *now* and which are
+                // waiting on an edge is the graph's answer, not this loop's (design D§4.3), and the
+                // driver below asks it on every pass — including the first, so a plan with no `needs`
+                // at all is promoted wholesale before anything else happens.
+                job.steps.push(Step::new(new_step_id(i), spec));
             }
         });
 
-        self.schedule_ready(job_id, dispatch, tree);
         let notify = self.waker(job_id);
 
         enum Next {
@@ -371,6 +369,14 @@ impl Control {
                 // that into an `errored` job with a reason (design D§10.2).
                 for (step_id, expiry) in sweep(&mut job.steps, &self.config.timeouts, now) {
                     tracing::warn!(%job_id, %step_id, expiry = expiry.as_str(), "step timed out");
+                }
+
+                // Then the graph: a step that just finished may have unblocked its dependents, or —
+                // if it failed or errored — made them unrunnable. Both answers have to be in the
+                // steps *before* the fold, or a partly-skipped job would never reach a verdict
+                // (design D§6.5).
+                for (step_id, advance) in graph::advance(&mut job.steps, now) {
+                    tracing::debug!(%job_id, %step_id, ?advance, "step advanced by the graph");
                 }
 
                 if now >= job.deadline_at {
@@ -405,6 +411,16 @@ impl Control {
                     return;
                 }
                 Next::Wait(deadline) => {
+                    // Whatever the graph just unblocked goes out **now**, before we sleep. Waiting
+                    // for the next report to schedule it would turn every dependency edge into a
+                    // round trip and serialize a pipeline that was written to fan out (D§6.5). This
+                    // is also the retry for a step the fleet had no capacity for last pass.
+                    if self.schedule_ready(job_id, dispatch, tree) {
+                        // Steps changed hands, so the deadline computed above is stale — re-fold
+                        // instead of sleeping on it. Bounded: a pass only reports a change when it
+                        // moved a step out of `ready`, and no step returns there on its own.
+                        continue;
+                    }
                     let dur = deadline
                         .map(|d| d.saturating_duration_since(Instant::now()))
                         .unwrap_or(Duration::from_secs(1));
@@ -412,18 +428,20 @@ impl Control {
                         _ = notify.notified() => {}
                         _ = tokio::time::sleep(dur) => {}
                     }
-                    // Capacity may have freed up while we waited.
-                    self.schedule_ready(job_id, dispatch, tree);
                 }
             }
         }
     }
 
-    /// Hand every schedulable step to the fleet.
+    /// Hand every schedulable step to the fleet — **all of them, in one pass**, because independent
+    /// DAG steps are supposed to occupy different nodes at the same time (design D§6.5).
     ///
     /// `NoCapacity` is **not** a failure — the step keeps its queue position and only the queue-wait
     /// clock can turn the wait into a verdict (design D§4.5: "over cap is a wait, not a failure").
-    fn schedule_ready(&self, job_id: &str, dispatch: &Dispatch, tree: &VerifiedTree) {
+    ///
+    /// Returns whether any step left `ready` (leased, or errored outright on a rejection), which
+    /// tells the driver its deadline is stale and it should fold again rather than sleep.
+    fn schedule_ready(&self, job_id: &str, dispatch: &Dispatch, tree: &VerifiedTree) -> bool {
         let assignments: Vec<(StepId, Assignment)> = self
             .with_job(job_id, |job| {
                 job.steps
@@ -460,38 +478,46 @@ impl Control {
             })
             .unwrap_or_default();
 
+        let mut moved = false;
         for (step_id, assignment) in assignments {
             // Outside the store lock: the fleet is somebody else's process, and blocking every
             // job's bookkeeping on it would be a self-inflicted outage.
             let result = self.deps.node.assign(&assignment, tree);
             let now = Instant::now();
-            self.with_job_mut(job_id, |job| {
-                let ttl = self.config.lease_ttl;
-                let Some(step) = job.step_mut(&step_id) else { return };
-                match result {
-                    Ok(node_id) => {
-                        if step.transition(StepState::Leased).is_ok() {
+            moved |= self
+                .with_job_mut(job_id, |job| {
+                    let ttl = self.config.lease_ttl;
+                    let Some(step) = job.step_mut(&step_id) else { return false };
+                    match result {
+                        Ok(node_id) => {
+                            if step.transition(StepState::Leased).is_err() {
+                                return false;
+                            }
                             step.node_id = Some(node_id);
                             step.attempt += 1;
                             // The step wall clock is armed here, not at the node's "running"
                             // signal — see timeouts::sweep.
                             step.started_at = Some(now);
                             step.lease_expires_at = Some(now + ttl.max(self.config.timeouts.step));
+                            true
                         }
-                    }
-                    Err(NodeError::NoCapacity) => {}
-                    Err(e) => {
-                        if step.transition(StepState::Errored).is_ok() {
+                        Err(NodeError::NoCapacity) => false,
+                        Err(e) => {
+                            if step.transition(StepState::Errored).is_err() {
+                                return false;
+                            }
                             step.error_reason = Some(Reason::Infra);
                             step.detail = sanitize_summary(&e.to_string(), SUMMARY_MAX_CHARS);
                             step.finished_at = Some(now);
+                            true
                         }
                     }
-                }
-            });
+                })
+                .unwrap_or(false);
         }
         // No wake here on purpose: the driver calls this and then folds immediately, so notifying
         // itself would hand back a permit and spin the loop instead of sleeping on the deadline.
+        moved
     }
 
     fn cancel_steps(&self, job_id: &str, step_ids: &[StepId]) {
@@ -622,8 +648,8 @@ async fn drive(ctrl: Arc<Control>, job_id: JobId) {
 mod tests {
     use super::*;
     use crate::testing::{
-        dispatch, fast_config, harness, step_report, wait_until, FailingFetcher, HangingFetcher,
-        NodeMode, OkFetcher, StaticPlanner, WrongTreeFetcher,
+        dispatch, fast_config, harness, spec, stays_false, step_report, wait_until, FailingFetcher,
+        HangingFetcher, NodeMode, OkFetcher, StaticPlanner, WrongTreeFetcher,
     };
     use hull_ci_proto::{Status, StepOutcome};
 
@@ -663,6 +689,47 @@ mod tests {
             self.ctrl
                 .with_job(&self.job_id, |j| j.steps.iter().map(|s| s.id.clone()).collect())
                 .unwrap_or_default()
+        }
+
+        // ── DAG helpers. Steps are addressed by pipeline name, the way `needs` addresses them. ──
+
+        fn step_id(&self, name: &str) -> StepId {
+            self.ctrl
+                .with_job(&self.job_id, |j| {
+                    j.steps.iter().find(|s| s.spec.name == name).map(|s| s.id.clone())
+                })
+                .flatten()
+                .unwrap_or_else(|| panic!("no step named {name}"))
+        }
+
+        /// `None` until the driver has fetched, planned, and built the steps — which every poll
+        /// below has to tolerate, because that all happens on a spawned task.
+        fn maybe_state(&self, name: &str) -> Option<StepState> {
+            self.ctrl
+                .with_job(&self.job_id, |j| {
+                    j.steps.iter().find(|s| s.spec.name == name).map(|s| s.state)
+                })
+                .flatten()
+        }
+
+        fn state_of(&self, name: &str) -> StepState {
+            self.maybe_state(name).unwrap_or_else(|| panic!("no step named {name}"))
+        }
+
+        /// What the fleet was handed, in the order it was handed over.
+        fn assigned_names(&self) -> Vec<String> {
+            self.node.assigned().into_iter().map(|a| a.step_name).collect()
+        }
+
+        async fn wait_leased(&self, name: &str) -> bool {
+            wait_until(|| self.maybe_state(name) == Some(StepState::Leased)).await
+        }
+
+        fn report(&self, name: &str, outcome: StepOutcome) {
+            let id = self.step_id(name);
+            self.ctrl
+                .record_step_report(&step_report(&self.job_id, &id, outcome, "ok"), "node-test")
+                .expect("the lease holder is believed");
         }
 
         async fn settled(&self) -> Verdict {
@@ -931,5 +998,187 @@ mod tests {
         let verdict = live.settled().await;
         assert_eq!(verdict.status, Status::Errored);
         assert_eq!(verdict.reason, Some(Reason::Infra));
+    }
+
+    // ── The DAG (design D§6.5) ───────────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn a_diamond_runs_both_branches_at_once_and_joins_only_when_both_are_in() {
+        // The claim design D§6.5 makes is about wall clock: "a 4-step pipeline with one dependency
+        // edge is 2 steps deep, not 4." A scheduler that respected `needs` but released one step at a
+        // time would satisfy every ordering assertion below and still be wrong, so the load-bearing
+        // assertion is that b and c are leased *simultaneously*.
+        let live = start(
+            fast_config(),
+            Arc::new(OkFetcher),
+            Arc::new(StaticPlanner::graph(&[("a", &[]), ("b", &["a"]), ("c", &["a"]), ("d", &["b", "c"])])),
+            NodeMode::Accept,
+        );
+
+        assert!(live.wait_leased("a").await);
+        assert_eq!(live.assigned_names(), vec!["a"], "nothing downstream may start before its edge");
+        live.report("a", StepOutcome::Passed);
+
+        assert!(live.wait_leased("b").await);
+        assert!(live.wait_leased("c").await);
+        assert_eq!(live.state_of("b"), StepState::Leased, "both branches are in flight together");
+        assert_eq!(live.state_of("c"), StepState::Leased);
+        assert_eq!(live.state_of("d"), StepState::Pending, "the join has not been reached");
+
+        live.report("b", StepOutcome::Passed);
+        assert!(
+            stays_false(|| live.assigned_names().iter().any(|n| n == "d")).await,
+            "a join waits for every edge, not for the first one to arrive"
+        );
+
+        live.report("c", StepOutcome::Passed);
+        assert!(live.wait_leased("d").await);
+        live.report("d", StepOutcome::Passed);
+        assert_eq!(live.settled().await.status, Status::Green);
+    }
+
+    #[tokio::test]
+    async fn a_failed_root_skips_everything_behind_it_and_the_job_is_red() {
+        // Two things at once, because they are the same bug: a dependent that stayed `pending` would
+        // never run *and* would keep the job from ever folding (spec §10 — Hull will not time it out
+        // for us). And the verdict is `red`: the root genuinely failed, which is a fact about the
+        // code, not about us.
+        let live = start(
+            fast_config(),
+            Arc::new(OkFetcher),
+            Arc::new(StaticPlanner::graph(&[("a", &[]), ("b", &["a"]), ("c", &["b"])])),
+            NodeMode::Accept,
+        );
+        assert!(live.wait_leased("a").await);
+        live.report("a", StepOutcome::Failed);
+
+        let verdict = live.settled().await;
+        assert_eq!(verdict.status, Status::Red, "a real failure, not an infrastructure one");
+        assert_eq!(live.state_of("b"), StepState::Skipped, "a blocked step finishes, it does not wait");
+        assert_eq!(live.state_of("c"), StepState::Skipped, "and the skip cascades down the chain");
+        assert_eq!(live.assigned_names(), vec!["a"], "nothing behind a failure is ever handed to a node");
+    }
+
+    #[tokio::test]
+    async fn a_tolerated_failure_still_releases_the_steps_behind_it() {
+        // Design D§6.6: `continue_on_error` says this failure does not decide the job. It must not
+        // decide the sub-graph underneath it either — a lint step that is allowed to fail and yet
+        // silently cancels the test suite would be far worse than no `continue_on_error` at all.
+        let live = start(
+            fast_config(),
+            Arc::new(OkFetcher),
+            Arc::new(StaticPlanner(vec![spec("lint", &[]).continue_on_error(), spec("test", &["lint"])])),
+            NodeMode::Accept,
+        );
+        assert!(live.wait_leased("lint").await);
+        live.report("lint", StepOutcome::Failed);
+
+        assert!(live.wait_leased("test").await, "the dependent runs despite the tolerated failure");
+        live.report("test", StepOutcome::Passed);
+
+        let verdict = live.settled().await;
+        assert_eq!(verdict.status, Status::Green);
+        assert!(
+            verdict.summary.as_deref().unwrap_or_default().contains("tolerated"),
+            "tolerated is not invisible"
+        );
+    }
+
+    #[tokio::test]
+    async fn fail_fast_cancels_the_other_branch_without_waiting_for_it_to_answer() {
+        // Design D§6.6: no reason to finish a build whose verdict is determined. `b` never reports at
+        // all here — if the driver waited for the graph to drain, this test would hang until the job
+        // wall clock rather than assert.
+        let live = start(
+            fast_config(),
+            Arc::new(OkFetcher),
+            Arc::new(StaticPlanner::graph(&[("a", &[]), ("b", &[]), ("a2", &["a"]), ("b2", &["b"])])),
+            NodeMode::Accept,
+        );
+        assert!(live.wait_leased("a").await);
+        assert!(live.wait_leased("b").await);
+        live.report("a", StepOutcome::Failed);
+
+        let verdict = live.settled().await;
+        assert_eq!(verdict.status, Status::Red);
+        let cancelled: Vec<String> = live.node.cancelled().into_iter().map(|(_, s)| s).collect();
+        assert!(cancelled.contains(&live.step_id("b")), "the in-flight sibling's sandbox is destroyed");
+        assert_eq!(live.state_of("b"), StepState::Skipped);
+        assert_eq!(live.state_of("a2"), StepState::Skipped, "and the work behind the failure is dropped");
+        assert_eq!(live.state_of("b2"), StepState::Skipped, "as is the work behind the cancelled branch");
+        assert_eq!(live.transport.seen().len(), 1, "one verdict, reported once");
+    }
+
+    #[tokio::test]
+    async fn a_late_report_from_a_cancelled_step_cannot_flip_a_decided_verdict() {
+        // Design D§10.4 in the direction that matters most: a `passed` arriving after we gave up
+        // would turn an `errored` job green, and Hull memoizes green (spec §7) — an outage would
+        // launder itself into a permanent pass for that tree. The existing lease/in-flight guard is
+        // what stops it, and cancellation is exactly the case that takes a step out of flight while a
+        // node is still working on it.
+        let mut config = fast_config();
+        config.timeouts.job = Duration::from_millis(30);
+        let live = start(
+            config,
+            Arc::new(OkFetcher),
+            Arc::new(StaticPlanner::graph(&[("a", &[]), ("b", &["a"])])),
+            NodeMode::Accept,
+        );
+
+        let verdict = live.settled().await;
+        assert_eq!(verdict.status, Status::Errored);
+        assert_eq!(verdict.reason, Some(Reason::Timeout));
+
+        let late = step_report(&live.job_id, &live.step_id("a"), StepOutcome::Passed, "finished late");
+        assert_eq!(live.ctrl.record_step_report(&late, "node-test"), Err(ReportRejected::NotInFlight));
+        assert_eq!(
+            live.ctrl.verdict(&live.job_id).map(|v| v.status),
+            Some(Status::Errored),
+            "the one verdict stands"
+        );
+        assert_eq!(live.transport.seen().len(), 1, "and it is not re-decided or re-sent");
+    }
+
+    #[tokio::test]
+    async fn a_chain_never_runs_ahead_of_itself() {
+        let names = ["a", "b", "c", "d", "e"];
+        let edges: Vec<(&str, &[&str])> = vec![
+            ("a", &[]),
+            ("b", &["a"]),
+            ("c", &["b"]),
+            ("d", &["c"]),
+            ("e", &["d"]),
+        ];
+        let live = start(
+            fast_config(),
+            Arc::new(OkFetcher),
+            Arc::new(StaticPlanner::graph(&edges)),
+            NodeMode::Accept,
+        );
+
+        for (i, name) in names.iter().enumerate() {
+            assert!(live.wait_leased(name).await, "{name} never reached the fleet");
+            assert_eq!(live.assigned_names(), names[..=i], "the chain is strictly ordered");
+            live.report(name, StepOutcome::Passed);
+        }
+        assert_eq!(live.settled().await.status, Status::Green);
+    }
+
+    #[tokio::test]
+    async fn a_plan_whose_edges_cannot_be_satisfied_errors_instead_of_hanging() {
+        // The planner promises an acyclic graph with no dangling edges (design D§4.4), so this is a
+        // guard against *our* bug, not a user's. It earns its place because the failure mode without
+        // it is silence: spec §10 says Hull never times a job out, so the change would sit
+        // unverified until a human noticed.
+        let live = start(
+            fast_config(),
+            Arc::new(OkFetcher),
+            Arc::new(StaticPlanner::graph(&[("a", &["ghost"])])),
+            NodeMode::Accept,
+        );
+        let verdict = live.settled().await;
+        assert_eq!(verdict.status, Status::Errored, "never red — we learned nothing about the code");
+        assert_eq!(verdict.reason, Some(Reason::Infra));
+        assert!(live.node.assigned().is_empty());
     }
 }

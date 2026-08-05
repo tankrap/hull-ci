@@ -149,7 +149,7 @@ async fn futures_forever() {
 pub struct StaticPlanner(pub Vec<StepSpec>);
 
 impl StaticPlanner {
-    /// `n` independent steps, the shape M1 produces (no DAG until M2).
+    /// `n` independent steps — a plan with no edges at all, still the common shape.
     pub fn steps(n: usize) -> Self {
         StaticPlanner(
             (0..n)
@@ -157,6 +157,19 @@ impl StaticPlanner {
                 .collect(),
         )
     }
+
+    /// A DAG, as `(name, needs)` in declaration order — the shape design D§4.4's `step(…, needs=[…])`
+    /// emits. Declaration order matters: a `needs` target must already have been declared, which is
+    /// what makes the graph acyclic by construction.
+    pub fn graph(edges: &[(&str, &[&str])]) -> Self {
+        StaticPlanner(edges.iter().map(|(name, needs)| spec(name, needs)).collect())
+    }
+}
+
+/// One planner step, named so other steps' `needs` can reference it.
+pub fn spec(name: &str, needs: &[&str]) -> StepSpec {
+    StepSpec::new(name, vec!["cargo".into(), "test".into()], "rust:1.83")
+        .needs(needs.iter().map(|n| (*n).to_string()).collect())
 }
 
 impl Planner for StaticPlanner {
@@ -286,4 +299,21 @@ pub async fn wait_until(mut pred: impl FnMut() -> bool) -> bool {
         tokio::time::sleep(Duration::from_millis(2)).await;
     }
     false
+}
+
+/// Poll for a short bounded window and answer whether `pred` stayed false throughout.
+///
+/// The counterpart to [`wait_until`], and what a DAG assertion needs: "the join step has *not* been
+/// scheduled yet" is an absence, and an absence can only ever be tested for a finite time. Kept
+/// short because every call spends it — and worth spending, because the alternative is asserting
+/// nothing about the one bug this scheduler can have, which is running a step before its edge
+/// cleared.
+pub async fn stays_false(mut pred: impl FnMut() -> bool) -> bool {
+    for _ in 0..25 {
+        if pred() {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+    true
 }

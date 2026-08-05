@@ -26,9 +26,9 @@
 //!
 //! State is in memory: one replica, no Postgres (design D§13 — M1 is a single-tenant bring-up
 //! scaffold). The idempotency decision has the same shape it will have against `INSERT … ON CONFLICT
-//! DO NOTHING`, so moving it later does not move any logic. There is no DAG (`needs` arrives with
-//! the Starlark planner in M2), no step memo, and no fair-share queue — the queue-wait *clock*
-//! exists (design D§10.2) even though the queue it guards is M3's.
+//! DO NOTHING`, so moving it later does not move any logic. Steps are scheduled as a DAG ([`graph`],
+//! design D§6.5), but there is no step memo and no fair-share queue — the queue-wait *clock* exists
+//! (design D§10.2) even though the queue it guards is M3's.
 //!
 //! ## Conformance (spec §11)
 //!
@@ -46,6 +46,7 @@ pub mod aggregate;
 pub mod auth;
 pub mod callback;
 pub mod control;
+pub mod graph;
 pub mod ids;
 pub mod ingest;
 pub mod model;

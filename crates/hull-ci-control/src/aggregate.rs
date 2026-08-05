@@ -105,6 +105,7 @@ pub fn fold(steps: &[Step], elapsed: Duration) -> Fold {
 fn green_summary(steps: &[Step], elapsed: Duration) -> String {
     let cached = steps.iter().filter(|s| s.state == StepState::Cached).count();
     let tolerated = steps.iter().filter(|s| s.state == StepState::Failed).count();
+    let skipped = steps.iter().filter(|s| s.state == StepState::Skipped).count();
     let mut line = format!(
         "{} step{} ({} cached), 0 failed — {}",
         steps.len(),
@@ -116,6 +117,11 @@ fn green_summary(steps: &[Step], elapsed: Duration) -> String {
         // A `continue_on_error` failure must stay visible; hiding it is how a CI system starts
         // lying (design D§10.3 makes the same argument about retries).
         line.push_str(&format!(" ({tolerated} tolerated failure(s))"));
+    }
+    if skipped > 0 {
+        // Same argument, for the same reason: a skipped step did not run, and a green summary that
+        // counts it among "18 steps" without saying so overstates what was checked.
+        line.push_str(&format!(" ({skipped} skipped)"));
     }
     sanitize_summary(&line, SUMMARY_MAX_CHARS)
 }
@@ -244,6 +250,43 @@ mod tests {
             d.verdict.summary.as_deref().unwrap().contains("tolerated"),
             "a tolerated failure still has to be visible"
         );
+    }
+
+    #[test]
+    fn a_skipped_step_is_neither_a_pass_nor_a_failure() {
+        // A step the graph never released did not run, so it is no evidence about the code — in
+        // either direction. It must not fail the job, and it must not silently pad the "18 steps"
+        // count that makes the job look thoroughly checked.
+        let steps = vec![step("a", "fmt", StepState::Passed), step("b", "test", StepState::Skipped)];
+        let d = fold(&steps, Duration::from_secs(4)).decision().unwrap();
+        assert_eq!(d.verdict.status, hull_ci_proto::Status::Green);
+        assert!(d.verdict.summary.as_deref().unwrap().contains("1 skipped"));
+    }
+
+    #[test]
+    fn a_graph_whose_root_failed_is_red_not_errored() {
+        // The whole plan below the root is `skipped`, but the job is `red`: the root genuinely
+        // failed, which is a statement about the code (spec §7). Reading a wall of skips as "we
+        // could not check this" would report `errored`, and Hull does not memoize `errored` — the
+        // change would be re-run forever instead of being told it is broken.
+        let mut root = step("a", "build", StepState::Failed);
+        root.detail = "3 errors".into();
+        let steps = vec![root, step("b", "test", StepState::Skipped), step("c", "docs", StepState::Skipped)];
+
+        let d = fold(&steps, Duration::from_secs(9)).decision().unwrap();
+        assert_eq!(d.verdict.status, hull_ci_proto::Status::Red);
+        assert!(d.cancel.is_empty(), "an already-skipped step is not in flight and needs no cancel");
+    }
+
+    #[test]
+    fn a_graph_whose_root_errored_is_errored() {
+        // The mirror image: nothing ran, and the reason nothing ran was us.
+        let mut root = step("a", "build", StepState::Errored);
+        root.error_reason = Some(Reason::Timeout);
+        let steps = vec![root, step("b", "test", StepState::Skipped)];
+        let d = fold(&steps, Duration::from_secs(9)).decision().unwrap();
+        assert_eq!(d.verdict.status, hull_ci_proto::Status::Errored);
+        assert_eq!(d.verdict.reason, Some(Reason::Timeout));
     }
 
     #[test]

@@ -185,6 +185,14 @@ pub struct StepSpec {
     pub timeout: Option<Duration>,
     /// A failure here does not decide the job red (design D§6.6).
     pub continue_on_error: bool,
+    /// Names of steps that must reach a terminal, non-failing state before this one may be scheduled
+    /// (design D§4.4 `needs`).
+    ///
+    /// Empty means "ready immediately", which is every step in M1 and why M1 could schedule the whole
+    /// plan at once. The planner guarantees the graph is acyclic — a `needs` target must already have
+    /// been declared when the step is evaluated — so nothing downstream has to detect cycles at
+    /// runtime; it only has to respect the edges.
+    pub needs: Vec<String>,
 }
 
 impl StepSpec {
@@ -195,7 +203,14 @@ impl StepSpec {
             image: image.into(),
             timeout: None,
             continue_on_error: false,
+            needs: Vec::new(),
         }
+    }
+
+    /// Declare the steps this one waits on (design D§4.4).
+    pub fn needs(mut self, needs: Vec<String>) -> Self {
+        self.needs = needs;
+        self
     }
 
     pub fn continue_on_error(mut self) -> Self {
