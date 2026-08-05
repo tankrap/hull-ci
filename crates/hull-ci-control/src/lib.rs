@@ -27,8 +27,8 @@
 //! State is in memory: one replica, no Postgres (design D§13 — M1 is a single-tenant bring-up
 //! scaffold). The idempotency decision has the same shape it will have against `INSERT … ON CONFLICT
 //! DO NOTHING`, so moving it later does not move any logic. Steps are scheduled as a DAG ([`graph`],
-//! design D§6.5), but there is no step memo and no fair-share queue — the queue-wait *clock* exists
-//! (design D§10.2) even though the queue it guards is M3's.
+//! design D§6.5); which of the ready ones actually goes out, and in what order, is the multi-tenant
+//! scheduler's answer ([`fairshare`], design D§4.5). There is still no step memo.
 //!
 //! ## Conformance (spec §11)
 //!
@@ -46,6 +46,7 @@ pub mod aggregate;
 pub mod auth;
 pub mod callback;
 pub mod control;
+pub mod fairshare;
 pub mod graph;
 pub mod ids;
 pub mod ingest;
@@ -62,6 +63,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 pub use control::{Accepted, Control, ControlConfig, Deps, ReportRejected};
+pub use fairshare::{FairShare, Priority, Prioritizer, TenantPlan};
 pub use timeouts::Timeouts;
 
 use callback::{CallbackTransport, HttpCallback};

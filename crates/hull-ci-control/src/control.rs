@@ -13,6 +13,18 @@
 //!
 //! Nothing here runs job code. `argv` is copied from the plan into an [`Assignment`] and handed to a
 //! node; it is never a string this process interpolates, splits, or executes (spec §14.1).
+//!
+//! ## One driver per job, one queue for the fleet
+//!
+//! The drivers are per job, but the fleet is shared, so *which* ready step goes out next cannot be a
+//! per-job decision — that is how one tenant's flood takes the whole fleet (design D§4.5). Every
+//! driver pass therefore ends in [`Control::pump`]: it reconciles the calling job's steps into the
+//! one [`FairQueue`], asks the queue to choose across **all** tenants, and hands the winners to the
+//! fleet — including steps belonging to other jobs, whose drivers it then wakes.
+//!
+//! That is deliberate. A driver that could only dispatch its own steps would leave a granted step
+//! sitting until its own job happened to wake, which is precisely the latency the fairness SLO
+//! measures. Whichever driver is awake serves the queue; the queue decides whose turn it is.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -26,6 +38,7 @@ use tokio::sync::Notify;
 
 use crate::aggregate::{fold, Decision, Fold};
 use crate::callback::{deliver, CallbackRequest, CallbackTransport, Delivery, RetryPolicy};
+use crate::fairshare::{Depth, FairQueue, FairShare, Grant, JobView, StepView};
 use crate::graph;
 use crate::ids::new_step_id;
 use crate::model::{Job, JobId, JobState, Step, StepId, StepSpec, StepState};
@@ -60,6 +73,9 @@ pub struct ControlConfig {
     /// Hard ceiling on jobs held in memory. Settled jobs are evicted oldest-first to meet it; live
     /// jobs never are, so this can be exceeded by a burst of concurrent work rather than by history.
     pub max_jobs: usize,
+    /// How the fleet is divided between tenants: weights, plan quotas, and priority classes
+    /// (design D§4.5). See [`crate::fairshare`].
+    pub fair_share: FairShare,
 }
 
 impl Default for ControlConfig {
@@ -75,6 +91,7 @@ impl Default for ControlConfig {
             // its own delivery is still being attempted.
             job_retention: Duration::from_secs(60 * 60),
             max_jobs: 10_000,
+            fair_share: FairShare::default(),
         }
     }
 }
@@ -118,16 +135,28 @@ pub struct Control {
     config: ControlConfig,
     deps: Deps,
     jobs: Mutex<JobStore>,
+    /// The one multi-tenant scheduler (design D§4.5). Shared by every driver, because a per-job
+    /// queue cannot be fair about a shared fleet.
+    ///
+    /// **Lock order is always `jobs` then `queue`.** The scheduler's accounting is derived from the
+    /// job store, so it is always the inner lock; nothing may take it first and then reach for a job.
+    queue: Mutex<FairQueue>,
+    /// Where the broker put each running job's tree, so any driver can build an [`Assignment`] for a
+    /// step the scheduler granted — including one belonging to a job it is not itself driving.
+    trees: Mutex<HashMap<JobId, VerifiedTree>>,
     /// One waker per live job, so a step report wakes its driver instead of the driver polling.
     wakers: Mutex<HashMap<JobId, Arc<Notify>>>,
 }
 
 impl Control {
     pub fn new(config: ControlConfig, deps: Deps) -> Arc<Self> {
+        let queue = FairQueue::new(config.fair_share.clone());
         Arc::new(Control {
             config,
             deps,
             jobs: Mutex::new(JobStore::new()),
+            queue: Mutex::new(queue),
+            trees: Mutex::new(HashMap::new()),
             wakers: Mutex::new(HashMap::new()),
         })
     }
@@ -356,13 +385,15 @@ impl Control {
         }
     }
 
-    async fn phase_run(
-        &self,
-        job_id: &str,
-        dispatch: &Dispatch,
-        tree: &VerifiedTree,
-        specs: Vec<StepSpec>,
-    ) {
+    async fn phase_run(&self, job_id: &str, tree: &VerifiedTree, specs: Vec<StepSpec>) {
+        // Published before the first step is even `pending`, because the scheduler may hand this
+        // job's work to a node from *another* job's driver, and that driver needs to know where the
+        // broker put this tree (see [`Control::pump`]).
+        self.trees
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(job_id.to_string(), tree.clone());
+
         self.with_job_mut(job_id, |job| {
             let _ = job.transition(JobState::Running);
             for (i, spec) in specs.into_iter().enumerate() {
@@ -437,8 +468,9 @@ impl Control {
                     // Whatever the graph just unblocked goes out **now**, before we sleep. Waiting
                     // for the next report to schedule it would turn every dependency edge into a
                     // round trip and serialize a pipeline that was written to fan out (D§6.5). This
-                    // is also the retry for a step the fleet had no capacity for last pass.
-                    if self.schedule_ready(job_id, dispatch, tree) {
+                    // is also the retry for a step the fleet had no capacity for last pass, and the
+                    // pass on which another tenant's freed capacity is handed on.
+                    if self.pump(Some(job_id)) {
                         // Steps changed hands, so the deadline computed above is stale — re-fold
                         // instead of sleeping on it. Bounded: a pass only reports a change when it
                         // moved a step out of `ready`, and no step returns there on its own.
@@ -456,91 +488,171 @@ impl Control {
         }
     }
 
-    /// Hand every schedulable step to the fleet — **all of them, in one pass**, because independent
-    /// DAG steps are supposed to occupy different nodes at the same time (design D§6.5).
-    ///
-    /// `NoCapacity` is **not** a failure — the step keeps its queue position and only the queue-wait
-    /// clock can turn the wait into a verdict (design D§4.5: "over cap is a wait, not a failure").
-    ///
-    /// Returns whether any step left `ready` (leased, or errored outright on a rejection), which
-    /// tells the driver its deadline is stale and it should fold again rather than sleep.
-    fn schedule_ready(&self, job_id: &str, dispatch: &Dispatch, tree: &VerifiedTree) -> bool {
-        let assignments: Vec<(StepId, Assignment)> = self
-            .with_job(job_id, |job| {
-                job.steps
-                    .iter()
-                    .filter(|s| s.state == StepState::Ready)
-                    .map(|s| {
-                        (
-                            s.id.clone(),
-                            Assignment {
-                                job_id: job.id.clone(),
-                                step_id: s.id.clone(),
-                                step_name: s.spec.name.clone(),
-                                // Tenancy travels with the work. The node needs it to scope the
-                                // workspace, the cache namespace, and the log key (D§1, D§11) —
-                                // derived here once, from the dispatch, rather than re-parsed
-                                // `tenant/repo` at each use on the far side.
-                                tenant: dispatch.tenant().to_string(),
-                                repo: dispatch.repo.clone(),
-                                tree_id: dispatch.tree_id.clone(),
-                                argv: s.spec.argv.clone(),
-                                image: s.spec.image.clone(),
-                                tier: self.config.tier,
-                                author_class: job.author_class,
-                                timeout_secs: s
-                                    .spec
-                                    .timeout
-                                    .unwrap_or(self.config.timeouts.step)
-                                    .as_secs(),
-                                lease_secs: self.config.lease_ttl.as_secs(),
-                            },
-                        )
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
+    // ── The multi-tenant scheduler (design D§4.5) ────────────────────────────────────────────────
 
-        let mut moved = false;
-        for (step_id, assignment) in assignments {
+    /// One pass of the scheduler: reconcile, choose, dispatch.
+    ///
+    /// `on_behalf_of` is the job whose driver is calling, and the only job whose steps are read back
+    /// into the queue on this pass — every other job's state changes are reconciled by its own
+    /// driver, which its own events wake. What is *not* per job is the choosing: [`FairQueue`] picks
+    /// across every tenant, so this may dispatch — and then wake — jobs the caller has never heard
+    /// of. That is the point of a shared fleet (see the module docs).
+    ///
+    /// Independent DAG steps still go out together (design D§6.5) whenever the plan quotas allow;
+    /// what the scheduler adds is that a *neighbour's* first step is not behind all of them.
+    ///
+    /// `NoCapacity` is **not** a failure: the step goes back on the queue and only the queue-wait
+    /// clock can turn the wait into a verdict (design D§4.5, "over cap is a wait, not a failure").
+    ///
+    /// Returns whether a step of `on_behalf_of` left `ready`, which tells the caller its deadline is
+    /// stale and it should fold again rather than sleep.
+    fn pump(&self, on_behalf_of: Option<&str>) -> bool {
+        let now = Instant::now();
+        let grants = {
+            let jobs = self.lock_jobs();
+            let mut queue = self.lock_queue();
+            if let Some(job_id) = on_behalf_of {
+                if let Some(job) = jobs.get(job_id) {
+                    queue.reconcile(&job_view(job, &self.config.fair_share), now);
+                }
+            }
+            queue.select(now)
+        };
+
+        let mut moved_here = false;
+        let mut woken: Vec<JobId> = Vec::new();
+        for grant in grants {
+            let Some((assignment, tree)) = self.assignment_for(&grant) else {
+                // The job settled, or was evicted, between the grant and now. Hand its slot back
+                // rather than leaving the tenant paying for work that will never run.
+                self.lock_queue().release(&grant.job_id, &grant.step_id, now);
+                continue;
+            };
             // Outside the store lock: the fleet is somebody else's process, and blocking every
             // job's bookkeeping on it would be a self-inflicted outage.
-            let result = self.deps.node.assign(&assignment, tree);
-            let now = Instant::now();
-            moved |= self
-                .with_job_mut(job_id, |job| {
-                    let ttl = self.config.lease_ttl;
-                    let Some(step) = job.step_mut(&step_id) else { return false };
-                    match result {
-                        Ok(node_id) => {
-                            if step.transition(StepState::Leased).is_err() {
-                                return false;
-                            }
-                            step.node_id = Some(node_id);
-                            step.attempt += 1;
-                            // The step wall clock is armed here, not at the node's "running"
-                            // signal — see timeouts::sweep.
-                            step.started_at = Some(now);
-                            step.lease_expires_at = Some(now + ttl.max(self.config.timeouts.step));
-                            true
-                        }
-                        Err(NodeError::NoCapacity) => false,
-                        Err(e) => {
-                            if step.transition(StepState::Errored).is_err() {
-                                return false;
-                            }
-                            step.error_reason = Some(Reason::Infra);
-                            step.detail = sanitize_summary(&e.to_string(), SUMMARY_MAX_CHARS);
-                            step.finished_at = Some(now);
-                            true
-                        }
-                    }
-                })
-                .unwrap_or(false);
+            let result = self.deps.node.assign(&assignment, &tree);
+            let moved = self.settle_assignment(&grant, &assignment, result);
+            if !moved {
+                continue;
+            }
+            if on_behalf_of == Some(grant.job_id.as_str()) {
+                moved_here = true;
+            } else if !woken.contains(&grant.job_id) {
+                woken.push(grant.job_id.clone());
+            }
         }
-        // No wake here on purpose: the driver calls this and then folds immediately, so notifying
-        // itself would hand back a permit and spin the loop instead of sleeping on the deadline.
+
+        // Someone else's driver may be asleep on a deadline while we hand its step to a node; it has
+        // to fold. No wake for the caller on purpose — it folds immediately after this returns, so
+        // notifying itself would hand back a permit and spin the loop instead of sleeping.
+        for job_id in woken {
+            self.wake(&job_id);
+        }
+        moved_here
+    }
+
+    /// Apply what the fleet said about one granted step. Returns whether the step left `ready`.
+    fn settle_assignment(
+        &self,
+        grant: &Grant,
+        assignment: &Assignment,
+        result: Result<String, NodeError>,
+    ) -> bool {
+        let now = Instant::now();
+        if matches!(result, Err(NodeError::NoCapacity)) {
+            // The fleet is full. Back on the queue at the tail of its class, still holding the
+            // tenant's place — a plan limit and a full fleet are both waits, not failures.
+            self.lock_queue().requeue(&grant.job_id, &grant.step_id, &assignment.step_name, now);
+            return false;
+        }
+        let rejected = result.is_err();
+
+        let moved = self
+            .with_job_mut(&grant.job_id, |job| {
+                let ttl = self.config.lease_ttl;
+                let Some(step) = job.step_mut(&grant.step_id) else { return false };
+                match result {
+                    Ok(node_id) => {
+                        if step.transition(StepState::Leased).is_err() {
+                            return false;
+                        }
+                        step.node_id = Some(node_id);
+                        step.attempt += 1;
+                        // The step wall clock is armed here, not at the node's "running" signal —
+                        // see timeouts::sweep.
+                        step.started_at = Some(now);
+                        step.lease_expires_at = Some(now + ttl.max(self.config.timeouts.step));
+                        true
+                    }
+                    Err(e) => {
+                        if step.transition(StepState::Errored).is_err() {
+                            return false;
+                        }
+                        step.error_reason = Some(Reason::Infra);
+                        step.detail = sanitize_summary(&e.to_string(), SUMMARY_MAX_CHARS);
+                        step.finished_at = Some(now);
+                        true
+                    }
+                }
+            })
+            .unwrap_or(false);
+
+        // A rejection ends the step here, and a step that would not move was cancelled or timed out
+        // while we were talking to the fleet. Either way the scheduler stops accounting for it, and
+        // its tenant gets the slot back.
+        if rejected || !moved {
+            self.lock_queue().release(&grant.job_id, &grant.step_id, now);
+        }
         moved
+    }
+
+    /// What the fleet needs to run one granted step, or `None` if the job is no longer runnable.
+    fn assignment_for(&self, grant: &Grant) -> Option<(Assignment, VerifiedTree)> {
+        let tree = self.trees.lock().unwrap_or_else(|e| e.into_inner()).get(&grant.job_id).cloned()?;
+        let assignment = self.with_job(&grant.job_id, |job| {
+            let step = job.step(&grant.step_id)?;
+            Some(Assignment {
+                job_id: job.id.clone(),
+                step_id: step.id.clone(),
+                step_name: step.spec.name.clone(),
+                // Tenancy travels with the work. The node needs it to scope the workspace, the
+                // cache namespace, and the log key (D§1, D§11) — derived here once, from the
+                // dispatch, rather than re-parsed out of `tenant/repo` at each use on the far side.
+                tenant: job.dispatch.tenant().to_string(),
+                repo: job.dispatch.repo.clone(),
+                tree_id: job.dispatch.tree_id.clone(),
+                argv: step.spec.argv.clone(),
+                image: step.spec.image.clone(),
+                tier: self.config.tier,
+                author_class: job.author_class,
+                timeout_secs: step.spec.timeout.unwrap_or(self.config.timeouts.step).as_secs(),
+                lease_secs: self.config.lease_ttl.as_secs(),
+            })
+        })??;
+        Some((assignment, tree))
+    }
+
+    /// Give back everything a finished job was holding, and offer the freed capacity to whoever is
+    /// next in the fair order.
+    ///
+    /// Called once the driver is done rather than left to the retention sweep: a tenant's quota is
+    /// the scarcest thing in the system under load, and holding a settled job's slots until its
+    /// record is evicted an hour later would quietly shrink every plan.
+    fn retire(&self, job_id: &str) {
+        let now = Instant::now();
+        self.trees.lock().unwrap_or_else(|e| e.into_inner()).remove(job_id);
+        self.lock_queue().forget_job(job_id, now);
+        self.pump(None);
+    }
+
+    /// How much work one tenant has queued and running. Only ever its own — design D§1's
+    /// scheduler-side-channel row (see [`FairQueue::depth`]).
+    pub fn queue_depth(&self, tenant: &str) -> Depth {
+        self.lock_queue().depth(tenant)
+    }
+
+    fn lock_queue(&self) -> std::sync::MutexGuard<'_, FairQueue> {
+        self.queue.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     fn cancel_steps(&self, job_id: &str, step_ids: &[StepId]) {
@@ -678,15 +790,46 @@ async fn drive(ctrl: Arc<Control>, job_id: JobId) {
             return;
         }
     };
-    ctrl.phase_run(&job_id, &dispatch, &tree, specs).await;
+    ctrl.phase_run(&job_id, &tree, specs).await;
+    // However the run ended — verdict, timeout, or a job that vanished under us — the quota it was
+    // holding belongs to its tenant again, and to whoever the fair order says is next.
+    ctrl.retire(&job_id);
+}
+
+/// One job's steps as the scheduler needs to see them (design D§4.5).
+///
+/// The priority class is derived here, on every pass, rather than stamped on the job at admission:
+/// it is policy, and a control plane that re-read its policy only at accept time would keep
+/// scheduling a re-classified tenant's work under the old rule for as long as the job lived.
+fn job_view(job: &Job, cfg: &FairShare) -> JobView {
+    JobView {
+        job_id: job.id.clone(),
+        // The tenant half of `repo`, which is the isolation boundary (design D§1) and the unit every
+        // quota and every virtual clock below is kept per.
+        tenant: job.dispatch.tenant().to_string(),
+        priority: cfg.prioritizer.priority(&job.dispatch),
+        steps: job
+            .steps
+            .iter()
+            .map(|s| StepView {
+                step_id: s.id.clone(),
+                name: s.spec.name.clone(),
+                state: s.state,
+                started_at: s.started_at,
+                finished_at: s.finished_at,
+            })
+            .collect(),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::fairshare::TenantPlan;
     use crate::testing::{
-        dispatch, fast_config, harness, spec, stays_false, step_report, wait_until, FailingFetcher,
-        HangingFetcher, NodeMode, OkFetcher, StaticPlanner, WrongTreeFetcher,
+        dispatch, fast_config, harness, spec, stays_false, step_report, wait_until, BackgroundRepo,
+        FailingFetcher, HangingFetcher, NodeMode, OkFetcher, PerTreePlanner, StaticPlanner,
+        WrongTreeFetcher,
     };
     use hull_ci_proto::{Status, StepOutcome};
 
@@ -1239,5 +1382,142 @@ mod tests {
         assert_eq!(verdict.status, Status::Errored, "never red — we learned nothing about the code");
         assert_eq!(verdict.reason, Some(Reason::Infra));
         assert!(live.node.assigned().is_empty());
+    }
+
+    // ── Fair share and admission (design D§4.5) ──────────────────────────────────────────────────
+
+    /// The step one job currently holds a lease on.
+    fn leased_step(ctrl: &Control, job_id: &str) -> Option<StepId> {
+        ctrl.with_job(job_id, |j| {
+            j.steps.iter().find(|s| s.state == StepState::Leased).map(|s| s.id.clone())
+        })
+        .flatten()
+    }
+
+    #[tokio::test]
+    async fn a_flooding_tenant_does_not_delay_a_neighbours_step() {
+        // The §1 fairness SLO, in the only form a test can hold it: p99 is not measurable here, but
+        // the *ordering* that produces it is. `flood` has six steps queued against a fleet with one
+        // slot; `solo` arrives afterwards with one. A first-come scheduler hands `solo` the seventh
+        // slot it ever frees. The fair queue hands it the second, because `flood` only ever advances
+        // its own virtual clock (design D§4.5).
+        let mut config = fast_config();
+        config.fair_share.fleet_slots = Some(1);
+        let h = harness(
+            config,
+            Arc::new(OkFetcher),
+            Arc::new(PerTreePlanner::new(&[("flood", 6), ("solo", 1)])),
+            NodeMode::Accept,
+        );
+
+        let flood = h.control.accept(dispatch("flood/api", "flood"));
+        let node = Arc::clone(&h.node);
+        assert!(wait_until(move || node.assigned().len() == 1).await, "the flood takes the one slot");
+
+        // Wait for the neighbour's step to actually be *in* the queue, so this is a test about the
+        // scheduler's choice and not about which driver happened to wake first.
+        h.control.accept(dispatch("solo/api", "solo"));
+        let ctrl = Arc::clone(&h.control);
+        assert!(wait_until(move || ctrl.queue_depth("solo").queued == 1).await, "solo is waiting");
+        assert_eq!(h.control.queue_depth("flood").queued, 5, "and so are five of the flood's");
+        let node = Arc::clone(&h.node);
+        assert!(
+            stays_false(move || node.assigned().len() > 1).await,
+            "nothing more goes out while the fleet is full"
+        );
+
+        // One slot comes free. It is the neighbour's turn, not the flood's second step.
+        let running = leased_step(&h.control, &flood.job_id).expect("a leased step");
+        h.control
+            .record_step_report(&step_report(&flood.job_id, &running, StepOutcome::Passed, "ok"), "node-test")
+            .unwrap();
+
+        let node = Arc::clone(&h.node);
+        assert!(wait_until(move || node.assigned().len() == 2).await, "the freed slot is used");
+        assert_eq!(
+            h.node.assigned()[1].tenant,
+            "solo",
+            "the neighbour goes second, not behind five more of the flood's steps"
+        );
+    }
+
+    #[tokio::test]
+    async fn steps_over_a_tenants_concurrency_cap_stay_queued_rather_than_failing() {
+        // Design D§4.5: "a step is admitted to running only if both [caps] are under cap; otherwise
+        // it stays queued." The failure this guards against is the tempting one — treating a plan
+        // limit as a rejection — which would turn "you are on the small plan" into a red build.
+        let mut config = fast_config();
+        config.fair_share.default_plan =
+            TenantPlan { max_running_steps: 1, ..TenantPlan::default() };
+        let live = start(config, Arc::new(OkFetcher), Arc::new(StaticPlanner::steps(3)), NodeMode::Accept);
+
+        assert!(live.wait_leased("step0").await);
+        let node = Arc::clone(&live.node);
+        assert!(stays_false(move || node.assigned().len() > 1).await, "one at a time, by plan");
+        assert_eq!(live.state_of("step1"), StepState::Ready, "queued, not errored");
+        assert_eq!(live.state_of("step2"), StepState::Ready);
+        assert_eq!(live.ctrl.queue_depth("t"), crate::fairshare::Depth { queued: 2, running: 1 });
+
+        // And the cap is a queue, not a ceiling on the job: each step goes as the last one lands.
+        for name in ["step0", "step1", "step2"] {
+            assert!(live.wait_leased(name).await, "{name} never got its turn");
+            live.report(name, StepOutcome::Passed);
+        }
+        assert_eq!(live.settled().await.status, Status::Green);
+        assert_eq!(live.assigned_names(), ["step0", "step1", "step2"]);
+    }
+
+    #[tokio::test]
+    async fn a_plan_limit_becomes_a_verdict_only_when_the_queue_wait_clock_fires() {
+        // The other half of "a wait, not a failure": the wait is not infinite either. A tenant with
+        // no node-minutes left never gets admitted, and after the queue-wait clock (design D§10.2)
+        // the step is `errored` with `reason: capacity` — never `red`, because the code did not
+        // fail, the tenant ran out of plan.
+        let mut config = fast_config();
+        config.timeouts.queue_wait = Duration::from_millis(40);
+        config.fair_share.default_plan =
+            TenantPlan { node_minutes_per_hour: 0.0, ..TenantPlan::default() };
+        let live = start(config, Arc::new(OkFetcher), Arc::new(StaticPlanner::steps(1)), NodeMode::Accept);
+
+        let verdict = live.settled().await;
+        assert_eq!(verdict.status, Status::Errored);
+        assert_eq!(verdict.reason, Some(Reason::Capacity), "a plan limit is not a test failure");
+        assert!(live.node.assigned().is_empty(), "and the fleet was never asked to run it");
+    }
+
+    #[tokio::test]
+    async fn an_interactive_step_preempts_its_own_tenants_background_work() {
+        // Design D§4.5's within-tenant order, end to end through the [`Prioritizer`] seam. The
+        // nightly job is queued first and has work left; the human's click still goes next. Both
+        // jobs are the *same tenant*, which is the only place priority is allowed to matter.
+        let mut config = fast_config();
+        config.fair_share.fleet_slots = Some(1);
+        config.fair_share.prioritizer = Arc::new(BackgroundRepo("nightly"));
+        let h = harness(
+            config,
+            Arc::new(OkFetcher),
+            Arc::new(PerTreePlanner::new(&[("nightly", 3), ("click", 1)])),
+            NodeMode::Accept,
+        );
+
+        let nightly = h.control.accept(dispatch("acme/nightly", "nightly"));
+        let node = Arc::clone(&h.node);
+        assert!(wait_until(move || node.assigned().len() == 1).await);
+
+        h.control.accept(dispatch("acme/api", "click"));
+        let ctrl = Arc::clone(&h.control);
+        assert!(wait_until(move || ctrl.queue_depth("acme").queued == 3).await, "2 nightly + 1 click");
+
+        let running = leased_step(&h.control, &nightly.job_id).expect("a leased step");
+        h.control
+            .record_step_report(&step_report(&nightly.job_id, &running, StepOutcome::Passed, "ok"), "node-test")
+            .unwrap();
+
+        let node = Arc::clone(&h.node);
+        assert!(wait_until(move || node.assigned().len() == 2).await);
+        assert_eq!(
+            h.node.assigned()[1].repo, "acme/api",
+            "someone is watching a spinner; the nightly's remaining steps wait"
+        );
     }
 }

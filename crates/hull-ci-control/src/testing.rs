@@ -2,6 +2,7 @@
 //! broker, or a network — and, more importantly, so the *failure* paths (a node that rejects, a Hull
 //! that 503s, a fetch that hangs past its clock) are exercised rather than assumed.
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Mutex;
 use std::time::Duration;
@@ -10,6 +11,7 @@ use hull_ci_proto::{Assignment, AuthorClass, Dispatch, StepOutcome, StepReport};
 
 use crate::callback::{BoxFuture, CallbackRequest, CallbackResponse, CallbackTransport, TransportError};
 use crate::control::{Control, ControlConfig, Deps};
+use crate::fairshare::{Prioritizer, Priority};
 use crate::model::StepSpec;
 use crate::seams::{
     FetchError, FetchRequest, Fetcher, Membership, NodeError, NodeSink, PlanError, Planner,
@@ -175,6 +177,43 @@ pub fn spec(name: &str, needs: &[&str]) -> StepSpec {
 impl Planner for StaticPlanner {
     fn plan<'a>(&'a self, _tree: &'a VerifiedTree) -> BoxFuture<'a, Result<Vec<StepSpec>, PlanError>> {
         Box::pin(async move { Ok(self.0.clone()) })
+    }
+}
+
+/// How many independent steps each `tree_id` plans to, so one control plane can serve two tenants
+/// with wildly different amounts of work — which is the only shape a fairness test can be written in.
+pub struct PerTreePlanner(HashMap<String, usize>);
+
+impl PerTreePlanner {
+    pub fn new(steps_per_tree: &[(&str, usize)]) -> Self {
+        PerTreePlanner(steps_per_tree.iter().map(|(t, n)| ((*t).to_string(), *n)).collect())
+    }
+}
+
+impl Planner for PerTreePlanner {
+    fn plan<'a>(&'a self, tree: &'a VerifiedTree) -> BoxFuture<'a, Result<Vec<StepSpec>, PlanError>> {
+        let n = self.0.get(&tree.tree_id).copied().unwrap_or(1);
+        Box::pin(async move {
+            Ok((0..n)
+                .map(|i| StepSpec::new(format!("step{i}"), vec!["cargo".into(), "test".into()], "rust:1.83"))
+                .collect())
+        })
+    }
+}
+
+// ── Priority ─────────────────────────────────────────────────────────────────────────────────────
+
+/// Files one named repo's work as `background` and everything else as `interactive` — a stand-in for
+/// Hull telling us "this came from the nightly sweep, not from someone clicking check".
+pub struct BackgroundRepo(pub &'static str);
+
+impl Prioritizer for BackgroundRepo {
+    fn priority(&self, dispatch: &Dispatch) -> Priority {
+        if dispatch.repo_name() == self.0 {
+            Priority::Background
+        } else {
+            Priority::Interactive
+        }
     }
 }
 
