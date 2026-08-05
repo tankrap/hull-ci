@@ -13,6 +13,9 @@ serde_json.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+# Per-job scratch directories. Already a workspace dependency; promoted out of dev-dependencies
+# because the local-process backend creates a scratch dir at runtime, not only under test.
+tempfile.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
