@@ -275,6 +275,32 @@ pub struct Job {
     /// The job wall clock (design D§10.2, default 60 min).
     pub deadline_at: Instant,
     pub report_attempts: u32,
+    /// Every distinct `callback_url` that has asked about this tree, in arrival order, starting with
+    /// the dispatch that created the job.
+    ///
+    /// **Work is deduplicated by `(repo, tree_id)`; delivery is not.** Two different changes can share
+    /// one tree — that is the entire premise of tree-keyed memoization (a rebase, a cherry-pick, a
+    /// revert of a revert) — and each arrives with its *own* `callback_url`. Spec §9 says Hull's
+    /// in-flight de-dup is best-effort and in-memory, so a second dispatch for a tree we already know
+    /// is expected: after a Hull restart, across replicas, or with `{"force": true}`. Reporting only
+    /// to the first URL would leave that second change unverified forever, waiting on an answer that
+    /// was delivered somewhere else. §9's own wording is the hint — be idempotent "per `(tree_id)`
+    /// **or** per `callback_url`": the tree keys the *work*, the callback keys the *answer*.
+    pub callback_urls: Vec<String>,
+}
+
+impl Job {
+    /// Record a `callback_url` that must receive this job's verdict. Returns whether it was new.
+    ///
+    /// De-duplicated, because an ordinary retry of the *same* dispatch must not make us deliver the
+    /// same verdict twice to the same place.
+    pub fn add_callback_url(&mut self, url: &str) -> bool {
+        if self.callback_urls.iter().any(|u| u == url) {
+            return false;
+        }
+        self.callback_urls.push(url.to_string());
+        true
+    }
 }
 
 impl Job {
@@ -285,6 +311,7 @@ impl Job {
         now: Instant,
         job_timeout: Duration,
     ) -> Self {
+        let callback_urls = vec![dispatch.callback_url.clone()];
         Job {
             id,
             dispatch,
@@ -295,6 +322,7 @@ impl Job {
             created_at: now,
             deadline_at: now + job_timeout,
             report_attempts: 0,
+            callback_urls,
         }
     }
 

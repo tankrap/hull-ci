@@ -71,8 +71,12 @@ impl JobStore {
     ) -> Admit {
         let key = (dispatch.repo.clone(), dispatch.tree_id.clone());
 
-        if let Some(existing_id) = self.by_key.get(&key) {
-            if let Some(job) = self.by_id.get(existing_id) {
+        if let Some(existing_id) = self.by_key.get(&key).cloned() {
+            if let Some(job) = self.by_id.get_mut(&existing_id) {
+                // The work is a duplicate; the *destination* may not be. A second change sharing this
+                // tree carries its own `callback_url`, and dropping it would leave that change waiting
+                // forever on an answer delivered elsewhere (see `Job::callback_urls`).
+                job.add_callback_url(&dispatch.callback_url);
                 return match (job.state.is_finished(), job.verdict.clone()) {
                     (true, Some(v)) => Admit::Finished { job_id: job.id.clone(), verdict: Box::new(v) },
                     // Finished-but-verdictless cannot happen through the driver; treat it as live

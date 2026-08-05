@@ -547,31 +547,47 @@ impl Control {
     /// Deliver (or re-deliver) the recorded verdict. Safe to call more than once — spec §9 makes a
     /// duplicate callback explicitly a re-affirmation.
     async fn report(&self, job_id: &str) {
-        let Some(Some(req)) = self.with_job(job_id, |job| {
-            job.verdict.clone().map(|verdict| CallbackRequest {
-                // Verbatim (spec §5).
-                url: job.dispatch.callback_url.clone(),
-                secret: self.config.secret.clone(),
-                verdict,
-                job_id: job.id.clone(),
+        // One verdict, but possibly several places that asked for it: work is deduplicated by
+        // (repo, tree_id), delivery is not (see `Job::callback_urls`).
+        let Some(Some(reqs)) = self.with_job(job_id, |job| {
+            job.verdict.clone().map(|verdict| {
+                job.callback_urls
+                    .iter()
+                    .map(|url| CallbackRequest {
+                        // Verbatim (spec §5).
+                        url: url.clone(),
+                        secret: self.config.secret.clone(),
+                        verdict: verdict.clone(),
+                        job_id: job.id.clone(),
+                    })
+                    .collect::<Vec<_>>()
             })
         }) else {
             return;
         };
 
-        let outcome = deliver(&*self.deps.transport, &req, &self.config.retry).await;
-        self.with_job_mut(job_id, |job| match &outcome {
-            Delivery::Delivered { attempts, .. } => {
-                job.report_attempts += attempts;
-                let _ = job.transition(JobState::Reported);
-            }
-            Delivery::Parked { attempts, .. } => {
-                job.report_attempts += attempts;
-                let _ = job.transition(JobState::ReportFailed);
-            }
+        // Every destination is attempted, and one unreachable Hull must not suppress the others; the
+        // job counts as reported if *any* delivery landed, and parked only if they all failed.
+        let mut attempts_total = 0;
+        let mut any_delivered = false;
+        for req in &reqs {
+            let outcome = deliver(&*self.deps.transport, req, &self.config.retry).await;
+            attempts_total += match &outcome {
+                Delivery::Delivered { attempts, .. } | Delivery::Parked { attempts, .. } => *attempts,
+            };
+            any_delivered |= outcome.is_delivered();
+        }
+        let outcome_delivered = any_delivered;
+        self.with_job_mut(job_id, |job| {
+            job.report_attempts += attempts_total;
+            let _ = job.transition(if outcome_delivered {
+                JobState::Reported
+            } else {
+                JobState::ReportFailed
+            });
         });
 
-        if outcome.is_delivered() {
+        if outcome_delivered {
             // The driver is done with this job; drop its waker so a long-lived process does not
             // accumulate one per job it has ever seen.
             self.wakers.lock().unwrap_or_else(|e| e.into_inner()).remove(job_id);
@@ -845,6 +861,60 @@ mod tests {
         assert_eq!(sent[1].url, sent[0].url);
         assert_eq!(sent[1].verdict.status, first.status);
         assert_eq!(live.node.assigned().len(), 1, "a duplicate must not re-run a single step");
+    }
+
+    #[tokio::test]
+    async fn a_second_change_sharing_a_tree_gets_the_verdict_at_its_own_callback_url() {
+        // The premise of tree-keyed memoization is that two changes can share a tree — a rebase, a
+        // cherry-pick, a revert of a revert. Each arrives with its OWN callback_url, and spec §9 says
+        // Hull's in-flight de-dup is best-effort and in-memory, so a second dispatch for a tree we
+        // already know is expected (after a Hull restart, across replicas, or with force).
+        //
+        // Deduplicating the WORK is right; deduplicating the DELIVERY is not. Reporting only to the
+        // first URL leaves the second change unverified forever, waiting on an answer that was
+        // delivered somewhere else — and because that change never gets a verdict, nothing about it
+        // ever looks broken enough to investigate.
+        let live = start(fast_config(), Arc::new(OkFetcher), Arc::new(StaticPlanner::steps(1)), NodeMode::Accept);
+        let steps = live.steps_leased().await;
+        live.ctrl
+            .record_step_report(&step_report(&live.job_id, &steps[0], StepOutcome::Passed, "ok"), "node-test")
+            .unwrap();
+        live.settled().await;
+
+        // Same repo, same tree, DIFFERENT change — so a different callback_url.
+        let mut second = dispatch("t/r", "tree1");
+        second.change = "b2b2b2b2b2b2".into();
+        second.callback_url = "https://hull.example/api/repos/t/r/change/b2b2/ci-result".into();
+        let again = live.ctrl.accept(second.clone());
+        assert_eq!(again.job_id, live.job_id, "the work is still deduplicated");
+
+        let transport = Arc::clone(&live.transport);
+        assert!(wait_until(move || transport.seen().len() >= 2).await);
+        let urls: Vec<String> = live.transport.seen().iter().map(|r| r.url.clone()).collect();
+        assert!(
+            urls.contains(&second.callback_url),
+            "the second change must receive the verdict at its own callback_url; got {urls:?}"
+        );
+        assert_eq!(live.node.assigned().len(), 1, "and still only one execution");
+    }
+
+    #[tokio::test]
+    async fn re_dispatching_the_identical_callback_url_does_not_double_deliver() {
+        // The counterpart to the above: an ordinary retry of the *same* dispatch must not make us
+        // post the same verdict twice to the same place. Delivery is per distinct URL, not per
+        // dispatch received.
+        let live = start(fast_config(), Arc::new(OkFetcher), Arc::new(StaticPlanner::steps(1)), NodeMode::Accept);
+        let steps = live.steps_leased().await;
+        live.ctrl
+            .record_step_report(&step_report(&live.job_id, &steps[0], StepOutcome::Passed, "ok"), "node-test")
+            .unwrap();
+        live.settled().await;
+
+        live.ctrl.accept(dispatch("t/r", "tree1"));
+        let transport = Arc::clone(&live.transport);
+        assert!(wait_until(move || transport.seen().len() == 2).await);
+        let urls: Vec<String> = live.transport.seen().iter().map(|r| r.url.clone()).collect();
+        assert_eq!(urls[0], urls[1], "the re-report goes to the one known URL, not to a second one");
     }
 
     #[tokio::test]
