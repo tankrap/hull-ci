@@ -364,11 +364,25 @@ impl FairQueue {
         self.tenants.entry(tenant).or_default().queues[priority as usize].push_back(waiting);
     }
 
-    /// Stop accounting for a step: it finished, was cancelled, or was handed back.
+    /// Stop accounting for a step that did not run to completion — cancelled, timed out, or handed
+    /// back by the fleet.
     ///
-    /// A step that was *running* pays for the time it held a slot, which is what the node-minute
-    /// quota is measured from and what the cost estimator learns from.
+    /// It still **pays** for whatever time it held a slot, because the fleet really was occupied and
+    /// the node-minute quota is a measure of consumption. What it does not do is **teach**: the
+    /// duration of a step that was interrupted says nothing about what that step costs to run, and a
+    /// grant the fleet refused would teach an estimate of *zero* — which would make that tenant's
+    /// work look free and hand it the queue, throttling exactly the wrong tenant.
     pub fn release(&mut self, job_id: &str, step_id: &str, at: Instant) {
+        self.unplace(job_id, step_id, at, false);
+    }
+
+    /// [`release`](Self::release), plus: this step ran to completion, so how long it took is what
+    /// that step key costs and the estimator should say so next time.
+    pub fn finish(&mut self, job_id: &str, step_id: &str, at: Instant) {
+        self.unplace(job_id, step_id, at, true);
+    }
+
+    fn unplace(&mut self, job_id: &str, step_id: &str, at: Instant, learn: bool) {
         let Some(meta) = self.jobs.get_mut(job_id) else { return };
         let tenant = meta.tenant.clone();
         let Some(placement) = meta.steps.remove(step_id) else { return };
@@ -379,7 +393,9 @@ impl FairQueue {
             t.running.remove(&(job_id.to_string(), step_id.to_string()));
             t.ledger.push_back((at, ran));
         }
-        self.observe_cost(&tenant, &placement.name, ran);
+        if learn {
+            self.observe_cost(&tenant, &placement.name, ran);
+        }
     }
 
     /// Hand a granted step back to the queue — the fleet had no capacity for it, or its lease was
@@ -429,6 +445,12 @@ impl FairQueue {
                 (StepState::Leased | StepState::Running, _) => {
                     self.release(&view.job_id, &step.step_id, now);
                     self.adopt(&view.job_id, &step.step_id, &step.name, step.started_at.unwrap_or(now));
+                }
+                // Only `passed` and `failed` mean a step ran to its own conclusion. A `cached` step
+                // never ran, and `errored`/`skipped` were cut short — none of the three is evidence
+                // about what this step key costs, so none of them teaches the estimator.
+                (StepState::Passed | StepState::Failed, Some(_)) => {
+                    self.finish(&view.job_id, &step.step_id, step.finished_at.unwrap_or(now))
                 }
                 (state, Some(_)) if state.is_terminal() => {
                     self.release(&view.job_id, &step.step_id, step.finished_at.unwrap_or(now))
@@ -706,7 +728,7 @@ mod tests {
         let mut order = Vec::new();
         for _ in 0..rounds {
             let Some(g) = q.select(now).first().cloned() else { break };
-            q.release(&g.job_id, &g.step_id, now + SERVED_FOR);
+            q.finish(&g.job_id, &g.step_id, now + SERVED_FOR);
             order.push((g.tenant, g.step_id));
         }
         order
@@ -903,6 +925,11 @@ mod tests {
         q.requeue(&g.job_id, &g.step_id, "test", now);
         assert_eq!(q.depth("t"), Depth { queued: 2, running: 0 }, "the slot is back");
         assert_eq!(q.select(now).len(), 1, "and the tenant can be served again");
+
+        // And the refusal taught the estimator nothing. If it had recorded the zero seconds this
+        // step "ran" for, every later step of this key would tag at the floor cost and the tenant
+        // whose work the fleet keeps refusing would end up *outbidding* everyone else.
+        assert_eq!(q.estimate("t", "test"), 60.0, "a step that never ran says nothing about cost");
     }
 
     #[test]
@@ -919,7 +946,7 @@ mod tests {
             q.enqueue("j", &format!("s{i}"), "test");
         }
         for (i, g) in q.select(now).into_iter().enumerate() {
-            q.release(&g.job_id, &g.step_id, now + Duration::from_secs(10 * (i as u64 + 1)));
+            q.finish(&g.job_id, &g.step_id, now + Duration::from_secs(10 * (i as u64 + 1)));
         }
         assert_eq!(q.estimate("acme", "test"), 20.0, "p50 of 10s, 20s, 30s");
         assert_eq!(q.estimate("other", "test"), 60.0, "and it never crosses a tenant boundary");

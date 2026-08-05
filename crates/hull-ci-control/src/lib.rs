@@ -63,7 +63,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 pub use control::{Accepted, Control, ControlConfig, Deps, ReportRejected};
-pub use fairshare::{FairShare, Priority, Prioritizer, TenantPlan};
+pub use fairshare::{Depth, FairShare, Prioritizer, Priority, TenantPlan};
 pub use timeouts::Timeouts;
 
 use callback::{CallbackTransport, HttpCallback};
