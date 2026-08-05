@@ -1,0 +1,29 @@
+# Black-box conformance suite for the Hull CI Integration Standard (CI-SPEC.md).
+#
+# DELIBERATELY NOT A WORKSPACE MEMBER. The empty `[workspace]` table below makes this package its own
+# workspace root, so it is invisible to /Users/justin/hull-ci/Cargo.toml and can neither be broken by
+# nor break the crates under `crates/`. It also means the suite compiles and runs before any of our
+# own code exists — which is the point: the baseline must predate the implementation.
+[package]
+name = "hull-ci-conformance"
+version = "0.0.1"
+edition = "2021"
+license = "Apache-2.0"
+publish = false
+description = "Black-box HTTP conformance suite for the Hull CI Integration Standard (CI-SPEC.md §11 + design D§14)."
+
+[workspace]
+
+[dependencies]
+# Deliberately tiny. The suite hand-rolls HTTP/1.1 over std::net rather than pulling in an async stack:
+# it must be startable in milliseconds, must never touch the network, and must not share a dependency
+# graph (or a tokio version) with the service it is judging.
+serde_json = "1"
+# SHA-256 rather than a faster hash on purpose: the harness's tree_id canonicalisation has to be
+# reproducible from any language, so the reference CI under tests/reference/ can verify it with
+# nothing but Python's stdlib.
+sha2 = "0.10"
+
+[lib]
+name = "hull_ci_conformance"
+path = "src/lib.rs"
