@@ -23,16 +23,18 @@
 //! Failures map to [`Reason`]: the 5-minute budget yields [`Reason::Timeout`], everything else
 //! [`Reason::Infra`]. A fetch failure is never `red` — it is a statement about us, not the code.
 //!
-//! # Known interop gap (producer side, not ours)
+//! # Symlinks — a producer-side bug this crate found, since fixed
 //!
-//! `hull-server`'s `tree_archive` builds its tar with `tar::Builder`'s default
-//! `follow_symlinks(true)`, so a symlink in the tree is packed as a *copy of its target*. keel
-//! addresses a symlink as a `MODE_SYMLINK` entry over a blob holding the target path, so a tree
-//! containing one is lossy before it reaches us and can never re-hash to its `tree_id`. We extract
-//! symlink entries correctly and the fix is one line on Hull's side (`ar.follow_symlinks(false)`);
-//! until then such a change fails verification and reports `errored`, which is the honest outcome —
-//! we would otherwise be running code that is not the change under test. Pinned by
-//! `hull_archives_dereference_symlinks_so_such_a_tree_cannot_verify_today`.
+//! `hull-server`'s `tree_archive` used to build its tar with `tar::Builder`'s default
+//! `follow_symlinks(true)`, packing a symlink as a *copy of its target*. keel addresses a symlink as
+//! a `MODE_SYMLINK` entry over a blob holding the target path, so such an archive could never
+//! re-hash to its own `tree_id`: every change touching a symlink would have failed verification
+//! **permanently**, because `errored` is not memoized and each re-check would fail identically. Hull
+//! now sets `follow_symlinks(false)`, and we extract symlink entries as symlinks.
+//!
+//! That episode is why this crate verifies unconditionally even though spec §6 only says **MAY**:
+//! the producer had been emitting unverifiable archives with nothing in the world able to notice
+//! until a verifying consumer existed. See design G5, which proposes promoting §6 to a MUST.
 
 pub mod extract;
 pub mod store;
@@ -512,12 +514,24 @@ mod tests {
     }
 
     /// An archive built exactly the way `hull-server` builds one (`tar::Builder` in
-    /// `HeaderMode::Deterministic`, `append_dir_all(".", dir)` over a checked-out tree).
+    /// `HeaderMode::Deterministic`, `follow_symlinks(false)`, `append_dir_all(".", dir)` over a
+    /// checked-out tree).
     fn hull_style_archive(dir: &Path) -> Vec<u8> {
+        hull_archive(dir, false)
+    }
+
+    /// The same, but dereferencing symlinks — what Hull produced before the fix, and what any
+    /// archiver that forgets `follow_symlinks(false)` produces. Used only to prove we refuse it.
+    fn dereferencing_archive(dir: &Path) -> Vec<u8> {
+        hull_archive(dir, true)
+    }
+
+    fn hull_archive(dir: &Path, follow_symlinks: bool) -> Vec<u8> {
         let mut buf = Vec::new();
         {
             let mut ar = tar::Builder::new(&mut buf);
             ar.mode(tar::HeaderMode::Deterministic);
+            ar.follow_symlinks(follow_symlinks);
             ar.append_dir_all(".", dir).unwrap();
             ar.finish().unwrap();
         }
@@ -563,7 +577,7 @@ mod tests {
     /// lands, this test fails, which is how it should be found.
     #[cfg(unix)]
     #[test]
-    fn hull_archives_dereference_symlinks_so_such_a_tree_cannot_verify_today() {
+    fn a_dereferenced_symlink_makes_a_tree_unverifiable_and_we_refuse_it() {
         let src = TempDir::new().unwrap();
         std::fs::write(src.path().join("real.txt"), b"payload\n").unwrap();
         std::os::unix::fs::symlink("real.txt", src.path().join("link.txt")).unwrap();
@@ -572,10 +586,17 @@ mod tests {
         let store = keel_store::store::Store::open_with_map_size(keel_dir.path(), 64 * 1024 * 1024).unwrap();
         let tree_id = keel_store::snapshot::snapshot(&store, src.path()).unwrap().to_hex();
 
+        // Hull's own archiver had this bug and nothing could see it until a verifying consumer
+        // existed; it is fixed, and this is the guard against it or any other producer regressing.
         let (_d, broker) = broker();
-        let err = broker.ingest("acme", &tree_id, &hull_style_archive(src.path())[..]).unwrap_err();
+        let err = broker.ingest("acme", &tree_id, &dereferencing_archive(src.path())[..]).unwrap_err();
         assert!(matches!(err, FetchError::Verify(VerifyError::Mismatch { .. })), "got {err:?}");
         assert!(!broker.store().has("acme", &tree_id), "and we refuse to serve the lossy tree");
+
+        // The counterpart, and the half that would have caught the original bug directly: packed the
+        // way Hull packs today, the very same tree verifies.
+        assert!(broker.ingest("acme", &tree_id, &hull_style_archive(src.path())[..]).is_ok());
+        assert!(broker.store().has("acme", &tree_id));
     }
 
     #[test]
