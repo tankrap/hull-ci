@@ -81,6 +81,16 @@ pub struct SandboxSpec {
     /// Whose authority the code carries (D§1). Separate axis from the tier; backends use it only for
     /// the defence-in-depth refusal below, never to weaken the box.
     pub author_class: AuthorClass,
+    /// Names in [`env`](Self::env) that the **secret broker** authorised for this job (D§7.4).
+    ///
+    /// Exempts exactly those names from the credential-shaped-name refusal, and nothing else. The
+    /// list is the broker's decision — minted only after it checked the job's author class, so an
+    /// `Outsider` never produces one — carried here so the sandbox layer can tell a delivered secret
+    /// from a caller who invented a variable called `NPM_TOKEN`. It is not, and must never become,
+    /// something the pipeline can populate.
+    ///
+    /// Empty in M1/M2, which deliver no secrets at all.
+    pub broker_authorised: Vec<String>,
 }
 
 /// One command to run inside a spawned sandbox.
@@ -301,7 +311,7 @@ pub trait SandboxInstance: Send {
 /// Centralised so a new backend cannot forget one: empty argv (nothing to run), a credential-shaped
 /// environment (§14.2), or a missing workspace are all refusals, not attempts.
 pub fn validate_spec(spec: &SandboxSpec) -> Result<(), SandboxError> {
-    if let Err(name) = crate::env::reject_forbidden(&spec.env) {
+    if let Err(name) = crate::env::reject_forbidden_except(&spec.env, &spec.broker_authorised) {
         return Err(SandboxError::ForbiddenEnv(name));
     }
     if !spec.workspace.is_dir() {

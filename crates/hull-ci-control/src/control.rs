@@ -1456,7 +1456,7 @@ mod tests {
         assert!(stays_false(move || node.assigned().len() > 1).await, "one at a time, by plan");
         assert_eq!(live.state_of("step1"), StepState::Ready, "queued, not errored");
         assert_eq!(live.state_of("step2"), StepState::Ready);
-        assert_eq!(live.ctrl.queue_depth("t"), crate::fairshare::Depth { queued: 2, running: 1 });
+        assert_eq!(live.ctrl.queue_depth("t"), Depth { queued: 2, running: 1 });
 
         // And the cap is a queue, not a ceiling on the job: each step goes as the last one lands.
         for name in ["step0", "step1", "step2"] {

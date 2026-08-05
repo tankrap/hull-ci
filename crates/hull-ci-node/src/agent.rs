@@ -255,6 +255,9 @@ impl NodeAgent {
             limits: self.config.limits,
             env: crate::env::base_env_with_path("/tmp", &self.backend.job_path()),
             author_class: a.author_class,
+            // Empty until the secret broker is wired in (D§7.4, M3). The node never mints this list
+            // itself — it carries the broker's decision or it carries nothing.
+            broker_authorised: Vec::new(),
         };
 
         let mut sandbox = match self.backend.spawn(&spec).await {

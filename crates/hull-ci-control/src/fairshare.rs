@@ -926,6 +926,27 @@ mod tests {
     }
 
     #[test]
+    fn the_virtual_charge_is_for_the_step_that_actually_went_out() {
+        // The tag and the dispatch must name the same step. When they were computed separately
+        // nothing caught the difference, because in every test the two heads cost the same — and the
+        // bug it hides is a good one: park one cheap background step behind expensive interactive
+        // work and the tenant is billed for the cheap one on every turn.
+        let mut q = queue(FairShare { fleet_slots: Some(1), ..config() });
+        let now = Instant::now();
+        q.observe_cost("acme", "slow", Duration::from_secs(600));
+        q.observe_cost("acme", "quick", Duration::from_secs(1));
+
+        q.admit_job("nightly", "acme", Priority::Background);
+        q.enqueue("nightly", "bg-0", "quick");
+        q.admit_job("click", "acme", Priority::Interactive);
+        q.enqueue("click", "fg-0", "slow");
+
+        let granted = q.select(now);
+        assert_eq!(granted[0].step_id, "fg-0", "the interactive step goes");
+        assert_eq!(q.tenants["acme"].vft_last, 600.0, "and 600 node-seconds is what it costs");
+    }
+
+    #[test]
     fn reconcile_derives_the_accounting_from_what_the_steps_actually_are() {
         // The scheduler is told nothing; it looks. This is the path every driver pass takes, and it
         // has to be idempotent, because the driver runs it on every wake.

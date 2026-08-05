@@ -576,6 +576,7 @@ mod tests {
             limits: Default::default(),
             env: crate::env::base_env("/tmp"),
             author_class: AuthorClass::Member,
+            broker_authorised: Vec::new(),
         }
     }
 

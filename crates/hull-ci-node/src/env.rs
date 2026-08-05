@@ -74,8 +74,28 @@ pub fn is_forbidden_name(name: &str) -> bool {
 /// because a caller trying to pass a secret in M1 has a bug we want to hear about, not a value we want
 /// to silently drop.
 pub fn reject_forbidden(env: &[EnvVar]) -> Result<(), String> {
+    reject_forbidden_except(env, &[])
+}
+
+/// [`reject_forbidden`], with a set of names the **secret broker** has authorised for this job.
+///
+/// The name check is a proxy for provenance, and once a real secret broker exists the proxy stops
+/// working: design D§7.4's own worked example is `secrets = ["NPM_TOKEN"]`, which
+/// [`FORBIDDEN_NAME_FRAGMENTS`] refuses by construction. A tenant is entitled to call its npm token
+/// `NPM_TOKEN`.
+///
+/// The fix is **not** to loosen the list — a caller who invents an `NPM_TOKEN` out of nowhere still
+/// has the bug §14.2 is about. It is to ask the question the list was always approximating: *where
+/// did this value come from?* An entry is exempt only when the broker minted a capability for that
+/// exact name for this job, having already checked the job's author class (D§1: `Outsider` never
+/// receives one). So the authority is the broker's decision, carried here as an explicit list —
+/// never the variable's spelling, and never something the pipeline can assert for itself.
+///
+/// Everything not on that list is still checked, so the backstop keeps working for exactly the
+/// mistake it was written to catch.
+pub fn reject_forbidden_except(env: &[EnvVar], broker_authorised: &[String]) -> Result<(), String> {
     for (name, _) in env {
-        if is_forbidden_name(name) {
+        if is_forbidden_name(name) && !broker_authorised.iter().any(|a| a == name) {
             return Err(name.clone());
         }
     }
@@ -94,6 +114,30 @@ mod tests {
         let names: Vec<&str> = env.iter().map(|(n, _)| n.as_str()).collect();
         assert_eq!(names, ["PATH", "HOME", "LANG", "CI", "TMPDIR"]);
         assert!(reject_forbidden(&env).is_ok());
+    }
+
+    #[test]
+    fn only_the_broker_can_exempt_a_credential_shaped_name() {
+        // The name check was always a proxy for provenance. Design D§7.4's own example is
+        // `secrets = ["NPM_TOKEN"]`, which the fragment list refuses by construction — a tenant is
+        // entitled to call its npm token NPM_TOKEN. The question that matters is not what the
+        // variable is called but where the value came from.
+        let env = vec![("NPM_TOKEN".to_string(), "sealed-value".to_string())];
+
+        // Unauthorised: still the §14.2 bug the backstop exists to catch.
+        assert_eq!(reject_forbidden(&env), Err("NPM_TOKEN".to_string()));
+
+        // Authorised by the broker for this job — which it only mints after checking author class,
+        // so an `Outsider` never gets here at all.
+        assert!(reject_forbidden_except(&env, &["NPM_TOKEN".to_string()]).is_ok());
+
+        // The exemption is exact, not a pattern: authorising one name does not open the category.
+        let other = vec![("AWS_SECRET_ACCESS_KEY".to_string(), "x".to_string())];
+        assert_eq!(
+            reject_forbidden_except(&other, &["NPM_TOKEN".to_string()]),
+            Err("AWS_SECRET_ACCESS_KEY".to_string()),
+            "authorising NPM_TOKEN must not exempt every credential-shaped name"
+        );
     }
 
     #[test]
