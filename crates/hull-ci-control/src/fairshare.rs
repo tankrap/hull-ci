@@ -242,6 +242,31 @@ pub struct Depth {
     pub running: usize,
 }
 
+/// Why one tenant's queued steps are being skipped during selection — design D§4.5's two plan caps,
+/// reported rather than merely acted on.
+///
+/// An operator looking at a tenant with a hundred queued steps and an idle fleet has exactly one
+/// question, "is this us or is this their plan?", and the scheduler is the only thing that knows.
+/// Scoped to the tenant you name, like [`FairQueue::depth`], so it adds nothing to the
+/// scheduler-side-channel row of D§1's table: there is still no accessor that answers about the
+/// fleet as a whole.
+///
+/// **Blocked is a wait, never a failure** (D§4.5). Nothing here errors a step; only the queue-wait
+/// clock can do that ([`crate::timeouts`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Admission {
+    /// At or over `max_running_steps` — the tenant's concurrent footprint.
+    pub over_concurrency: bool,
+    /// At or over `node_minutes_per_hour` in the rolling window — the tenant's total footprint.
+    pub over_node_minutes: bool,
+}
+
+impl Admission {
+    pub fn blocked(self) -> bool {
+        self.over_concurrency || self.over_node_minutes
+    }
+}
+
 /// What the control plane saw when it last looked at one step.
 #[derive(Debug, Clone)]
 pub struct StepView {
@@ -531,12 +556,37 @@ impl FairQueue {
     }
 
     /// Both plan caps, in the order that is cheapest to check.
+    ///
+    /// `&&` short-circuits, which is the point of the ordering: this runs once per tenant on every
+    /// selection pass, and [`over_node_minutes`] walks a rolling-hour ledger. The *reporting* form
+    /// below deliberately does not short-circuit, because "we stopped looking" is not an answer an
+    /// operator can act on.
     fn admissible(&self, name: &str, tenant: &Tenant, now: Instant) -> bool {
         let plan = self.cfg.plan(name);
-        if tenant.running.len() >= plan.max_running_steps {
-            return false;
+        !over_concurrency(tenant, &plan) && !over_node_minutes(tenant, &plan, now)
+    }
+
+    /// Which caps this tenant is currently over, both evaluated.
+    ///
+    /// Reads the same two predicates [`admissible`](Self::admissible) does, rather than restating
+    /// them: a panel that disagreed with the scheduler about why a tenant is waiting would be worse
+    /// than no panel, because it would be believed.
+    pub fn admission(&self, tenant: &str, now: Instant) -> Admission {
+        let Some(t) = self.tenants.get(tenant) else { return Admission::default() };
+        let plan = self.cfg.plan(tenant);
+        Admission {
+            over_concurrency: over_concurrency(t, &plan),
+            over_node_minutes: over_node_minutes(t, &plan, now),
         }
-        node_seconds(tenant, now) < plan.node_minutes_per_hour * 60.0
+    }
+
+    /// Node-seconds this tenant has spent inside the rolling window (finished work plus work in
+    /// flight), against the plan's ceiling in the same unit.
+    ///
+    /// Measured, not estimated: every term is an elapsed wall clock the scheduler observed. The
+    /// *estimates* in this module are the WFQ costs, which never appear here.
+    pub fn node_seconds_used(&self, tenant: &str, now: Instant) -> f64 {
+        self.tenants.get(tenant).map(|t| node_seconds(t, now)).unwrap_or(0.0)
     }
 
     fn pop_head(&mut self, name: &str) -> Option<Waiting> {
@@ -663,6 +713,16 @@ fn head_class(tenant: &Tenant) -> Option<usize> {
 /// A tenant's next step: the oldest interactive one, else the oldest background one.
 fn head(tenant: &Tenant) -> Option<&Waiting> {
     head_class(tenant).and_then(|class| tenant.queues[class].front())
+}
+
+/// The concurrency cap: at the limit is already over, because the check gates *admitting one more*.
+fn over_concurrency(tenant: &Tenant, plan: &TenantPlan) -> bool {
+    tenant.running.len() >= plan.max_running_steps
+}
+
+/// The node-minute cap, in the ledger's unit.
+fn over_node_minutes(tenant: &Tenant, plan: &TenantPlan, now: Instant) -> bool {
+    node_seconds(tenant, now) >= plan.node_minutes_per_hour * 60.0
 }
 
 /// Node-seconds this tenant has spent inside the rolling window, finished work plus work in flight.
@@ -1024,6 +1084,36 @@ mod tests {
         let order = q.select(now);
         assert_eq!(order.len(), 1);
         assert_eq!(order[0].step_id, "t-2", "the cancelled entries are skipped, not served");
+    }
+
+    #[test]
+    fn the_reported_admission_is_the_one_selection_actually_used() {
+        // The panel's whole value is that it agrees with the scheduler. Both caps are asserted
+        // against `select`'s observable behaviour, so a future refactor that lets the two drift
+        // fails here rather than in an operator's reading of a stalled queue.
+        let cfg = config().with_plan(
+            "capped",
+            TenantPlan { max_running_steps: 2, node_minutes_per_hour: 10.0, ..TenantPlan::default() },
+        );
+        let mut q = queue(cfg);
+        let t0 = Instant::now();
+        flood(&mut q, "capped", 5);
+
+        assert!(!q.admission("capped", t0).blocked(), "nothing spent yet");
+        assert_eq!(q.admission("nobody", t0), Admission::default(), "an unknown tenant is not blocked");
+
+        assert_eq!(q.select(t0).len(), 2, "the concurrency cap lets exactly two out");
+        let over = q.admission("capped", t0);
+        assert!(over.over_concurrency, "and the panel says why the other three are waiting");
+        assert!(!over.over_node_minutes, "no time has passed, so the other cap is not the reason");
+        assert!(q.select(t0).is_empty(), "which is the same answer selection gave");
+
+        // Ten minutes of the two running steps is twenty node-minutes against a ten-minute plan, so
+        // the second cap is now over as well — and is reported even though the first already blocks.
+        let t1 = t0 + Duration::from_secs(600);
+        let both = q.admission("capped", t1);
+        assert!(both.over_concurrency && both.over_node_minutes, "both caps are evaluated, not the first");
+        assert_eq!(q.node_seconds_used("capped", t1), 1200.0, "measured, not estimated");
     }
 
     #[test]

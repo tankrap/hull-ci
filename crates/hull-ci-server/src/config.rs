@@ -17,6 +17,7 @@
 //! | `HULL_CI_NODE_ID` | `node-0` | this node's id, as it appears in leases and log keys |
 //! | `HULL_CI_IMAGE` | `hull-ci/m1:latest` | image the planner names for its step |
 //! | `HULL_CI_DETAILS_BASE_URL` | *none* | base for the verdict's `details_url` (design G4) |
+//! | `HULL_CI_ADMIN_TOKEN` | *none* | bearer token for the read-only operator panel; **unset disables it entirely** |
 //!
 //! `HULL_CI_SECRET` deserves its own note: spec §8 makes configuring one a SHOULD, and this process
 //! treats a missing one as a loud warning rather than a refusal, because a loopback bring-up run
@@ -83,6 +84,14 @@ pub struct Config {
     pub image: String,
     pub details_base_url: Option<String>,
     pub timeouts: Timeouts,
+    /// Bearer token for the operator panel ([`crate::admin`]).
+    ///
+    /// `None` means the panel does not exist: no route is mounted, so there is nothing to
+    /// misconfigure, nothing to brute-force, and no default credential. That is deliberate rather
+    /// than cautious — the panel is **cross-tenant by nature** (design D§1: every other shared
+    /// surface in this system is partitioned by tenant, and this one is not), so a deployment that
+    /// did not ask for it must not get it.
+    pub admin_token: Option<String>,
 }
 
 impl Default for Config {
@@ -105,6 +114,8 @@ impl Default for Config {
             image: "hull-ci/m1:latest".into(),
             details_base_url: None,
             timeouts: Timeouts::default(),
+            // Off. See the field's doc: an operator surface that shows every tenant's jobs is opt-in.
+            admin_token: None,
         }
     }
 }
@@ -136,6 +147,9 @@ impl Config {
             image: var("HULL_CI_IMAGE").unwrap_or(d.image),
             details_base_url: var("HULL_CI_DETAILS_BASE_URL"),
             timeouts: d.timeouts,
+            // `var` treats an empty value as unset, which matters more here than anywhere else:
+            // `HULL_CI_ADMIN_TOKEN=` must disable the panel, never authenticate the empty string.
+            admin_token: var("HULL_CI_ADMIN_TOKEN"),
         })
     }
 }
@@ -164,6 +178,7 @@ mod tests {
             !d.trusted.is_trusted("acme"),
             "least privilege: an unconfigured deployment has no trusted tenant, so it runs nothing"
         );
+        assert!(d.admin_token.is_none(), "the cross-tenant operator panel is off unless asked for");
     }
 
     #[test]

@@ -1,0 +1,445 @@
+<!doctype html>
+<!--
+  The operator panel — a renderer over /admin/summary, /admin/nodes, /admin/jobs and /admin/queue.
+
+  No build step and no CDN: one file, inline CSS, inline vanilla JS, served by `hull_ci_server::admin`
+  with include_str!. A dashboard that needed a toolchain would rot faster than the runner it watches,
+  and a dashboard that loaded a script from someone else's origin would be a supply chain in front of
+  a page that holds an admin token.
+
+  THE RULE THIS FILE LIVES BY: everything that came from a dispatch, a tree or a job is untrusted
+  (CI-SPEC §14.5). `repo`, `tree_id`, step names, step details and verdict summaries are all
+  attacker-reachable. Every one of them reaches the document through textContent and through nothing
+  else: this file never assigns a string as markup, by any of the three APIs that would let it. So a
+  job whose output is a script tag renders as the characters it is, instead of executing on the
+  origin that holds the operator's token. A test in admin.rs asserts those API names appear nowhere
+  in this file, which is why they are not written out here either.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>hull-ci — operator</title>
+<style>
+  :root {
+    --bg: #12141a; --panel: #191c24; --line: #2a2f3b; --ink: #dfe3ec; --dim: #8a92a6;
+    --green: #4ec9a0; --red: #e5636b; --amber: #e0a34a; --blue: #6ba6e8; --grey: #6b7280;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--ink);
+    font: 13px/1.45 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  header {
+    display: flex; align-items: baseline; gap: 16px; flex-wrap: wrap;
+    padding: 10px 16px; border-bottom: 1px solid var(--line); background: var(--panel);
+    position: sticky; top: 0; z-index: 2;
+  }
+  h1 { font-size: 13px; margin: 0; letter-spacing: .08em; text-transform: uppercase; }
+  .stat { color: var(--dim); }
+  .stat b { color: var(--ink); font-weight: 600; }
+  .spacer { flex: 1; }
+  main { padding: 16px; display: grid; gap: 16px; }
+  section { border: 1px solid var(--line); background: var(--panel); }
+  section > h2 {
+    margin: 0; padding: 7px 12px; font-size: 11px; letter-spacing: .1em; text-transform: uppercase;
+    color: var(--dim); border-bottom: 1px solid var(--line);
+  }
+  .body { padding: 10px 12px; }
+  table { width: 100%; border-collapse: collapse; }
+  th, td { text-align: left; padding: 5px 12px; border-bottom: 1px solid var(--line); vertical-align: top; }
+  th { color: var(--dim); font-weight: 500; font-size: 11px; text-transform: uppercase; letter-spacing: .06em; }
+  tr:last-child td { border-bottom: none; }
+  td.num { text-align: right; font-variant-numeric: tabular-nums; }
+  .banner { border: 1px solid var(--amber); background: #2a2113; }
+  .banner.ok { border-color: var(--green); background: #14251f; }
+  .banner h2 { color: var(--amber); border-bottom-color: var(--amber); }
+  .banner.ok h2 { color: var(--green); border-bottom-color: var(--green); }
+  ul.clauses { margin: 6px 0 0; padding-left: 18px; columns: 2; column-gap: 28px; }
+  ul.clauses li { margin: 1px 0; color: var(--ink); break-inside: avoid; }
+  .dim { color: var(--dim); }
+  .note { color: var(--dim); font-size: 12px; margin-top: 6px; }
+  .pill { display: inline-block; padding: 0 6px; border: 1px solid var(--line); border-radius: 9px; font-size: 11px; }
+  .green { color: var(--green); } .red { color: var(--red); } .amber { color: var(--amber); }
+  .blue { color: var(--blue); } .grey { color: var(--grey); }
+  .detail { color: var(--dim); white-space: pre-wrap; word-break: break-word; max-width: 62ch; }
+  .steps { display: flex; flex-wrap: wrap; gap: 4px; }
+  .step { border: 1px solid var(--line); border-radius: 3px; padding: 0 5px; font-size: 11px; }
+  .filters { display: flex; gap: 6px; flex-wrap: wrap; padding: 8px 12px; border-bottom: 1px solid var(--line); }
+  button { font: inherit; color: var(--ink); background: transparent; border: 1px solid var(--line);
+           border-radius: 3px; padding: 2px 9px; cursor: pointer; }
+  button[aria-pressed="true"] { border-color: var(--blue); color: var(--blue); }
+  #gate { max-width: 460px; margin: 12vh auto; }
+  #gate input { width: 100%; font: inherit; color: var(--ink); background: var(--bg);
+                border: 1px solid var(--line); border-radius: 3px; padding: 6px 8px; margin: 8px 0; }
+  .err { color: var(--red); }
+  .empty { color: var(--dim); padding: 10px 12px; }
+</style>
+</head>
+<body>
+
+<!-- The token gate. The panel is cross-tenant, so nothing loads until a token is supplied; it is
+     kept in sessionStorage (this tab only, gone when the tab closes) and sent as a header, never as
+     a query parameter, a cookie, or anything a referrer or an access log would capture. -->
+<div id="gate" hidden>
+  <section>
+    <h2>hull-ci operator panel</h2>
+    <div class="body">
+      <p class="dim">This panel shows every tenant's jobs. It needs the admin token
+        (<code>HULL_CI_ADMIN_TOKEN</code>).</p>
+      <form id="gate-form">
+        <input id="token" type="password" autocomplete="off" spellcheck="false"
+               placeholder="admin token" aria-label="admin token">
+        <button type="submit">Open</button>
+      </form>
+      <p id="gate-error" class="err" hidden>That token was refused.</p>
+      <p class="note">Kept for this browser tab only. Read-only: nothing here can start, cancel or
+        retry a job.</p>
+    </div>
+  </section>
+</div>
+
+<div id="panel" hidden>
+  <header>
+    <h1>hull-ci</h1>
+    <span class="stat">jobs <b id="s-jobs">–</b></span>
+    <span class="stat">running <b id="s-running">–</b></span>
+    <span class="stat">queued <b id="s-queued">–</b></span>
+    <span class="stat">steps running <b id="s-steps-running">–</b></span>
+    <span class="stat">steps queued <b id="s-steps-queued">–</b></span>
+    <span class="stat">slots free <b id="s-slots">–</b></span>
+    <span class="stat">tenants <b id="s-tenants">–</b></span>
+    <span class="spacer"></span>
+    <span class="stat" id="s-age">–</span>
+    <button id="pause" aria-pressed="false">pause</button>
+    <button id="forget">forget token</button>
+  </header>
+
+  <main>
+    <!-- Leads the page on purpose: what this deployment does not protect against is the first thing
+         an operator should read, not a footnote under a latency chart (design D§7.2, D§13). -->
+    <section id="conformance" class="banner">
+      <h2 id="conformance-title">§14 enforcement</h2>
+      <div class="body">
+        <div id="conformance-summary"></div>
+        <ul id="conformance-clauses" class="clauses"></ul>
+        <p id="conformance-note" class="note"></p>
+      </div>
+    </section>
+
+    <section>
+      <h2>node</h2>
+      <div class="body"><div id="node"></div><p id="node-note" class="note"></p></div>
+    </section>
+
+    <section>
+      <h2>queue — per tenant</h2>
+      <table id="queue"><thead><tr>
+        <th>tenant</th><th class="num">queued</th><th class="num">running</th><th class="num">cap</th>
+        <th class="num">weight</th><th class="num">node-min used</th><th class="num">node-min/h</th>
+        <th>admission</th><th class="num">jobs</th>
+      </tr></thead><tbody></tbody></table>
+      <p id="queue-note" class="note" style="padding: 8px 12px"></p>
+    </section>
+
+    <section>
+      <h2>jobs</h2>
+      <div class="filters" id="filters"></div>
+      <table id="jobs"><thead><tr>
+        <th>job</th><th>tenant / repo</th><th>tree</th><th>state</th><th>author</th>
+        <th class="num">age</th><th>steps</th><th>verdict</th>
+      </tr></thead><tbody></tbody></table>
+      <p id="jobs-note" class="note" style="padding: 8px 12px"></p>
+    </section>
+  </main>
+</div>
+
+<script>
+(function () {
+  "use strict";
+
+  var KEY = "hull-ci-admin-token";
+  var REFRESH_MS = 4000;
+  var token = sessionStorage.getItem(KEY) || "";
+  var paused = false;
+  // "all" rather than "live": on an idle runner a live-only default shows an empty table under a
+  // header that says three jobs are held, which reads as a broken panel. The store is bounded and
+  // the list is newest-first, so "everything, newest first" is both the honest default and the
+  // useful one; "live" is one click away when the fleet is busy.
+  var filter = "all";
+  var lastAt = 0;
+  var timer = null;
+
+  // ── DOM helpers ────────────────────────────────────────────────────────────────────────────────
+  // `text` is the only way any value reaches the document. It takes a string and returns a node;
+  // there is no path in this file that turns a server value into markup (CI-SPEC §14.5).
+
+  function $(id) { return document.getElementById(id); }
+
+  function el(tag, cls, txt) {
+    var n = document.createElement(tag);
+    if (cls) { n.className = cls; }
+    if (txt !== undefined && txt !== null) { n.textContent = String(txt); }
+    return n;
+  }
+
+  function cell(row, txt, cls) { row.appendChild(el("td", cls, txt)); return row; }
+
+  function clear(node) { while (node.firstChild) { node.removeChild(node.firstChild); } }
+
+  function secs(n) {
+    if (n === null || n === undefined) { return "–"; }
+    if (n < 60) { return n.toFixed(1) + "s"; }
+    if (n < 3600) { return Math.floor(n / 60) + "m" + String(Math.floor(n % 60)).padStart(2, "0") + "s"; }
+    return Math.floor(n / 3600) + "h" + String(Math.floor((n % 3600) / 60)).padStart(2, "0") + "m";
+  }
+
+  var STATE_CLASS = {
+    green: "green", passed: "green", reported: "green",
+    red: "red", failed: "red", errored: "red", report_failed: "red",
+    running: "blue", leased: "blue", fetching: "blue", planning: "blue",
+    queued: "amber", ready: "amber", pending: "grey", cached: "grey", skipped: "grey"
+  };
+
+  // ── Transport ──────────────────────────────────────────────────────────────────────────────────
+
+  function get(path) {
+    return fetch(path, {
+      headers: { "X-Hull-CI-Admin-Token": token },
+      cache: "no-store",
+      credentials: "omit"
+    }).then(function (r) {
+      if (r.status === 401) { throw { unauthorized: true }; }
+      if (!r.ok) { throw new Error(path + " → " + r.status); }
+      return r.json();
+    });
+  }
+
+  // ── Renderers ──────────────────────────────────────────────────────────────────────────────────
+
+  function renderSummary(s) {
+    var byState = s.jobs.by_state || {};
+    $("s-jobs").textContent = s.jobs.held;
+    $("s-running").textContent = byState.running || 0;
+    $("s-queued").textContent = byState.queued || 0;
+    $("s-steps-running").textContent = s.steps.running;
+    $("s-steps-queued").textContent = s.steps.queued;
+    $("s-slots").textContent = s.slots.free + " / " + s.slots.total;
+    $("s-tenants").textContent = s.tenants_with_work;
+  }
+
+  function renderNodes(d) {
+    var node = d.nodes[0];
+    var unmet = node.unmet_clauses || [];
+    var banner = $("conformance");
+    var title = $("conformance-title");
+    var summary = $("conformance-summary");
+    var list = $("conformance-clauses");
+    clear(summary); clear(list);
+
+    if (unmet.length === 0) {
+      banner.className = "banner ok";
+      title.textContent = "§14 fully enforced";
+      summary.appendChild(el("div", null,
+        "Backend " + node.backend + " enforces every §14 clause. Untrusted authors are admitted."));
+    } else {
+      banner.className = "banner";
+      title.textContent = "§14 NOT fully enforced — " + unmet.length + " clause(s) unmet";
+      summary.appendChild(el("div", null,
+        "Backend " + node.backend + " (tier " + node.tier + ") does not enforce the following. Work "
+        + "from an untrusted author is refused rather than run, so this is a capability limit, not "
+        + "an open door — but everything below is a control this deployment does NOT have."));
+      unmet.forEach(function (clause) { list.appendChild(el("li", null, clause)); });
+    }
+    $("conformance-note").textContent = d.bind_is_loopback
+      ? "Listening on " + d.bind + " (loopback). Keep it that way: this panel is cross-tenant and a "
+        + "bearer token is the only thing in front of it."
+      : "WARNING — listening on " + d.bind + ", which is not loopback. This panel and the dispatch "
+        + "endpoint are exposed on that interface.";
+
+    var n = $("node");
+    clear(n);
+    var t = el("table");
+    var body = el("tbody");
+    [["node id", node.node_id], ["backend", node.backend], ["tier", node.tier],
+     ["slots", node.slots_free + " free / " + node.slots_total + " total"],
+     ["warm trees", node.warm_trees],
+     ["admits untrusted", node.admits_untrusted ? "yes" : "no"],
+     ["egress deny", node.capabilities.egress_deny ? "yes" : "no"],
+     ["metadata blackhole", node.capabilities.metadata_blackhole ? "yes" : "no"],
+     ["single-use sandbox", node.capabilities.single_use ? "yes" : "no"],
+     ["cross-tenant safe", node.capabilities.cross_tenant_safe ? "yes" : "no"]
+    ].forEach(function (pair) {
+      var row = el("tr");
+      row.appendChild(el("th", null, pair[0]));
+      row.appendChild(el("td", null, pair[1]));
+      body.appendChild(row);
+    });
+    t.appendChild(body);
+    n.appendChild(t);
+    $("node-note").textContent = d.fleet.note;
+  }
+
+  function renderQueue(d) {
+    var body = $("queue").querySelector("tbody");
+    clear(body);
+    if (!d.tenants.length) {
+      var row = el("tr");
+      var td = el("td", "empty", "no tenant has work in the store");
+      td.colSpan = 9;
+      row.appendChild(td);
+      body.appendChild(row);
+    }
+    d.tenants.forEach(function (t) {
+      var row = el("tr");
+      cell(row, t.tenant);
+      cell(row, t.queued, "num");
+      cell(row, t.running, "num");
+      cell(row, t.max_running_steps, "num");
+      cell(row, t.weight, "num");
+      cell(row, t.node_minutes_used, "num");
+      cell(row, t.node_minutes_per_hour, "num");
+      var why = [];
+      if (t.over_concurrency) { why.push("at concurrency cap"); }
+      if (t.over_node_minutes) { why.push("over node-minutes"); }
+      cell(row, why.length ? "waiting — " + why.join(", ") : "admitting",
+           why.length ? "amber" : "dim");
+      cell(row, t.jobs_held, "num");
+      body.appendChild(row);
+    });
+    $("queue-note").textContent =
+      "Over a cap is a wait, not a failure: steps keep their queue position. "
+      + "node-min used is " + d.measurement_notes.node_minutes_used + ". "
+      + "Ordering is " + d.measurement_notes.queue_order + ".";
+  }
+
+  function renderJobs(d) {
+    var body = $("jobs").querySelector("tbody");
+    clear(body);
+    if (!d.jobs.length) {
+      var row = el("tr");
+      var td = el("td", "empty", "no jobs match");
+      td.colSpan = 8;
+      row.appendChild(td);
+      body.appendChild(row);
+    }
+    d.jobs.forEach(function (j) {
+      var row = el("tr");
+      cell(row, j.job_id, "dim");
+      cell(row, j.repo);
+      cell(row, j.tree_id_short, "dim");
+      cell(row, j.state, STATE_CLASS[j.state] || "");
+      cell(row, j.author_class, j.author_class === "outsider" ? "amber" : "dim");
+      cell(row, secs(j.age_secs), "num");
+
+      var stepCell = el("td");
+      var steps = el("div", "steps");
+      j.steps.forEach(function (s) {
+        var pill = el("span", "step " + (STATE_CLASS[s.state] || ""),
+                      s.name + " · " + s.state + (s.ran_for_secs !== null ? " · " + secs(s.ran_for_secs) : ""));
+        // Untrusted job output, held as the tooltip rather than laid out — `title` is a property
+        // assignment, so it is data here too.
+        if (s.detail) { pill.title = s.detail; }
+        steps.appendChild(pill);
+      });
+      if (!j.steps.length) { steps.appendChild(el("span", "dim", "no steps")); }
+      stepCell.appendChild(steps);
+      row.appendChild(stepCell);
+
+      var verdictCell = el("td");
+      if (j.verdict) {
+        verdictCell.appendChild(el("span", "pill " + (STATE_CLASS[j.verdict.status] || ""),
+          j.verdict.status + (j.verdict.reason ? " · " + j.verdict.reason : "")));
+        if (j.verdict.summary) { verdictCell.appendChild(el("div", "detail", j.verdict.summary)); }
+      } else {
+        verdictCell.appendChild(el("span", "dim", "–"));
+      }
+      row.appendChild(verdictCell);
+      body.appendChild(row);
+    });
+    $("jobs-note").textContent =
+      "showing " + d.shown + " of " + d.matched + " matched, " + d.held + " held. "
+      + "Repo, tree id, step names, step details and verdict summaries are untrusted job/dispatch "
+      + "output and are shown as text, never as markup.";
+  }
+
+  // ── Loop ───────────────────────────────────────────────────────────────────────────────────────
+
+  function renderFilters() {
+    var box = $("filters");
+    clear(box);
+    ["all", "live", "settled", "running", "queued", "reported"].forEach(function (name) {
+      var b = el("button", null, name);
+      b.setAttribute("aria-pressed", String(name === filter));
+      b.addEventListener("click", function () { filter = name; renderFilters(); load(); });
+      box.appendChild(b);
+    });
+  }
+
+  function load() {
+    return Promise.all([
+      get("/admin/summary"),
+      get("/admin/nodes"),
+      get("/admin/queue"),
+      get("/admin/jobs?limit=200&state=" + encodeURIComponent(filter))
+    ]).then(function (r) {
+      renderSummary(r[0]);
+      renderNodes(r[1]);
+      renderQueue(r[2]);
+      renderJobs(r[3]);
+      lastAt = Date.now();
+      tick();
+    }).catch(function (e) {
+      if (e && e.unauthorized) { forget(true); return; }
+      $("s-age").textContent = "refresh failed";
+    });
+  }
+
+  function tick() {
+    if (!lastAt) { return; }
+    var ago = Math.round((Date.now() - lastAt) / 1000);
+    $("s-age").textContent = (paused ? "paused · " : "") + "updated " + ago + "s ago";
+  }
+
+  function start() {
+    $("gate").hidden = true;
+    $("panel").hidden = false;
+    renderFilters();
+    load();
+    if (timer) { clearInterval(timer); }
+    timer = setInterval(function () { tick(); if (!paused) { load(); } }, REFRESH_MS);
+  }
+
+  function forget(refused) {
+    token = "";
+    sessionStorage.removeItem(KEY);
+    if (timer) { clearInterval(timer); timer = null; }
+    $("panel").hidden = true;
+    $("gate").hidden = false;
+    $("gate-error").hidden = !refused;
+    $("token").value = "";
+    $("token").focus();
+  }
+
+  $("gate-form").addEventListener("submit", function (e) {
+    e.preventDefault();
+    token = $("token").value;
+    if (!token) { return; }
+    sessionStorage.setItem(KEY, token);
+    $("gate-error").hidden = true;
+    start();
+  });
+  $("pause").addEventListener("click", function () {
+    paused = !paused;
+    $("pause").setAttribute("aria-pressed", String(paused));
+    $("pause").textContent = paused ? "resume" : "pause";
+    tick();
+  });
+  $("forget").addEventListener("click", function () { forget(false); });
+
+  if (token) { start(); } else { $("gate").hidden = false; $("token").focus(); }
+})();
+</script>
+</body>
+</html>

@@ -12,6 +12,9 @@ hull-ci-control = { path = "../hull-ci-control" }
 hull-ci-fetch = { path = "../hull-ci-fetch" }
 hull-ci-node = { path = "../hull-ci-node" }
 hull-ci-plan = { path = "../hull-ci-plan" }
+# The operator panel's responses. The control plane hands out typed snapshots; the HTTP shape of
+# `/admin/*` is this crate's to own, so the serialization lives here rather than on those types.
+serde_json.workspace = true
 thiserror.workspace = true
 # `net` on top of the workspace feature set, for the listener this binary binds.
 tokio = { workspace = true, features = ["net"] }
@@ -22,8 +25,10 @@ axum.workspace = true
 [dev-dependencies]
 tempfile.workspace = true
 tar.workspace = true
-serde_json.workspace = true
 reqwest.workspace = true
+# Drives the admin router as a service, so "every admin route is read-only" is asserted against the
+# router axum actually builds rather than against a list of `get(...)` calls read by eye.
+tower = { version = "0.5", features = ["util"] }
 # The end-to-end suite has to name a *real* `tree_id`, which means computing one the way keel does.
 # Same git rev hull-ci-fetch pins, so both sides of the verification agree by construction rather
 # than by two crates happening to be on compatible revisions.

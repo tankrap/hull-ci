@@ -38,7 +38,7 @@ use tokio::sync::Notify;
 
 use crate::aggregate::{fold, Decision, Fold};
 use crate::callback::{deliver, CallbackRequest, CallbackTransport, Delivery, RetryPolicy};
-use crate::fairshare::{Depth, FairQueue, FairShare, Grant, JobView, StepView};
+use crate::fairshare::{Admission, Depth, FairQueue, FairShare, Grant, JobView, StepView};
 use crate::graph;
 use crate::ids::new_step_id;
 use crate::model::{Job, JobId, JobState, Step, StepId, StepSpec, StepState};
@@ -289,7 +289,11 @@ impl Control {
         Ok(())
     }
 
-    // ── Introspection (used by tests and, later, the operator dashboard) ─────────────────────────
+    // ── Introspection (used by tests and by the operator dashboard, design D§11) ─────────────────
+    //
+    // The operator-facing half of this lives in [`crate::snapshot`], which returns owned, redacted
+    // copies. What is here is the raw access it is built from, deliberately not public: a `&Job`
+    // carries the dispatch, and the dispatch carries `source_url`, `callback_url` and `fetch_token`.
 
     pub fn job_state(&self, job_id: &str) -> Option<JobState> {
         self.with_job(job_id, |j| j.state)
@@ -301,6 +305,14 @@ impl Control {
 
     pub fn with_job<R>(&self, job_id: &str, f: impl FnOnce(&Job) -> R) -> Option<R> {
         self.lock_jobs().get(job_id).map(f)
+    }
+
+    /// Read every held job under one lock acquisition. The public way in is
+    /// [`Control::snapshot_jobs`].
+    pub(crate) fn with_jobs<R>(&self, f: impl FnOnce(&mut dyn Iterator<Item = &Job>) -> R) -> R {
+        let jobs = self.lock_jobs();
+        let mut iter = jobs.iter();
+        f(&mut iter)
     }
 
     fn with_job_mut<R>(&self, job_id: &str, f: impl FnOnce(&mut Job) -> R) -> Option<R> {
@@ -649,6 +661,17 @@ impl Control {
     /// scheduler-side-channel row (see [`FairQueue::depth`]).
     pub fn queue_depth(&self, tenant: &str) -> Depth {
         self.lock_queue().depth(tenant)
+    }
+
+    /// Which plan caps one tenant is currently over — why its queued steps are being skipped
+    /// (design D§4.5). Per tenant, like [`Control::queue_depth`], and for the same reason.
+    pub fn queue_admission(&self, tenant: &str, now: Instant) -> Admission {
+        self.lock_queue().admission(tenant, now)
+    }
+
+    /// Node-seconds one tenant has consumed in the rolling hour, against its plan's ceiling.
+    pub fn queue_node_seconds(&self, tenant: &str, now: Instant) -> f64 {
+        self.lock_queue().node_seconds_used(tenant, now)
     }
 
     fn lock_queue(&self) -> std::sync::MutexGuard<'_, FairQueue> {

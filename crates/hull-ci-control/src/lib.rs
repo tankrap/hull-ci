@@ -52,6 +52,7 @@ pub mod ids;
 pub mod ingest;
 pub mod model;
 pub mod seams;
+pub mod snapshot;
 pub mod store;
 pub mod timeouts;
 
@@ -63,7 +64,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 pub use control::{Accepted, Control, ControlConfig, Deps, ReportRejected};
-pub use fairshare::{Depth, FairShare, Prioritizer, Priority, TenantPlan};
+pub use fairshare::{Admission, Depth, FairShare, Prioritizer, Priority, TenantPlan};
+pub use snapshot::{JobSnapshot, StepSnapshot, TenantSnapshot, VerdictSnapshot};
 pub use timeouts::Timeouts;
 
 use callback::{CallbackTransport, HttpCallback};

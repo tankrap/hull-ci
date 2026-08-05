@@ -40,6 +40,7 @@
 //! memory and a restart forgets in-flight jobs, which is survivable because Hull re-dispatches a tree
 //! with no verdict. And one node: [`node::InProcessFleet`] runs assignments here, in this process.
 
+pub mod admin;
 pub mod config;
 pub mod fetch;
 pub mod membership;
@@ -102,6 +103,10 @@ pub struct Runner {
 pub async fn assemble(config: &Config) -> Result<Runner, StartupError> {
     let backend = choose_backend(config).await?;
     announce_isolation(config, backend.as_ref());
+    // Taken before the backend is handed to the agent: which §14 clauses this deployment enforces
+    // cannot change while the process runs (`choose_backend` refuses rather than degrades), so the
+    // panel reads a copy instead of reaching back through the node for it.
+    let node_facts = admin::NodeFacts::of(backend.as_ref());
 
     // The broker's store and the workspace root are created up front, so a misconfigured path is a
     // startup failure rather than a job that errors five minutes into someone's afternoon.
@@ -143,7 +148,21 @@ pub async fn assemble(config: &Config) -> Result<Runner, StartupError> {
     let control = Control::new(control_config, deps);
     fleet.attach(&control);
 
-    Ok(Runner { router: hull_ci_control::ingest::router(Arc::clone(&control)), control, fleet })
+    // The panel is merged onto the same listener, which is why it inherits `HULL_CI_BIND`'s
+    // loopback default. With no token configured there is no `/admin*` route at all — not a 403 and
+    // not a login page (see [`admin`]).
+    let mut router = hull_ci_control::ingest::router(Arc::clone(&control));
+    if let Some(token) = config.admin_token.clone() {
+        router = router.merge(admin::router(admin::AdminState::new(
+            Arc::clone(&control),
+            Arc::clone(&fleet),
+            node_facts,
+            token,
+            config.bind,
+        )));
+    }
+
+    Ok(Runner { router, control, fleet })
 }
 
 /// Assemble, bind, and serve until the process ends.
@@ -228,6 +247,21 @@ fn announce_isolation(config: &Config, backend: &dyn SandboxBackend) {
             "no HULL_CI_SECRET configured — every dispatch reaching this port is accepted (spec §8)"
         );
     }
+
+    match (&config.admin_token, config.bind.ip().is_loopback()) {
+        (None, _) => tracing::info!("operator panel disabled (no HULL_CI_ADMIN_TOKEN); /admin is not routed"),
+        (Some(_), true) => tracing::info!(bind = %config.bind, "operator panel on /admin (read-only, loopback)"),
+        // The one combination worth a warning. The panel is the one surface in this system that is
+        // deliberately cross-tenant (design D§1 partitions every other one), so on a non-loopback
+        // bind a single bearer token is all that stands between the network and every tenant's job
+        // list. Legitimate behind a VPN or an authenticating proxy; a mistake anywhere else.
+        (Some(_), false) => tracing::warn!(
+            bind = %config.bind,
+            "operator panel on /admin is bound to a NON-LOOPBACK address. It shows every tenant's \
+             jobs to anyone holding HULL_CI_ADMIN_TOKEN. Put it behind a private interface, a VPN, \
+             or an authenticating proxy."
+        ),
+    }
 }
 
 fn prepare_dir(what: &'static str, path: &std::path::Path) -> Result<(), StartupError> {
@@ -291,5 +325,45 @@ mod tests {
 
         let runner = assemble(&config).await.unwrap();
         assert!(!runner.fleet.agent().capabilities().admits_untrusted());
+    }
+
+    /// GET a path on an assembled runner's router, optionally presenting the admin token.
+    async fn get(config: &Config, path: &str, token: Option<&str>) -> axum::http::StatusCode {
+        use tower::ServiceExt;
+        let runner = assemble(config).await.unwrap();
+        let mut req = axum::http::Request::builder().method("GET").uri(path);
+        if let Some(t) = token {
+            req = req.header(crate::admin::ADMIN_TOKEN_HEADER, t);
+        }
+        runner
+            .router
+            .oneshot(req.body(axum::body::Body::empty()).unwrap())
+            .await
+            .unwrap()
+            .status()
+    }
+
+    #[tokio::test]
+    async fn the_operator_panel_does_not_exist_until_a_token_is_configured() {
+        // Not a 403 and not a login page: with no `HULL_CI_ADMIN_TOKEN` there is no route, so there
+        // is no default credential to leave in place and nothing to brute-force. The panel is the
+        // one cross-tenant surface in this system (design D§1), so a deployment that did not ask for
+        // it must not have it.
+        use axum::http::StatusCode;
+        let (_d, mut config) = dirs();
+        config.sandbox = SandboxChoice::LocalProcess;
+        config.allow_unsandboxed = true;
+
+        for path in ["/admin", "/admin/jobs", "/admin/nodes", "/admin/queue", "/admin/summary"] {
+            assert_eq!(get(&config, path, None).await, StatusCode::NOT_FOUND, "{path} was routed");
+        }
+        // And ingest is unaffected either way.
+        assert_eq!(get(&config, "/healthz", None).await, StatusCode::OK);
+
+        config.admin_token = Some("t0ken".into());
+        assert_eq!(get(&config, "/admin", None).await, StatusCode::OK, "the page is the renderer");
+        assert_eq!(get(&config, "/admin/jobs", None).await, StatusCode::UNAUTHORIZED);
+        assert_eq!(get(&config, "/admin/jobs", Some("wrong")).await, StatusCode::UNAUTHORIZED);
+        assert_eq!(get(&config, "/admin/jobs", Some("t0ken")).await, StatusCode::OK);
     }
 }

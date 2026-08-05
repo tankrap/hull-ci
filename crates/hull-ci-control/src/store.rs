@@ -102,6 +102,16 @@ impl JobStore {
         self.by_id.get_mut(job_id)
     }
 
+    /// Every job still held, in no particular order.
+    ///
+    /// Crate-internal on purpose. Its one caller is [`crate::snapshot`], which copies out a redacted
+    /// view; handing a `&Job` across a crate boundary would hand out `dispatch`, and `dispatch`
+    /// carries `source_url`, `callback_url` and `fetch_token` — the fields spec §14.2 keeps away
+    /// from everything that is not the broker.
+    pub(crate) fn iter(&self) -> impl Iterator<Item = &Job> {
+        self.by_id.values()
+    }
+
     pub fn len(&self) -> usize {
         self.by_id.len()
     }
