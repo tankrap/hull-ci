@@ -14,15 +14,39 @@ description = "Black-box HTTP conformance suite for the Hull CI Integration Stan
 
 [workspace]
 
+[features]
+default = []
+# Genuine keel tree ids (`HULL_CI_TREE_ID=keel`), computed with keel's OWN object encoder — the same
+# crate at the same pinned rev that `hull-server` embeds and `hull-ci-fetch` verifies with. Optional
+# so the default build keeps the properties the suite is built on: no network, no shared dependency
+# graph with the service under test, and a compile measured in seconds.
+keel = ["dep:keel-store"]
+# The white-box cross-check (`tests/keel_addressing.rs`): run OUR fetch broker's real hardened
+# extractor and real tree verifier over the suite's own archive, and diff the archive's layout
+# against one `tar::Builder` actually produced. This is the only thing in the suite that imports
+# hull-ci, and it asserts nothing about a CI endpoint — it asserts that the *harness* speaks keel.
+crosscheck = ["keel", "dep:hull-ci-fetch", "dep:tar", "dep:tempfile"]
+
 [dependencies]
 # Deliberately tiny. The suite hand-rolls HTTP/1.1 over std::net rather than pulling in an async stack:
 # it must be startable in milliseconds, must never touch the network, and must not share a dependency
 # graph (or a tokio version) with the service it is judging.
 serde_json = "1"
-# SHA-256 rather than a faster hash on purpose: the harness's tree_id canonicalisation has to be
-# reproducible from any language, so the reference CI under tests/reference/ can verify it with
+# SHA-256 rather than a faster hash on purpose: the harness's opaque tree_id canonicalisation has to
+# be reproducible from any language, so the reference CI under tests/reference/ can verify it with
 # nothing but Python's stdlib.
 sha2 = "0.10"
+
+# ── `keel` feature ──────────────────────────────────────────────────────────────────────────────
+# keel's REAL object encoder, pinned to the rev `hull-server` and `hull-ci-fetch` both pin. A tree id
+# the suite computes for itself would be worthless: the point of keel mode is to hand a verifying
+# runner an address keel would have produced, so the encoding must come from keel, not from us.
+keel-store = { git = "https://github.com/tankrap/keel", rev = "6827a3443de3c9be2e66887c8038310e32dddc37", package = "keel-store", optional = true }
+
+# ── `crosscheck` feature ────────────────────────────────────────────────────────────────────────
+hull-ci-fetch = { path = "../crates/hull-ci-fetch", optional = true }
+tar = { version = "0.4", optional = true }
+tempfile = { version = "3", optional = true }
 
 [lib]
 name = "hull_ci_conformance"

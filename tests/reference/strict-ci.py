@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """A *strictly* conforming reference CI — the suite's own proof that it can be satisfied.
 
-`hull/scripts/fake-ci.py` is the spec's minimal illustration and it fails four of this suite's checks
+`hull/scripts/fake-ci.py` is the spec's minimal illustration and it fails some of this suite's checks
 (see README.md, "Baseline"). That leaves a question a conformance suite must answer about itself:
 are those failures the subject's, or the harness's? This stand-in exists to settle it. It implements
 the same contract as `fake-ci.py` plus exactly the clauses `fake-ci.py` omits — `errored` on a fetch
@@ -60,13 +60,26 @@ def sanitize_summary(raw, max_chars=SUMMARY_MAX_CHARS):
 
 
 def tree_id_of(members):
-    """The harness's canonical tree hash (see tests/src/tree.rs). Re-hashing the *extracted* tree and
-    comparing to the dispatch's tree_id is what §6 permits and design D§4.2 makes mandatory."""
+    """The harness's OPAQUE canonical tree hash (see tests/src/tree.rs). Re-hashing the *extracted*
+    tree and comparing to the dispatch's tree_id is what §6 permits and design D§4.2 makes mandatory.
+
+    This implements `HULL_CI_TREE_ID=opaque` only — the suite's default, and the mode a CI that
+    cannot compute a keel address should be judged in. In `HULL_CI_TREE_ID=keel` the suite advertises
+    a genuine keel tree id (BLAKE3 over keel's canonical object encoding), which this stand-in has no
+    way to reproduce from the standard library; it would then report `errored` for every job, and
+    correctly so. Run this reference in the default mode.
+
+    `members` are (path, kind, mode, payload) tuples, where `payload` is a file's bytes or a
+    symlink's target path — which is exactly what keel addresses a link by, so the two modes agree
+    about *what* is hashed even though they disagree about how."""
     h = hashlib.sha256()
     h.update(b"hull-ci-conformance/tree/v1\n")
-    for path, mode, data in sorted(members, key=lambda m: m[0]):
-        h.update(f"file {mode:06o} {len(data)} {path}\n".encode())
-        h.update(data)
+    for path, kind, mode, payload in sorted(members, key=lambda m: m[0]):
+        if kind == "link":
+            h.update(f"link 120000 {len(payload)} {path}\n".encode())
+        else:
+            h.update(f"file {mode:06o} {len(payload)} {path}\n".encode())
+        h.update(payload)
     return h.hexdigest()
 
 
@@ -89,10 +102,15 @@ def fetch_and_verify(job):
 
     try:
         tf = tarfile.open(fileobj=io.BytesIO(data))
+        # Directory entries carry no content and are implied by the paths under them, so they are not
+        # part of the address in either mode — but they ARE part of the archive Hull serves, which is
+        # why they are skipped explicitly here rather than assumed absent.
         members = [
-            (m.name, m.mode, tf.extractfile(m).read())
+            (m.name, "link", m.mode, m.linkname.encode())
+            if m.issym()
+            else (m.name, "file", m.mode, tf.extractfile(m).read())
             for m in tf.getmembers()
-            if m.isfile()
+            if m.isfile() or m.issym()
         ]
     except (tarfile.TarError, OSError) as e:
         raise Errored("infra", f"source archive is not a readable tar: {e}") from e

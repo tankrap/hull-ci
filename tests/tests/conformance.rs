@@ -194,6 +194,45 @@ fn spec_11_3_runs_the_checks_it_finds_in_the_fetched_tree() {
     // here — deliberately not asserted rather than asserted vacuously.
 }
 
+#[test]
+fn spec_11_3_does_not_report_errored_for_a_well_formed_tree() {
+    // `green` is not assertable — whether the fixture's checks pass is the CI's business, and a
+    // runner with no `make` may legitimately disagree with one that has it. `errored` is different:
+    // §7 defines it as a statement about the *runner*, "anything that stops us producing a verdict
+    // about the code". This dispatch is well-formed, its `source_url` serves a valid archive, and
+    // that archive really is the tree the dispatch names — so there is nothing here to be stopped by.
+    //
+    // Without this line the checklist is satisfiable by a CI that refuses every job: each of the
+    // other tests accepts any of the three statuses, and `errored` is one of them. That matters most
+    // for the thing this file cannot see — `HULL_CI_TREE_ID`. Point the suite at a *verifying* runner
+    // in the wrong addressing mode and every job legitimately fails its `tree_id` re-hash; the
+    // endpoint is doing exactly the right thing, the harness is at fault, and every other assertion
+    // in this file stays green while it happens.
+    let hull = hull();
+    let job = hull.job();
+    hull.dispatch(&job).expect("dispatch failed to send");
+
+    let callback = hull.wait_for_callback(&job.token).unwrap_or_else(|| {
+        panic!(
+            "CI-SPEC §11.3: no callback arrived within {:?}",
+            config::callback_timeout()
+        )
+    });
+
+    assert_ne!(
+        callback.status.as_deref(),
+        Some("errored"),
+        "CI-SPEC §7 / §11.3: `errored` means the runner could not produce a verdict about the code, \
+         but this job gave it nothing to fail on — a valid tar, served at the exact source_url, that \
+         re-hashes to the tree_id the dispatch advertised (addressing mode: {}). \
+         If the endpoint under test verifies tree_id (ours does — design D§4.2), check that mode \
+         first: HULL_CI_TREE_ID=keel for a keel-native runner, `opaque` for a CI that reproduces the \
+         canonicalisation documented in src/tree.rs. The endpoint said: {}",
+        config::addressing().name(),
+        escape_for_message(callback.summary.as_deref().unwrap_or("(no summary)")),
+    );
+}
+
 // ── §11.4 — "POSTs {status, summary} to the exact callback_url, echoing X-Hull-CI-Secret." ───────
 
 #[test]

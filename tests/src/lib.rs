@@ -12,15 +12,26 @@
 //!    header names and JSON shapes are transcribed from the spec. If our own constants drift from the
 //!    document, this suite is what notices.
 //!
+//! One thing must not be black-box, and is not: **how the suite names a tree**. `tree_id` is opaque
+//! on the wire (§5) and re-hashing is only a **MAY** (§6), but our own runner re-hashes with keel's
+//! real encoding and refuses a mismatch (design D§4.2). A suite that invented its own address would
+//! fail every happy-path test against our own service and report the service broken. So addressing
+//! is a knob — [`tree::Addressing`], set by `HULL_CI_TREE_ID` — and `tests/keel_addressing.rs`
+//! (behind `--features crosscheck`, the only file here that imports `hull-ci`) proves the keel mode
+//! agrees with keel itself and with Hull's archive layout. Nothing on the judging path imports our
+//! code.
+//!
 //! ## Layout
 //!
 //! * [`hull`] — the stub Hull: sends dispatches (§5), serves `source_url` (§6), receives callbacks
 //!   (§7/§8), and records everything.
-//! * [`tree`] — synthetic keel trees, their tar serialisation, and their content address.
+//! * [`tree`] — synthetic keel trees, their tar serialisation, and their content address in either
+//!   addressing mode.
 //! * [`http`] — a small HTTP/1.1 client and server, so the harness shares no transport stack with
 //!   its subject.
 //! * `tests/conformance.rs` — the §11 checklist, one test per checklist line.
 //! * `tests/adversarial.rs` — the design D§14 adversarial cases.
+//! * `tests/keel_addressing.rs` — the harness's own proof that keel mode is genuine.
 //!
 //! ## What a black-box suite cannot see
 //!
