@@ -1,0 +1,25 @@
+[package]
+name = "hull-ci-secrets"
+description = "The secret broker: tenant-declared secrets sealed under per-tenant KEKs, delivered just-in-time to one job on one node, and never to an outsider."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+hull-ci-proto = { path = "../hull-ci-proto" }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+chacha20poly1305 = "0.10"
+rand = "0.8"
+zeroize = { version = "1", features = ["derive"] }
+subtle = "2"
+# Capability-token encoding and the hex rendering of sealed records (legible `bytea`-shaped columns).
+hex.workspace = true
+# Digest of a capability's secret half. The registry stores the digest, never the token.
+blake3.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
