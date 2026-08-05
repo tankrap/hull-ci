@@ -716,6 +716,78 @@ mod tests {
         assert_ne!(status, ExecStatus::Exited(0), "the container must no longer exist");
     }
 
+    /// §14 as tests, not assertions (design D§14). Each of these asserts a control the capability
+    /// struct *claims*, against a live daemon — because a backend that reports `egress_deny: true`
+    /// and does not enforce it is strictly worse than one that admits it cannot, and nothing but a
+    /// live probe can tell those two apart.
+    #[tokio::test]
+    #[ignore = "requires a running container daemon and the alpine image"]
+    async fn live_a_job_cannot_reach_the_cloud_metadata_endpoint() {
+        // Spec §14.2 names this one directly: the classic RCE → instance-role credential path.
+        let out = run_live(&["/bin/sh", "-c",
+            "wget -q -T 2 -O- http://169.254.169.254/latest/meta-data/ 2>&1; echo rc=$?"]).await;
+        assert!(out.contains("rc=1"), "the metadata endpoint must be unreachable, got: {out}");
+        assert!(!out.contains("ami-"), "and nothing that looks like instance metadata came back: {out}");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a running container daemon and the alpine image"]
+    async fn live_a_job_has_no_egress_at_all() {
+        // Spec §14.3: default egress-deny. Tested against DNS and a raw IP separately, because a
+        // resolver failure and a routing failure look the same from inside and only one of them is
+        // the control we mean to be asserting.
+        let dns = run_live(&["/bin/sh", "-c", "wget -q -T 2 -O- http://example.com 2>&1; echo rc=$?"]).await;
+        assert!(dns.contains("rc=1"), "named egress must fail: {dns}");
+
+        let raw = run_live(&["/bin/sh", "-c", "wget -q -T 2 -O- http://1.1.1.1 2>&1; echo rc=$?"]).await;
+        assert!(raw.contains("rc=1"), "egress to a raw IP must fail too: {raw}");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a running container daemon and the alpine image"]
+    async fn live_a_job_runs_unprivileged_on_a_read_only_root() {
+        // §14.4: non-root, read-only rootfs, writable tmpfs scratch.
+        let who = run_live(&["/bin/sh", "-c", "id -u"]).await;
+        assert!(!who.trim_start().starts_with('0'), "a job must not run as root, got uid: {who}");
+
+        let ro = run_live(&["/bin/sh", "-c", "touch /planted 2>&1; echo rc=$?"]).await;
+        assert!(ro.contains("rc=1"), "the root filesystem must be read-only: {ro}");
+
+        let tmp = run_live(&["/bin/sh", "-c", "touch /tmp/scratch && echo tmp-ok"]).await;
+        assert!(tmp.contains("tmp-ok"), "but /tmp must be writable: {tmp}");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a running container daemon and the alpine image"]
+    async fn live_nothing_a_job_plants_survives_into_the_next_one() {
+        // §14.1's single-use rule, observed rather than trusted. The first job writes into the one
+        // place it *can* write; the second must not find it.
+        let first = run_live(&["/bin/sh", "-c", "echo planted > /tmp/evidence && cat /tmp/evidence"]).await;
+        assert!(first.contains("planted"), "the first job should have written its marker: {first}");
+
+        let second = run_live(&["/bin/sh", "-c", "cat /tmp/evidence 2>&1; echo rc=$?"]).await;
+        assert!(second.contains("rc=1"), "a fresh sandbox must not carry the last job's writes: {second}");
+    }
+
+    /// Run one argv in a single-use live container and return its captured output.
+    async fn run_live(argv: &[&str]) -> String {
+        let t = tempfile::tempdir().unwrap();
+        let backend = ContainerBackend::detect(ContainerConfig::default()).await.expect("daemon");
+        let mut s = spec(t.path());
+        s.image = "alpine:3".into();
+        let mut sbx = backend.spawn(&s).await.expect("spawn");
+        let req = ExecRequest {
+            job_id: s.job_id.clone(),
+            argv: argv.iter().map(|a| a.to_string()).collect(),
+            timeout: Duration::from_secs(120),
+            caps: crate::capture::OutputCaps::default(),
+        };
+        let _ = sbx.exec(&req).await.expect("exec");
+        let out = sbx.collect().await.unwrap().text().to_string();
+        sbx.destroy().await.expect("destroy");
+        out
+    }
+
     #[tokio::test]
     async fn spawn_refuses_without_a_daemon_rather_than_running_on_the_host() {
         let t = tempfile::tempdir().unwrap();
