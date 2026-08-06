@@ -744,6 +744,21 @@ impl Control {
             .unwrap_or(false);
 
         if recorded {
+            // **Release the tenant's quota at the verdict, not at delivery.**
+            //
+            // `report` below retries for up to the full budget — with the default schedule, roughly
+            // an hour against an unreachable Hull. Retiring only afterwards meant a job held its
+            // tenant's concurrency for that entire window, long after its work had finished and its
+            // sandbox was gone, so a single unreachable Hull could wedge a tenant's whole allocation.
+            // A liveness bug, and a quiet one: the fleet sits idle, the steps sit `ready`, and
+            // nothing in the logs says why.
+            //
+            // Design D§10.1 had already drawn this line — `reported` is a state separate from the
+            // verdict precisely "so the callback sender can retry independently of job completion" —
+            // and the implementation simply had not honoured it. The work is finished when the
+            // verdict exists. Delivery is bookkeeping about telling someone, and bookkeeping must
+            // never hold a slot.
+            self.retire(job_id);
             self.report(job_id).await;
         }
     }
@@ -1151,6 +1166,60 @@ mod tests {
         assert_eq!(sent[1].url, sent[0].url);
         assert_eq!(sent[1].verdict.status, first.status);
         assert_eq!(live.node.assigned().len(), 1, "a duplicate must not re-run a single step");
+    }
+
+    #[tokio::test]
+    async fn an_undeliverable_verdict_does_not_hold_its_tenants_quota() {
+        // The liveness bug this guards. `finish` used to await `report` before retiring, so a job
+        // whose Hull was unreachable held its tenant's concurrency for the whole retry budget —
+        // about an hour by default — with its work long finished and its sandbox long gone. One
+        // unreachable Hull could therefore wedge a tenant's entire allocation, and quietly: the
+        // fleet idles, the next steps sit `ready`, and nothing says why.
+        //
+        // Caught by clamping the default plan to the fleet size, which turned "needs 16 leaks to
+        // notice" into "needs one".
+        let mut cfg = fast_config();
+        cfg.fair_share.default_plan.max_running_steps = 1;
+        cfg.fair_share.fleet_slots = Some(1);
+        // Delivery must be genuinely slow, or there is no window to observe and the test passes
+        // whether or not the bug is present — which is exactly what the first version of it did.
+        // These numbers stand in for the default schedule's ~1 hour.
+        cfg.retry = crate::callback::RetryPolicy {
+            base: Duration::from_secs(30),
+            max_delay: Duration::from_secs(60),
+            max_attempts: 12,
+        };
+
+        let h = crate::testing::harness_with(
+            cfg,
+            Arc::new(OkFetcher),
+            Arc::new(StaticPlanner::steps(1)),
+            NodeMode::Accept,
+            // A Hull that never answers: delivery will retry to exhaustion.
+            Arc::new(crate::testing::ScriptedTransport::always_failing()),
+        );
+        let accepted = h.control.accept(dispatch("t/r", "tree1"));
+        let live = Live {
+            ctrl: Arc::clone(&h.control),
+            job_id: accepted.job_id.clone(),
+            node: Arc::clone(&h.node),
+            transport: Arc::clone(&h.transport),
+        };
+
+        let steps = live.steps_leased().await;
+        live.ctrl
+            .record_step_report(&step_report(&live.job_id, &steps[0], StepOutcome::Passed, "ok"), "node-test")
+            .unwrap();
+
+        // The quota must come back as soon as the verdict exists — while delivery is still retrying,
+        // not after it gives up.
+        let ctrl = Arc::clone(&live.ctrl);
+        let freed = wait_until(move || ctrl.queue_depth("t").running == 0).await;
+        assert!(
+            freed,
+            "the tenant's slot must be released at the verdict, not at delivery; depth was {:?}",
+            live.ctrl.queue_depth("t")
+        );
     }
 
     #[tokio::test]

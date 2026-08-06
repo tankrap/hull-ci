@@ -300,6 +300,25 @@ pub struct Harness {
 }
 
 /// Wire a control plane out of fakes.
+/// [`harness`] with a caller-chosen transport, for tests about what happens when Hull does not answer.
+pub fn harness_with(
+    config: ControlConfig,
+    fetcher: std::sync::Arc<dyn Fetcher>,
+    planner: std::sync::Arc<dyn Planner>,
+    node_mode: NodeMode,
+    transport: std::sync::Arc<ScriptedTransport>,
+) -> Harness {
+    let node = std::sync::Arc::new(RecordingNode::new(node_mode));
+    let deps = Deps {
+        fetcher,
+        planner,
+        node: node.clone(),
+        transport: transport.clone(),
+        membership: std::sync::Arc::new(AlwaysMember),
+    };
+    Harness { control: Control::new(config, deps), transport, node }
+}
+
 pub fn harness(config: ControlConfig, fetcher: std::sync::Arc<dyn Fetcher>, planner: std::sync::Arc<dyn Planner>, node_mode: NodeMode) -> Harness {
     let transport = std::sync::Arc::new(ScriptedTransport::ok());
     let node = std::sync::Arc::new(RecordingNode::new(node_mode));
