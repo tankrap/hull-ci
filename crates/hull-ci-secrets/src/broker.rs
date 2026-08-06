@@ -677,6 +677,7 @@ mod tests {
             repo: "acme/widget".into(),
             tree_id: "f7a2".into(),
             argv: vec!["true".into()],
+            secrets: vec!["NPM_TOKEN".into()],
             image: "img".into(),
             tier: IsolationTier::MicroVm,
             author_class: AuthorClass::Outsider,

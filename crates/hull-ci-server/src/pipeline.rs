@@ -40,6 +40,11 @@ pub struct PipelinePlanner {
     fallback: AutodetectPlanner,
     default_image: String,
     limits: Limits,
+    /// Whether this deployment has a secret broker wired ([`crate::secrets`]). Read for one purpose
+    /// only — deciding whether a `secrets = [...]` declaration deserves the "not honoured" warning
+    /// below. It is **not** an authority input: the planner never decides whether a secret is
+    /// delivered, and a `true` here on a job whose author is an outsider still delivers nothing.
+    secrets_delivered: bool,
 }
 
 impl PipelinePlanner {
@@ -49,7 +54,14 @@ impl PipelinePlanner {
             fallback: AutodetectPlanner::new(default_image.clone()),
             default_image,
             limits: Limits::default(),
+            secrets_delivered: false,
         }
+    }
+
+    /// Tell the planner a broker exists, so it stops warning that `secrets` go undelivered.
+    pub fn with_secret_delivery(mut self, delivered: bool) -> Self {
+        self.secrets_delivered = delivered;
+        self
     }
 }
 
@@ -112,7 +124,12 @@ fn to_step_spec(step: &PlanStep, pipeline: &Pipeline, default_image: &str) -> St
         argv,
         step.effective_image(pipeline).unwrap_or(default_image).to_string(),
     )
-    .needs(step.needs.clone());
+    .needs(step.needs.clone())
+    // Names only (D§7.4). Copying them here is the whole of the plan's involvement with secrets: the
+    // evaluator ran on attacker-controlled input, so nothing it produced may be treated as authority.
+    // Whether any of these is ever *delivered* is decided at placement, by the broker, from the job's
+    // author class — a fact about the actor that no edit to this file can raise.
+    .secrets(step.secrets.clone());
     spec.timeout = step.timeout;
     spec.continue_on_error = step.continue_on_error;
     spec
@@ -124,7 +141,7 @@ fn to_step_spec(step: &PlanStep, pipeline: &Pipeline, default_image: &str) -> St
 /// `shard = "auto"` or `secrets = [...]` and believes it took effect. Rejecting the pipeline outright
 /// would be worse — it would make a repo's pipeline unusable until every feature lands — so the
 /// compromise is that it runs, and the operator can see exactly what was dropped.
-fn warn_unhonoured(pipeline: &Pipeline, tree_id: &str) {
+fn warn_unhonoured(pipeline: &Pipeline, tree_id: &str, secrets_delivered: bool) {
     let sharded: Vec<&str> =
         pipeline.steps.iter().filter(|s| s.shard.is_some()).map(|s| s.name.as_str()).collect();
     if !sharded.is_empty() {
@@ -132,11 +149,18 @@ fn warn_unhonoured(pipeline: &Pipeline, tree_id: &str) {
     }
     let with_secrets: Vec<&str> =
         pipeline.steps.iter().filter(|s| !s.secrets.is_empty()).map(|s| s.name.as_str()).collect();
-    if !with_secrets.is_empty() {
-        // The security-relevant one. There is no secret broker before M3, so the variables simply do
-        // not appear — a step expecting them will fail on its own terms rather than run without them
-        // unnoticed.
-        tracing::warn!(%tree_id, steps = ?with_secrets, "`secrets` are not delivered before M3 (design D§7.4): these steps run without them");
+    if !with_secrets.is_empty() && !secrets_delivered {
+        // The security-relevant one. With no broker configured (`HULL_CI_SECRETS=off`, the default)
+        // the variables simply do not appear — a step expecting them fails on its own terms rather
+        // than running without them unnoticed. There is deliberately no warning for the *delivered*
+        // case: a member's job receiving its declared secret is the feature working, and an outsider
+        // receiving nothing is refused at the broker, which logs its own refusal with the actor
+        // attached (D§7.4).
+        tracing::warn!(
+            %tree_id,
+            steps = ?with_secrets,
+            "no secret broker is configured (HULL_CI_SECRETS=off): these steps run without their declared secrets"
+        );
     }
     let cached: Vec<&str> =
         pipeline.steps.iter().filter(|s| !s.cache.is_empty()).map(|s| s.name.as_str()).collect();
@@ -186,7 +210,7 @@ impl Planner for PipelinePlanner {
                 }
             };
 
-            warn_unhonoured(&pipeline, &tree.tree_id);
+            warn_unhonoured(&pipeline, &tree.tree_id, self.secrets_delivered);
             tracing::info!(
                 tree_id = %tree.tree_id,
                 steps = pipeline.steps.len(),

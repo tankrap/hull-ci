@@ -22,7 +22,11 @@
 //!    isolation.
 //! 3. **Just-in-time delivery** ([`capability`]). A short-TTL, single-use capability bound to
 //!    `(job_id, node_id, declared names, author_class)`. A reference travels, not the secret.
-//! 4. **Masking is a backstop, not a control** ([`mask`]) — exact-substring redaction, trivially
+//! 4. **Node identity makes the node binding real** ([`identity`], [`service`]). A `node_id` in a
+//!    request is a claim; an Ed25519 signature over the redemption, checked against an enrolment
+//!    table, is a proof. [`service::SecretService`] verifies the signature and derives the node id
+//!    from the verified key, so the id the broker binds against is never one the caller wrote.
+//! 5. **Masking is a backstop, not a control** ([`mask`]) — exact-substring redaction, trivially
 //!    defeated by base64/split/transform. It stops an accidental `echo`. It is not what protects a
 //!    secret from hostile code; (1) is.
 //!
@@ -33,20 +37,42 @@
 //! [`keys::KeyManager`], so the control plane can back them with Postgres and AWS KMS without this
 //! crate learning about either.
 //!
+//! # What a redemption does *not* prove
+//!
+//! Worth stating in the crate doc rather than a module doc, because these are the gaps an operator
+//! would otherwise have to infer from an absence:
+//!
+//! * **Not lease-holding.** D§7.4 says "the broker verifies the node is the lease-holder"; it cannot.
+//!   The lease table is the control plane's. What stands in for it here is *when* a capability is
+//!   minted — at placement, by the same call that grants the lease — so a capability exists only for
+//!   the node that was just leased the step. That is a property of the composition, not of this
+//!   crate, and a different composition would not inherit it.
+//! * **Not channel binding.** The signature covers the redemption, not the connection it arrives on.
+//!   A network deployment must still carry it inside TLS; without that, an attacker who can replay a
+//!   *whole* signed request within the freshness window is only stopped by the capability being
+//!   single-use — which is why it is single-use.
+//! * **Not attestation.** An enrolled key proves a machine was provisioned, not that it is running
+//!   the software it was provisioned with. D§7.4's "so node attestations can ride it later" is the
+//!   forward reference; nothing here implements one.
+//!
 //! [pwn]: https://securitylab.github.com/resources/github-actions-preventing-pwn-requests/
 
 pub mod broker;
 pub mod capability;
+pub mod identity;
 pub mod keys;
 pub mod mask;
 pub mod seal;
+pub mod service;
 pub mod store;
 
 pub use broker::{CapabilityRequest, DeliveredSecrets, SecretBroker};
 pub use capability::{CapId, CapabilityGrant, CapabilityToken, DEFAULT_TTL_SECS};
+pub use identity::{NodeIdentity, NodePublicKey, NodeRegistry, SignedRedemption, MAX_SKEW_SECS};
 pub use keys::{DevKeyManager, KekVersion, KeyManager};
 pub use mask::{Masker, MASK, MIN_MASKABLE_LEN};
 pub use seal::{SealedSecret, SecretBytes, Vault};
+pub use service::SecretService;
 pub use store::{MemorySealedStore, SealedStore};
 
 /// Everything that can go wrong, named for the attack or mistake it stops.
@@ -104,8 +130,33 @@ pub enum SecretError {
     CapabilityRevoked,
     /// Presented by a node other than the one the capability was minted for — a stolen token used
     /// from the wrong place.
+    ///
+    /// Only meaningful because [`service::SecretService`] derives the presenting node's id from a
+    /// verified Ed25519 signature. Reached through [`SecretBroker::redeem`] directly, it compares a
+    /// string the caller supplied against a string the caller could have supplied differently.
     #[error("capability is bound to another node")]
     WrongNode,
+    /// The capability was minted for a different job than the node signed its redemption for.
+    #[error("capability is bound to job `{bound}` but was presented for `{presented}`")]
+    WrongJob { bound: String, presented: String },
+    /// The redemption's Ed25519 signature does not verify — a forged, corrupted, or tampered-with
+    /// request. Covers a malformed public key too: both mean "this was not signed by the key it
+    /// claims", and there is no reason to help a caller tell them apart.
+    #[error("node signature is not valid")]
+    BadNodeSignature,
+    /// A correctly signed redemption from a key no operator enrolled. Distinct from
+    /// [`SecretError::BadNodeSignature`] on purpose: an operator whose node will not redeem needs to
+    /// know whether the request was corrupt or the machine was never provisioned, and an attacker
+    /// who cannot forge a signature learns nothing actionable from the difference.
+    #[error("node public key `{0}` is not enrolled")]
+    UnenrolledNode(String),
+    /// The redemption's timestamp is further from ours than [`identity::MAX_SKEW_SECS`] — a replay,
+    /// or a node whose clock is broken. Refused before it can consume a capability.
+    #[error("redemption is {skew_secs}s away from this clock")]
+    StaleRedemption { skew_secs: u64 },
+    /// One public key may not be enrolled to two nodes: that would let one machine redeem as either.
+    #[error("public key is already enrolled to node `{enrolled_to}` and may not also be `{requested}`")]
+    KeyAlreadyEnrolled { enrolled_to: String, requested: String },
     /// The job asked for a name outside its declared set. The declared set is fixed at mint time, so
     /// a job cannot widen its own reach mid-flight.
     #[error("`{0}` is not in this job's declared secret set")]

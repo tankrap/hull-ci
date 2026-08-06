@@ -12,6 +12,9 @@ hull-ci-control = { path = "../hull-ci-control" }
 hull-ci-fetch = { path = "../hull-ci-fetch" }
 hull-ci-node = { path = "../hull-ci-node" }
 hull-ci-plan = { path = "../hull-ci-plan" }
+# The composition root is where the secret broker acquires a deployment (D§7.4): a key manager, a
+# store, and — before the node can redeem anything — an enrolment for the node's public key.
+hull-ci-secrets = { path = "../hull-ci-secrets" }
 # The operator panel's responses. The control plane hands out typed snapshots; the HTTP shape of
 # `/admin/*` is this crate's to own, so the serialization lives here rather than on those types.
 serde_json.workspace = true

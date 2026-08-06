@@ -8,11 +8,20 @@ repository.workspace = true
 
 [dependencies]
 hull-ci-proto = { path = "../hull-ci-proto" }
+# D§7.4: the node holds its own Ed25519 enrolment key, signs redemptions with it, and injects the
+# values it gets back. None of that can live anywhere else — a signature produced off-node proves
+# nothing about which machine is speaking — so the node takes the broker's crate for the identity,
+# the redemption wire type, and the masker. It gains nothing that could *store* a secret: the store
+# and the key manager are traits it never implements and never holds.
+hull-ci-secrets = { path = "../hull-ci-secrets" }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+# `Zeroizing` on the delivered values in a `SandboxSpec`, so a spec dropped on a failure path does
+# not leave plaintext in freed heap.
+zeroize = { version = "1", features = ["derive"] }
 # Per-job scratch directories. Already a workspace dependency; promoted out of dev-dependencies
 # because the local-process backend creates a scratch dir at runtime, not only under test.
 tempfile.workspace = true

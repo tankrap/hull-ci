@@ -193,6 +193,13 @@ pub struct StepSpec {
     /// been declared when the step is evaluated — so nothing downstream has to detect cycles at
     /// runtime; it only has to respect the edges.
     pub needs: Vec<String>,
+    /// Tenant secret **names** this step declared (design D§7.4).
+    ///
+    /// Carried through the control plane and out onto the [`Assignment`](hull_ci_proto::Assignment)
+    /// unchanged, and never resolved here: the control plane holds no key material and has no way to
+    /// turn one of these into a value. It is a request the secret broker adjudicates against the
+    /// job's author class, which is a fact about the actor and not something this list can raise.
+    pub secrets: Vec<String>,
 }
 
 impl StepSpec {
@@ -204,12 +211,19 @@ impl StepSpec {
             timeout: None,
             continue_on_error: false,
             needs: Vec::new(),
+            secrets: Vec::new(),
         }
     }
 
     /// Declare the steps this one waits on (design D§4.4).
     pub fn needs(mut self, needs: Vec<String>) -> Self {
         self.needs = needs;
+        self
+    }
+
+    /// Declare the tenant secret names this step asks for (design D§7.4). A request, not a grant.
+    pub fn secrets(mut self, secrets: Vec<String>) -> Self {
+        self.secrets = secrets;
         self
     }
 

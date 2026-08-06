@@ -20,8 +20,8 @@ use std::sync::Arc;
 
 use hull_ci_proto::AuthorClass;
 use hull_ci_secrets::{
-    CapabilityRequest, CapabilityToken, DevKeyManager, KeyManager, MemorySealedStore, SealedSecret,
-    SealedStore, SecretBroker, SecretError, Vault,
+    CapabilityRequest, CapabilityToken, DevKeyManager, KeyManager, MemorySealedStore, NodeIdentity,
+    NodeRegistry, SealedSecret, SealedStore, SecretBroker, SecretError, SecretService, Vault,
 };
 
 /// The declared set a hostile fork would write into `.hull/ci.star`. Identical in every test that
@@ -169,7 +169,11 @@ fn compromising_one_tenants_key_does_not_reach_another_tenants_secrets() {
 fn a_capability_cannot_be_stretched() {
     let s = stack();
 
-    // Bound to its node.
+    // Bound to its node — but note what this line is and is not. Called straight against the broker,
+    // `node-b` is a string this test chose, so all it proves is that the comparison happens. The
+    // attack it stands for is `a_stolen_capability_is_useless_on_the_attackers_machine` below, which
+    // goes through `SecretService` and makes the node prove which node it is. D§7.4 is explicit that
+    // the difference is invisible from the code, so it is spelled out here instead.
     let (token, grant) = s.broker.mint(&request(AuthorClass::Member, "job-1", "node-a")).unwrap();
     assert_eq!(s.broker.redeem(&token, "node-b", &[]).unwrap_err(), SecretError::WrongNode);
 
@@ -295,4 +299,67 @@ fn delivery_produces_an_environment_and_a_primed_masker() {
     // And the honest disclaimer, asserted rather than merely written down: the same value, encoded,
     // sails straight through. The gate above is what protects it from hostile code.
     assert_eq!(masker.mask(&hex::encode("npm_live_s3cr3t_value")), hex::encode("npm_live_s3cr3t_value"));
+}
+
+/// **The attack the node binding actually exists for**, told end to end through the seam that makes
+/// it real.
+///
+/// An attacker gets a live capability token — off a crash dump, a stray log line, a compromised
+/// second node. Every other property still stands in their way, but the one under test here is the
+/// node binding, and D§7.4 says it is worthless unless the *transport* proves who is speaking:
+///
+/// > a `node_id` is just a string in a request. Unless the transport has already proven *which node*
+/// > is speaking, the field is self-asserted and the `WrongNode` refusal is decorative: an attacker
+/// > who has the capability token can simply claim the right id.
+///
+/// So the attacker is given every advantage short of the honest node's private key: a real keypair,
+/// a real enrolment of their own, and a correctly signed request naming the right job. There is no
+/// field left in which to claim to be `node-honest`, because the id is derived from the key that
+/// signed — and the refusal follows from a fact the attacker cannot restate.
+#[test]
+fn a_stolen_capability_is_useless_on_the_attackers_machine() {
+    let s = stack();
+    let broker = Arc::new(s.broker);
+    let nodes = Arc::new(NodeRegistry::new());
+    let service = SecretService::new(Arc::clone(&broker), Arc::clone(&nodes));
+
+    let honest = NodeIdentity::generate();
+    let attacker = NodeIdentity::generate();
+    service.enrol_node("node-honest", honest.public()).unwrap();
+    service.enrol_node("node-attacker", attacker.public()).unwrap();
+
+    let (stolen, _) = service.mint(&request(AuthorClass::Member, "job-1", "node-honest")).unwrap();
+    // Real wall-clock seconds, because this stack runs on the real clock and a redemption stamped
+    // outside `MAX_SKEW_SECS` is refused for freshness before the node binding is ever reached — a
+    // useful thing to have discovered while writing this, and a reason not to hand-pick a timestamp.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap();
+
+    // 1. Signed correctly, by an enrolled key, for the right job — and still refused, because the
+    //    key resolves to `node-attacker`.
+    assert_eq!(
+        service.redeem(&attacker.sign(&stolen, "job-1", &[], now)).unwrap_err(),
+        SecretError::WrongNode
+    );
+
+    // 2. Copying the honest node's public key into the request does not help: the signature is over
+    //    that key too, and the attacker cannot produce one for a key they do not hold.
+    let mut impersonation = attacker.sign(&stolen, "job-1", &[], now);
+    impersonation.public_key = honest.public();
+    assert_eq!(service.redeem(&impersonation).unwrap_err(), SecretError::BadNodeSignature);
+
+    // 3. Neither does an unenrolled key, however well-formed the rest of the request is.
+    let anonymous = NodeIdentity::generate();
+    assert!(matches!(
+        service.redeem(&anonymous.sign(&stolen, "job-1", &[], now)),
+        Err(SecretError::UnenrolledNode(_))
+    ));
+
+    // Prove the positive: none of those attempts burned the capability, and the node the capability
+    // was actually minted for still gets its secrets. A binding that also killed the honest job
+    // would hand an attacker a denial of service in place of a theft.
+    let delivered = service.redeem(&honest.sign(&stolen, "job-1", &[], now)).unwrap();
+    assert_eq!(delivered.get("NPM_TOKEN").unwrap().expose(), b"npm_live_s3cr3t_value");
 }

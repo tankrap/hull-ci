@@ -25,6 +25,7 @@ use std::pin::Pin;
 use std::time::Duration;
 
 use hull_ci_proto::{AuthorClass, BackendCapabilities, IsolationTier};
+use zeroize::Zeroizing;
 
 use crate::capture::{CapturedOutput, OutputCaps};
 use crate::controls::EnforcedControls;
@@ -63,7 +64,11 @@ impl Default for ResourceLimits {
 }
 
 /// Everything a backend needs to build one sandbox for one job.
-#[derive(Debug, Clone)]
+///
+/// `Debug` is hand-written below rather than derived, because [`secret_env`](Self::secret_env) holds
+/// plaintext tenant secrets for the length of one spawn and a derived `Debug` would put them in the
+/// first log line anyone adds while debugging a backend.
+#[derive(Clone)]
 pub struct SandboxSpec {
     pub job_id: String,
     pub step_id: String,
@@ -89,8 +94,56 @@ pub struct SandboxSpec {
     /// from a caller who invented a variable called `NPM_TOKEN`. It is not, and must never become,
     /// something the pipeline can populate.
     ///
-    /// Empty in M1/M2, which deliver no secrets at all.
+    /// Empty unless a broker is configured and this job's author is a member.
     pub broker_authorised: Vec<String>,
+    /// Broker-delivered tenant secret values, held **only for the spawn** (D§7.4).
+    ///
+    /// Kept in its own field rather than merged into [`env`](Self::env) for two reasons that are both
+    /// about not being able to make a mistake later: this type's `Debug` can redact one field and not
+    /// the other, and [`validate_spec`] can assert the invariant that every name here was authorised
+    /// by the broker. [`SandboxSpec::full_env`] is what a backend actually passes to a child.
+    ///
+    /// [`Zeroizing`] so that a spec dropped on a failure path — a refused validation, a backend that
+    /// errored before spawning — does not leave the values in freed heap.
+    pub secret_env: Vec<(String, Zeroizing<String>)>,
+}
+
+impl std::fmt::Debug for SandboxSpec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SandboxSpec")
+            .field("job_id", &self.job_id)
+            .field("step_id", &self.step_id)
+            .field("image", &self.image)
+            .field("workspace", &self.workspace)
+            .field("workdir", &self.workdir)
+            .field("limits", &self.limits)
+            .field("env", &self.env)
+            .field("author_class", &self.author_class)
+            .field("broker_authorised", &self.broker_authorised)
+            // Names, never values — the same rule the broker's own audit line follows.
+            .field("secret_env", &self.secret_env.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>())
+            .finish()
+    }
+}
+
+impl SandboxSpec {
+    /// The environment a child process actually receives: the allowlist, plus whatever the broker
+    /// delivered for this job.
+    ///
+    /// Materializing plaintext into plain `String`s is unavoidable at this point — `Command::envs`
+    /// takes strings, and so does every runtime CLI — so this is the boundary where D§7.4's "held in
+    /// memory only for the spawn" starts being a property of the caller's discipline rather than of a
+    /// type. Backends call it once, at spawn, and keep the result no longer than the instance lives.
+    pub fn full_env(&self) -> Vec<EnvVar> {
+        let mut env = self.env.clone();
+        env.extend(self.secret_env.iter().map(|(n, v)| (n.clone(), v.to_string())));
+        env
+    }
+
+    /// The names of the delivered secrets. Safe to log.
+    pub fn secret_names(&self) -> Vec<&str> {
+        self.secret_env.iter().map(|(n, _)| n.as_str()).collect()
+    }
 }
 
 /// One command to run inside a spawned sandbox.
@@ -156,6 +209,11 @@ pub enum SandboxError {
     EmptyArgv,
     #[error("environment variable `{0}` is credential-shaped and must not enter a sandbox (§14.2)")]
     ForbiddenEnv(String),
+    /// A value in `secret_env` that the broker never authorised. Unreachable unless the node builds a
+    /// spec wrong, and refused rather than trusted precisely because the two lists coming apart is
+    /// the shape of a delivery bug that would otherwise look like a working feature.
+    #[error("`{0}` is in the delivered environment but was not authorised by the broker (§14.2, D§7.4)")]
+    UnauthorisedSecret(String),
     #[error("workspace `{0}` does not exist")]
     MissingWorkspace(PathBuf),
     #[error("backend `{backend}` cannot admit untrusted work: {unmet}")]
@@ -309,9 +367,18 @@ pub trait SandboxInstance: Send {
 /// Shared validation every backend runs before touching the host.
 ///
 /// Centralised so a new backend cannot forget one: empty argv (nothing to run), a credential-shaped
-/// environment (§14.2), or a missing workspace are all refusals, not attempts.
+/// environment (§14.2), an unauthorised delivered secret (D§7.4), or a missing workspace are all
+/// refusals, not attempts.
 pub fn validate_spec(spec: &SandboxSpec) -> Result<(), SandboxError> {
-    if let Err(name) = crate::env::reject_forbidden_except(&spec.env, &spec.broker_authorised) {
+    // Checked before the name rules, because it is the *provenance* question and the name rules are
+    // only a proxy for it. A value that reached `secret_env` without a matching entry in
+    // `broker_authorised` did not come from a redemption, whatever it is called.
+    for (name, _) in &spec.secret_env {
+        if !spec.broker_authorised.iter().any(|a| a == name) {
+            return Err(SandboxError::UnauthorisedSecret(name.clone()));
+        }
+    }
+    if let Err(name) = crate::env::reject_forbidden_except(&spec.full_env(), &spec.broker_authorised) {
         return Err(SandboxError::ForbiddenEnv(name));
     }
     if !spec.workspace.is_dir() {
@@ -370,6 +437,58 @@ mod tests {
         let mut g = UseGuard::new("sbx", "job");
         g.begin_collect().expect("empty output from a failed spawn is a legitimate answer");
         g.mark_destroyed();
+    }
+
+    fn spec_with_secret(authorised: &[&str], delivered: &[(&str, &str)]) -> SandboxSpec {
+        SandboxSpec {
+            job_id: "job-1".into(),
+            step_id: "step-1".into(),
+            image: "img".into(),
+            // Points at a directory that exists, so `validate_spec` fails for the reason under test
+            // rather than on the workspace check that follows it.
+            workspace: std::env::temp_dir(),
+            workdir: "/workspace".into(),
+            limits: ResourceLimits::default(),
+            env: crate::env::base_env("/tmp"),
+            author_class: AuthorClass::Member,
+            broker_authorised: authorised.iter().map(|s| s.to_string()).collect(),
+            secret_env: delivered
+                .iter()
+                .map(|(n, v)| (n.to_string(), Zeroizing::new(v.to_string())))
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn a_delivered_secret_must_have_been_authorised_by_the_broker() {
+        // The invariant that keeps `secret_env` from becoming a way around §14.2: a value only rides
+        // in it if the broker's redemption named it. The two lists coming apart is the shape of a
+        // delivery bug that would otherwise look exactly like the feature working.
+        let ok = spec_with_secret(&["NPM_TOKEN"], &[("NPM_TOKEN", "npm_s3cr3tvalue")]);
+        assert!(validate_spec(&ok).is_ok());
+        assert_eq!(ok.full_env().len(), crate::env::base_env("/tmp").len() + 1);
+
+        let unauthorised = spec_with_secret(&[], &[("NPM_TOKEN", "npm_s3cr3tvalue")]);
+        assert!(matches!(
+            validate_spec(&unauthorised),
+            Err(SandboxError::UnauthorisedSecret(name)) if name == "NPM_TOKEN"
+        ));
+
+        // Authorising one name does not open the category, in the merged environment either.
+        let mut sneaky = spec_with_secret(&["NPM_TOKEN"], &[("NPM_TOKEN", "npm_s3cr3tvalue")]);
+        sneaky.env.push(("AWS_SECRET_ACCESS_KEY".into(), "hunter2".into()));
+        assert!(matches!(validate_spec(&sneaky), Err(SandboxError::ForbiddenEnv(_))));
+    }
+
+    #[test]
+    fn a_spec_does_not_print_the_values_it_carries() {
+        // `Debug` is hand-written for exactly this. A derived one would put a tenant's credential in
+        // the first log line anyone adds while debugging a backend.
+        let spec = spec_with_secret(&["NPM_TOKEN"], &[("NPM_TOKEN", "npm_s3cr3tvalue")]);
+        let rendered = format!("{spec:?}");
+        assert!(!rendered.contains("npm_s3cr3tvalue"), "{rendered}");
+        assert!(rendered.contains("NPM_TOKEN"), "the name is fine to log, and useful: {rendered}");
+        assert!(rendered.contains("job-1"), "and the rest of the spec still renders");
     }
 
     #[test]

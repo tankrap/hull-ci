@@ -634,6 +634,10 @@ impl Control {
                 repo: job.dispatch.repo.clone(),
                 tree_id: job.dispatch.tree_id.clone(),
                 argv: step.spec.argv.clone(),
+                // Names, verbatim from the plan (D§7.4). The control plane does not adjudicate them
+                // and could not resolve one if it wanted to — it holds no key material. It carries
+                // them to the placement site, which mints against the job's author class.
+                secrets: step.spec.secrets.clone(),
                 image: step.spec.image.clone(),
                 tier: self.config.tier,
                 author_class: job.author_class,

@@ -7,7 +7,7 @@
 //! [`Assignment`] goes out, a [`StepReport`] comes back from the identity that holds the lease — so
 //! M3 replaces this file with a transport and neither the control plane nor the agent changes.
 //!
-//! Three things this file owns, none of which the control plane may:
+//! Four things this file owns, none of which the control plane may:
 //!
 //! 1. **The isolation gate.** `assign` runs the agent's admission check *before* leasing anything, so
 //!    work no backend here can contain is refused at the door rather than discovered inside a sandbox
@@ -16,6 +16,17 @@
 //! 2. **Workspace materialization** (D§6.2) — see [`crate::workspace`] for why it is a copy.
 //! 3. **Teardown.** The workspace is removed on every path, including cancellation, because it is
 //!    single-use in the same sense the sandbox is (§14.1).
+//! 4. **Minting the secret capability** (D§7.4: "At placement, control mints a short-TTL, single-use
+//!    capability"). This is the placement site — the call the control plane makes to grant the lease
+//!    — so it is where a capability comes into existence, and it comes into existence bound to the
+//!    node that was just leased the step.
+//!
+//! That last point is load-bearing for a check the broker cannot make on its own. D§7.4 says "the
+//! broker verifies the node is the lease-holder", and it cannot: the lease table is the control
+//! plane's. What holds here instead is a property of *when*: a capability exists only because a lease
+//! was just granted to this node, in this call, and it dies in sixty seconds. That is weaker than
+//! consulting a lease table — it does not notice a lease revoked in between — and it is worth naming
+//! as such rather than letting the code read as though the stronger check exists.
 //!
 //! # The one wart: reporting before the lease is recorded
 //!
@@ -37,6 +48,7 @@ use hull_ci_control::{Control, ReportRejected};
 use hull_ci_node::agent::NodeErrorKind;
 use hull_ci_node::NodeAgent;
 use hull_ci_proto::{sanitize_summary, Assignment, StepOutcome, StepReport, SUMMARY_MAX_CHARS};
+use hull_ci_secrets::{CapabilityRequest, CapabilityToken, SecretError, SecretService};
 use tokio::task::JoinHandle;
 
 /// How long a finished step will wait for its own lease to be recorded before giving up. Generous
@@ -54,6 +66,9 @@ pub struct InProcessFleet {
     control: OnceLock<Weak<Control>>,
     /// In-flight steps, so fail-fast cancellation (D§6.6) can actually stop one.
     running: Mutex<HashMap<StepKey, JoinHandle<()>>>,
+    /// The broker, on the control side of the seam. `None` in `HULL_CI_SECRETS=off`, in which case no
+    /// capability is ever minted and a step that declared secrets simply runs without them.
+    secrets: Option<Arc<SecretService>>,
 }
 
 type StepKey = (String, String);
@@ -65,7 +80,64 @@ impl InProcessFleet {
             work_root,
             control: OnceLock::new(),
             running: Mutex::new(HashMap::new()),
+            secrets: None,
         })
+    }
+
+    /// [`new`](Self::new), with the broker this fleet mints against at placement (D§7.4).
+    pub fn with_secrets(agent: NodeAgent, work_root: PathBuf, secrets: Arc<SecretService>) -> Arc<Self> {
+        Arc::new(InProcessFleet {
+            agent: Arc::new(agent),
+            work_root,
+            control: OnceLock::new(),
+            running: Mutex::new(HashMap::new()),
+            secrets: Some(secrets),
+        })
+    }
+
+    /// Mint this placement's capability, or explain why there is none.
+    ///
+    /// Three outcomes, and the middle one is the interesting one:
+    ///
+    /// * **No broker, or nothing declared** → `Ok(None)`. The step runs with the base environment.
+    /// * **`OutsiderRefused`** → `Ok(None)`, and the job *still runs*. D§7.4 is explicit that an
+    ///   outsider-authored job "is passed no secret names and the broker refuses to mint a capability
+    ///   for it" — refused a secret, not refused a run. That is also the boundary GitHub draws for a
+    ///   fork's `pull_request` workflow. A step that needed the variable fails on its own terms,
+    ///   which is the correct signal: the change genuinely cannot be verified by that step from a
+    ///   fork.
+    /// * **Anything else** → a refusal of the *assignment*. A member's job naming a secret that does
+    ///   not exist, or a tenant with no key material, is a configuration error, and D§7.4 puts that
+    ///   error at placement where it reads as one — rather than inside a sandbox spawn, where it
+    ///   would look like an infrastructure flake.
+    ///
+    /// The author-class decision is **not** duplicated here. It belongs to the broker, which derives
+    /// it from the assignment the control plane built (D§1), and a second copy of that rule in the
+    /// composition root is a second place for it to drift.
+    fn mint_capability(&self, a: &Assignment) -> Result<Option<CapabilityToken>, NodeError> {
+        let (Some(service), false) = (&self.secrets, a.secrets.is_empty()) else {
+            return Ok(None);
+        };
+        let request = CapabilityRequest::for_assignment(a, self.node_id(), a.secrets.clone());
+        match service.mint(&request) {
+            Ok((token, grant)) => {
+                tracing::info!(
+                    job = %a.job_id, step = %a.step_id, cap_id = %grant.cap_id,
+                    // Names and the id, never a value and never the token itself.
+                    names = ?grant.names, expires_at = grant.expires_at,
+                    "minted a secret capability at placement"
+                );
+                Ok(Some(token))
+            }
+            Err(SecretError::OutsiderRefused) => {
+                tracing::info!(
+                    job = %a.job_id, step = %a.step_id, declared = ?a.secrets,
+                    "outsider-authored job: no capability minted, the step runs without its declared secrets (D§7.4)"
+                );
+                Ok(None)
+            }
+            Err(e) => Err(NodeError::Rejected(format!("could not mint a secret capability: {e}"))),
+        }
     }
 
     /// Point the fleet at the control plane it reports to.
@@ -115,6 +187,10 @@ impl NodeSink for InProcessFleet {
             return Err(NodeError::Rejected("node fleet is not attached to a control plane".into()));
         };
 
+        // Minted after the isolation gate and before the lease is handed back, so a capability never
+        // exists for work this node has already refused to run.
+        let capability = self.mint_capability(assignment)?;
+
         let node_id = self.agent.config().node_id.clone();
         let key: StepKey = (assignment.job_id.clone(), assignment.step_id.clone());
         let run = Run {
@@ -124,6 +200,7 @@ impl NodeSink for InProcessFleet {
             assignment: assignment.clone(),
             tree_path: tree.path.clone(),
             workspace: self.workspace_path(assignment),
+            capability,
         };
 
         let handle = tokio::spawn(run.execute());
@@ -154,6 +231,10 @@ struct Run {
     assignment: Assignment,
     tree_path: PathBuf,
     workspace: PathBuf,
+    /// This placement's capability, if one was minted. Travels with the run rather than on the
+    /// [`Assignment`] — a bearer credential does not belong on the value that is serialized and
+    /// logged (see the field's note on `Assignment::secrets`).
+    capability: Option<CapabilityToken>,
 }
 
 impl Run {
@@ -161,7 +242,9 @@ impl Run {
         let report = match self.materialize().await {
             Ok(()) => {
                 self.agent.note_warm_tree(self.assignment.tree_id.clone());
-                self.agent.run_assignment(&self.assignment, &self.workspace).await
+                self.agent
+                    .run_assignment_with(&self.assignment, &self.workspace, self.capability.as_ref())
+                    .await
             }
             // A workspace we could not build is our failure, and the step never ran: `errored` with
             // the infra marker, never `red` (spec §7).
@@ -256,6 +339,7 @@ mod tests {
             repo: "acme/widget".into(),
             tree_id: "tree1".into(),
             argv: vec!["/bin/true".into()],
+            secrets: Vec::new(),
             image: "n/a".into(),
             tier: IsolationTier::Container,
             author_class: class,

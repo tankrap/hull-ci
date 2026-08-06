@@ -33,6 +33,11 @@
 //!   see [`assemble`] and [`node::InProcessFleet::assign`].
 //! * The **unsandboxed backend requires the operator to say so**, in an environment variable whose
 //!   only purpose is to be typed on purpose ([`config::SandboxChoice`]).
+//! * The **secret broker is a seam too, and its identity check is not skipped for being local**
+//!   ([`secrets`]). D§7.4 puts the broker in a fourth, credential-scoped process; here it is a struct
+//!   in this one. The node still signs every redemption with its own enrolled Ed25519 key and the
+//!   service still derives the node id from that key, because a shortcut for the in-process case
+//!   would make the check that matters the one thing never exercised.
 //!
 //! # What M1 does not do
 //!
@@ -47,6 +52,7 @@ pub mod membership;
 pub mod node;
 pub mod pipeline;
 pub mod plan;
+pub mod secrets;
 pub mod workspace;
 
 use std::sync::Arc;
@@ -58,7 +64,7 @@ use hull_ci_fetch::{ContentStore, FetchBroker};
 use hull_ci_node::{ContainerConfig, LocalProcessBackend, NodeAgent, NodeConfig, SandboxBackend};
 use hull_ci_proto::IsolationTier;
 
-pub use config::{Config, ConfigError, SandboxChoice};
+pub use config::{Config, ConfigError, SandboxChoice, SecretsMode};
 use fetch::BrokerFetcher;
 use node::InProcessFleet;
 use pipeline::PipelinePlanner;
@@ -97,6 +103,14 @@ pub struct Runner {
     pub control: Arc<Control>,
     pub router: Router,
     pub fleet: Arc<InProcessFleet>,
+    /// The secret broker and this node's enrolled identity, or `None` in `HULL_CI_SECRETS=off`.
+    ///
+    /// Exposed for the same reason `control` is: the end-to-end suite has to store a tenant secret
+    /// and inspect enrolment, and doing that through the *assembled* plane is the only way to test
+    /// the wiring rather than a rebuilt copy of it. There is no HTTP surface here — storing a secret
+    /// is an operator action against the control-plane DB (D§7.4), and inventing an endpoint for it
+    /// would be a new attack surface this milestone does not need.
+    pub secrets: Option<Arc<hull_ci_secrets::SecretService>>,
 }
 
 /// Build the runner: choose a backend, check it, and wire the seams.
@@ -118,7 +132,24 @@ pub async fn assemble(config: &Config) -> Result<Runner, StartupError> {
         NodeConfig { node_id: config.node_id.clone(), ..NodeConfig::default() },
         backend,
     );
-    let fleet = InProcessFleet::new(agent, config.work_root.clone());
+
+    // D§7.4. The plane is built before the fleet because enrolling the node's key is a precondition
+    // for it redeeming anything: a node wired to a broker it is not enrolled with would fail every
+    // delivery, and it would fail it in the shape of an outage rather than of a misconfiguration.
+    let secrets = secrets::assemble(config);
+    if let Some(plane) = &secrets {
+        if let Some(raw) = &config.dev_secrets {
+            secrets::seed_dev_secrets(plane, raw);
+        }
+    }
+    let fleet = match &secrets {
+        Some(plane) => InProcessFleet::with_secrets(
+            agent.with_secrets(Arc::clone(&plane.client)),
+            config.work_root.clone(),
+            Arc::clone(&plane.service),
+        ),
+        None => InProcessFleet::new(agent, config.work_root.clone()),
+    };
 
     let control_config = ControlConfig {
         secret: config.secret.clone(),
@@ -135,7 +166,12 @@ pub async fn assemble(config: &Config) -> Result<Runner, StartupError> {
     // error rather than a runner that reports `errored` on every job because its planner is a stub.
     let deps = Deps {
         fetcher: Arc::new(BrokerFetcher::new(broker)),
-        planner: Arc::new(PipelinePlanner::new(config.image.clone())),
+        // The planner is told whether a broker exists for one reason only: so it stops warning that
+        // `secrets = [...]` goes undelivered when it no longer does. It is not an authority input —
+        // the broker still refuses an outsider whatever this says.
+        planner: Arc::new(
+            PipelinePlanner::new(config.image.clone()).with_secret_delivery(secrets.is_some()),
+        ),
         node: Arc::clone(&fleet) as Arc<dyn hull_ci_control::seams::NodeSink>,
         // Built here rather than taken from `Deps::default` so that failing to construct the HTTP
         // client is a startup error, not a silently unwired verdict sender.
@@ -162,7 +198,7 @@ pub async fn assemble(config: &Config) -> Result<Runner, StartupError> {
         )));
     }
 
-    Ok(Runner { router, control, fleet })
+    Ok(Runner { router, control, fleet, secrets: secrets.map(|p| p.service) })
 }
 
 /// Assemble, bind, and serve until the process ends.
@@ -246,6 +282,23 @@ fn announce_isolation(config: &Config, backend: &dyn SandboxBackend) {
             bind = %config.bind,
             "no HULL_CI_SECRET configured — every dispatch reaching this port is accepted (spec §8)"
         );
+    }
+
+    match config.secrets {
+        // Not a gap to apologise for: it is the state in which a sandbox escape reaches no tenant
+        // credential at all, because there is none on this host to reach.
+        SecretsMode::Off => tracing::info!(
+            "tenant secret broker disabled (HULL_CI_SECRETS=off): `secrets` in a pipeline is \
+             delivered to nobody, and this runner holds no tenant credential"
+        ),
+        // The loud one is emitted by `secrets::assemble`, which is the module that knows *why* the
+        // dev key manager is dangerous. This line is the summary an operator reads next to it.
+        SecretsMode::Dev => tracing::warn!(
+            node_id = %config.node_id,
+            "tenant secret broker enabled in DEVELOPMENT mode. Member-authored jobs receive their \
+             declared secrets; outsider-authored jobs never do (D§7.4). Masking of job output is a \
+             backstop against an accidental echo, not a control."
+        ),
     }
 
     match (&config.admin_token, config.bind.ip().is_loopback()) {

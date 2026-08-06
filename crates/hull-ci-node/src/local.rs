@@ -110,7 +110,10 @@ impl SandboxBackend for LocalProcessBackend {
                 guard: UseGuard::new(id.clone(), spec.job_id.clone()),
                 id,
                 workspace: spec.workspace.clone(),
-                env: rehome(&spec.env, scratch.path().to_string_lossy().as_ref()),
+                // `full_env` rather than `spec.env`: broker-delivered secrets are part of the job's
+                // environment (D§7.4) and `validate_spec` above has already established that each of
+                // them was authorised for this job.
+                env: rehome(&spec.full_env(), scratch.path().to_string_lossy().as_ref()),
                 scratch: Some(scratch),
                 capture: None,
             }) as Box<dyn SandboxInstance>)
@@ -210,6 +213,7 @@ mod tests {
             env: crate::env::base_env("/tmp"),
             author_class: AuthorClass::Member,
             broker_authorised: Vec::new(),
+            secret_env: Vec::new(),
         }
     }
 

@@ -337,6 +337,18 @@ pub struct Assignment {
     pub tree_id: String,
     /// argv, executed inside the sandbox only — never interpolated into a host command line.
     pub argv: Vec<String>,
+    /// Tenant secret **names** this step declared (design D§7.4, `secrets = ["NPM_TOKEN"]`).
+    ///
+    /// Names only, and that is the invariant to hold on to: no secret *value* is ever on an
+    /// assignment, in a plan, or in the job store. The short-TTL capability the node redeems at exec
+    /// time travels *beside* this type rather than on it, for the same reason `VerifiedTree` does —
+    /// a bearer credential does not belong on the value that gets serialized, retried and logged.
+    ///
+    /// Declaring a name is a request, not a grant. The broker adjudicates it against the job's author
+    /// class and never consults this list for authority (D§1), so an outsider's assignment may name
+    /// whatever it likes and receive nothing.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub secrets: Vec<String>,
     pub image: String,
     pub tier: IsolationTier,
     pub author_class: AuthorClass,

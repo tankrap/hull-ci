@@ -10,10 +10,15 @@
 //! removing things. Deny-lists fail open — a new host variable leaks until someone remembers to add
 //! it — and this is the exact surface where failing open means handing an attacker a credential.
 //!
-//! The node itself holds **no** tenant credential and **no** CI shared secret (D§7.1): the fetch is
-//! the broker's job and the callback is the control plane's, so there is nothing here to leak even if
-//! the allowlist were wrong. [`reject_forbidden`] is therefore a backstop against a *caller* mistake,
-//! not the primary control.
+//! The node itself holds **no** *platform* credential and **no** CI shared secret (D§7.1): the fetch
+//! is the broker's job and the callback is the control plane's, so there is nothing of ours here to
+//! leak even if the allowlist were wrong. [`reject_forbidden`] is therefore a backstop against a
+//! *caller* mistake, not the primary control.
+//!
+//! Since M3 the node does hold one thing for the length of a spawn: the tenant secrets a
+//! member-authored job declared, redeemed from the broker (D§7.4). Those are *meant* to enter the
+//! sandbox, which is why [`reject_forbidden_except`] exists — and the exemption is the broker's
+//! decision carried in a list, never a relaxation of the rule.
 
 /// A single environment entry destined for the sandbox.
 pub type EnvVar = (String, String);
@@ -52,11 +57,12 @@ pub fn base_env_with_path(home: &str, path: &str) -> Vec<EnvVar> {
     ]
 }
 
-/// Substrings that must never appear in a variable name we pass into a sandbox.
+/// Substrings that must never appear in a variable name we pass into a sandbox — unless the broker
+/// authorised that exact name for this job (see [`reject_forbidden_except`]).
 ///
-/// M1 injects no tenant secrets at all (the secret broker is M3, D§7.4), so the correct number of
-/// credential-shaped variables entering a sandbox right now is zero. This list exists so that a
-/// caller who starts passing extra variables cannot quietly reintroduce §14.2's failure mode.
+/// The list is a proxy for provenance, and the exemption is the provenance answer itself. Everything
+/// *not* on the broker's list is still refused outright, which is the failure mode §14.2 is about: a
+/// caller who starts passing extra variables cannot quietly reintroduce it.
 const FORBIDDEN_NAME_FRAGMENTS: &[&str] = &[
     "SECRET", "TOKEN", "PASSWORD", "PASSWD", "CREDENTIAL", "PRIVATE_KEY", "APIKEY", "API_KEY",
     "AWS_", "GOOGLE_APPLICATION", "AZURE_", "GITHUB_TOKEN", "NPM_TOKEN", "HULL_CI",

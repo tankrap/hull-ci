@@ -41,12 +41,14 @@ use hull_ci_proto::{
     sanitize_summary, Assignment, AuthorClass, BackendCapabilities, NodeState, StepOutcome,
     StepReport, SUMMARY_MAX_CHARS,
 };
+use hull_ci_secrets::{CapabilityToken, NodePublicKey};
 
 use crate::capture::{CapturedOutput, OutputCaps};
 use crate::detect::{detect_test_command, Detection};
 use crate::sandbox::{
     ExecRequest, ExecStatus, ResourceLimits, SandboxBackend, SandboxError, SandboxSpec,
 };
+use crate::secrets::SecretsClient;
 
 /// Why a step errored, in a form the control plane can map to `hull_ci_proto::Reason`.
 ///
@@ -131,6 +133,10 @@ pub struct NodeAgent {
     /// Trees this node holds extracted, for `tree_affinity` scoring (D§5.2). Materialization is the
     /// control plane's, so the node only *reports* what it has been given.
     warm_trees: Mutex<Vec<String>>,
+    /// This node's identity and its route to the secret broker (D§7.4), or `None` where no broker is
+    /// configured — in which case no step ever receives a declared secret and every one of them runs
+    /// exactly as it did before M3.
+    secrets: Option<Arc<SecretsClient>>,
 }
 
 impl NodeAgent {
@@ -149,7 +155,22 @@ impl NodeAgent {
             );
         }
         let slots_free = AtomicU32::new(config.slots_total);
-        NodeAgent { config, backend, slots_free, warm_trees: Mutex::new(Vec::new()) }
+        NodeAgent { config, backend, slots_free, warm_trees: Mutex::new(Vec::new()), secrets: None }
+    }
+
+    /// Give this node an identity and a broker to redeem against (D§7.4).
+    ///
+    /// Opt-in rather than constructed by default, because a node with an identity nobody enrolled is
+    /// a node that fails every redemption in a way that looks like a broker outage. The composition
+    /// root enrols the key and wires this in the same breath — see `hull_ci_server::secrets`.
+    pub fn with_secrets(mut self, client: Arc<SecretsClient>) -> Self {
+        self.secrets = Some(client);
+        self
+    }
+
+    /// This node's public identity, if it has one. The enrolment record's other half.
+    pub fn public_key(&self) -> Option<NodePublicKey> {
+        self.secrets.as_ref().map(|s| s.identity().public())
     }
 
     pub fn config(&self) -> &NodeConfig {
@@ -213,15 +234,35 @@ impl NodeAgent {
     /// `workspace` is the already-materialized tree (D§6.2). The node does not fetch it and holds no
     /// credential that could (§14.2).
     pub async fn run_assignment(&self, a: &Assignment, workspace: &Path) -> StepReport {
+        self.run_assignment_with(a, workspace, None).await
+    }
+
+    /// [`run_assignment`](Self::run_assignment), plus the capability minted for this placement.
+    ///
+    /// The capability travels as an argument rather than on the [`Assignment`] for the same reason
+    /// `VerifiedTree` does (see `NodeSink::assign`): the assignment is the serialized, stored, logged
+    /// wire record of the work, and a live bearer credential does not belong on it. It belongs to the
+    /// lease grant, which is what this parameter represents.
+    pub async fn run_assignment_with(
+        &self,
+        a: &Assignment,
+        workspace: &Path,
+        capability: Option<&CapabilityToken>,
+    ) -> StepReport {
         self.slots_free.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| Some(n.saturating_sub(1))).ok();
-        let report = self.run_inner(a, workspace).await;
+        let report = self.run_inner(a, workspace, capability).await;
         self.slots_free
             .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| Some((n + 1).min(self.config.slots_total)))
             .ok();
         report
     }
 
-    async fn run_inner(&self, a: &Assignment, workspace: &Path) -> StepReport {
+    async fn run_inner(
+        &self,
+        a: &Assignment,
+        workspace: &Path,
+        capability: Option<&CapabilityToken>,
+    ) -> StepReport {
         if let Err(why) = self.admission_check(a) {
             return errored(a, NodeErrorKind::Infra, &why);
         }
@@ -245,6 +286,43 @@ impl NodeAgent {
             a.argv.clone()
         };
 
+        // D§7.4's "at exec time": the redemption happens here, immediately before the spawn, so the
+        // window in which this process holds plaintext is one sandbox creation wide. A failure is
+        // terminal for the step — a step that declared a secret and did not get it must not run and
+        // quietly fail on its own terms, because that failure would be indistinguishable from the
+        // code being broken and Hull would be told the wrong thing about the tree.
+        let delivered = match (&self.secrets, capability) {
+            (Some(client), Some(token)) => match client.redeem(a, token).await {
+                Ok(d) => Some(d),
+                Err(e) => {
+                    return errored(
+                        a,
+                        NodeErrorKind::Infra,
+                        &format!("secret delivery refused, so the step did not run: {e}"),
+                    )
+                }
+            },
+            // No broker configured, or no capability minted for this placement (an outsider-authored
+            // job, or a step that declared nothing). Either way the step runs without the variables,
+            // which is what D§7.4 says an outsider gets.
+            _ => None,
+        };
+
+        // Names for the sandbox's provenance check, and a primed masker for the output. Both are
+        // taken before the values move into the spec, so nothing below has to reach back into a type
+        // that is about to be consumed.
+        let broker_authorised: Vec<String> =
+            delivered.as_ref().map(|d| d.names().iter().map(|n| n.to_string()).collect()).unwrap_or_default();
+        let masker = delivered.as_ref().map(|d| d.masker());
+        let secret_env = delivered.as_ref().map(|d| d.to_env_vars()).unwrap_or_default();
+        if !broker_authorised.is_empty() {
+            // Names, never values — the audit line for "which step got what".
+            tracing::info!(
+                job = %a.job_id, step = %a.step_id, names = ?broker_authorised,
+                "injecting broker-delivered tenant secrets into the sandbox"
+            );
+        }
+
         let timeout = Duration::from_secs(a.timeout_secs).min(self.config.max_step_timeout);
         let spec = SandboxSpec {
             job_id: a.job_id.clone(),
@@ -255,10 +333,15 @@ impl NodeAgent {
             limits: self.config.limits,
             env: crate::env::base_env_with_path("/tmp", &self.backend.job_path()),
             author_class: a.author_class,
-            // Empty until the secret broker is wired in (D§7.4, M3). The node never mints this list
-            // itself — it carries the broker's decision or it carries nothing.
-            broker_authorised: Vec::new(),
+            // The broker's decision, carried — never the node's own. `a.secrets` is what the pipeline
+            // *asked* for and is deliberately not consulted here: what goes in this list is what came
+            // back from a redemption the broker granted after checking author class (D§1, D§7.4).
+            broker_authorised,
+            secret_env,
         };
+        // The delivery is now entirely inside `spec`; drop the original so there is one copy of each
+        // plaintext value alive from here to the spawn, not two.
+        drop(delivered);
 
         let mut sandbox = match self.backend.spawn(&spec).await {
             Ok(s) => s,
@@ -272,13 +355,27 @@ impl NodeAgent {
             caps: self.config.output_caps,
         };
         let exec = sandbox.exec(&req).await;
-        let captured = match sandbox.collect().await {
+        let mut captured = match sandbox.collect().await {
             Ok(c) => c,
             Err(e) => {
                 tracing::warn!(error = %e, "collect failed; reporting without job output");
                 CapturedOutput::empty(self.config.output_caps)
             }
         };
+
+        // D§7.4: "Every value registers with the log shipper (§7.1) and the summary constructor
+        // (§6.6) and is replaced with `***`." This is that registration, applied at the one point
+        // where all of this step's output exists in one buffer — so the chunk-boundary problem
+        // `Masker::longest_value` warns a streaming caller about does not arise here.
+        //
+        // **Best-effort, and that is not a hedge.** `hull_ci_secrets::mask` is exact-substring
+        // redaction: the job holds the plaintext and can `base64` it, split it, or spell it out, and
+        // none of those are matched. It catches the honest case — a member's own pipeline echoing its
+        // environment while debugging — and nothing else. What stops hostile code is that hostile
+        // code was never given the value (the author-class gate at the broker).
+        if let Some(masker) = &masker {
+            captured.redact_with(|bytes| masker.mask_bytes(bytes));
+        }
 
         // §14.1: destroy always, on every path, including the ones that already failed.
         if let Err(e) = sandbox.destroy().await {
@@ -424,6 +521,7 @@ mod tests {
             repo: "acme/widget".into(),
             tree_id: "tree-1".into(),
             argv: argv.iter().map(|s| s.to_string()).collect(),
+            secrets: Vec::new(),
             image: "n/a".into(),
             tier: IsolationTier::Container,
             author_class: AuthorClass::Member,

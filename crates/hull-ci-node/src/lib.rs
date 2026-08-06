@@ -23,15 +23,33 @@
 //! - [`detect`] — M1 test-command autodetection, and the `no_tests`-vs-infra distinction §9.1 rests on.
 //! - [`agent`] — [`NodeAgent`]: state, heartbeats, one assignment → one [`StepReport`].
 //! - [`env`] — the allowlist-built job environment (§14.2).
+//! - [`secrets`] — this node's Ed25519 identity and its route to the secret broker (D§7.4).
 //!
 //! # What this node cannot do, by construction
 //!
 //! Design D§7.1: the agent "holds **no tenant credentials and no CI shared secret** — neither the
 //! fetch path nor the callback path goes through it (§14.2), and there is nothing in its memory a
 //! successful sandbox escape would want except the ability to be a node." That is a property of what
-//! is *absent* here: there is no HTTP client, no secret type, no `source_url`, and no `callback_url`
-//! anywhere in this crate. [`NodeAgent::run_assignment`] takes a workspace path that somebody else
-//! fetched and verified (D§6.2, "materialize, don't fetch").
+//! is *absent* here: there is no HTTP client, no `source_url`, and no `callback_url` anywhere in this
+//! crate. [`NodeAgent::run_assignment`] takes a workspace path that somebody else fetched and
+//! verified (D§6.2, "materialize, don't fetch").
+//!
+//! **M3 narrows that claim in one place, and it is worth being exact about where.** With a broker
+//! configured, this crate holds two things it did not before:
+//!
+//! * **Its own enrolment keypair** ([`secrets::SecretsClient`]). It authenticates the node and
+//!   authorises nothing: stealing it lets an attacker *be this node*, which is exactly what D§7.1's
+//!   "except the ability to be a node" already conceded. It cannot decrypt a stored secret, cannot
+//!   mint a capability, and reaches no tenant but whichever one has a job placed here.
+//! * **One job's declared secret values, for the length of one spawn.** Redeemed immediately before
+//!   `spawn`, dropped immediately after, never written to disk, and only ever for a
+//!   `member`-authored job — because the broker refuses to mint for anyone else. That is not a
+//!   loophole in D§7.1 but D§7.4's stated design ("holds them in memory **only for the spawn**"), and
+//!   the exposure it buys is bounded to the job that asked for them.
+//!
+//! What is still absent is what mattered: no *platform* credential, no other tenant's anything, and
+//! no key that could open a secret at rest. A sandbox escape during a spawn reaches the values that
+//! job was about to be handed anyway.
 //!
 //! Likewise there is no API in this crate that accepts a command *string*. Everything is `Vec<String>`
 //! argv, all the way to the sandbox — D§7.2: "No raw shell on any host, ever."
@@ -70,6 +88,7 @@ pub mod env;
 pub mod local;
 pub mod process;
 pub mod sandbox;
+pub mod secrets;
 
 pub use agent::{ControlLink, LinkError, NodeAgent, NodeConfig, NodeErrorKind};
 pub use capture::{CapturedOutput, OutputCapture, OutputCaps, DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES};
@@ -81,6 +100,7 @@ pub use sandbox::{
     ExecOutcome, ExecRequest, ExecStatus, Lifecycle, ResourceLimits, SandboxBackend, SandboxError,
     SandboxInstance, SandboxSpec,
 };
+pub use secrets::{NodeClock, SecretRedeemer, SecretsClient, SystemNodeClock};
 
 /// Pick the strongest backend this host can actually provide.
 ///

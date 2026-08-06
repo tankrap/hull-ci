@@ -18,6 +18,8 @@
 //! | `HULL_CI_IMAGE` | `hull-ci/m1:latest` | image the planner names for its step |
 //! | `HULL_CI_DETAILS_BASE_URL` | *none* | base for the verdict's `details_url` (design G4) |
 //! | `HULL_CI_ADMIN_TOKEN` | *none* | bearer token for the read-only operator panel; **unset disables it entirely** |
+//! | `HULL_CI_SECRETS` | `off` | `off` \| `dev` — the tenant secret broker (design D§7.4) |
+//! | `HULL_CI_DEV_SECRETS` | *none* | `tenant/NAME=value,…` seed for `HULL_CI_SECRETS=dev`; **dev only** |
 //!
 //! `HULL_CI_SECRET` deserves its own note: spec §8 makes configuring one a SHOULD, and this process
 //! treats a missing one as a loud warning rather than a refusal, because a loopback bring-up run
@@ -58,6 +60,38 @@ impl SandboxChoice {
     }
 }
 
+/// Whether this deployment can deliver a tenant secret, and what holds the keys (design D§7.4).
+///
+/// There is no `auto`. Whether a runner can hand a job a credential is not something to infer from
+/// the environment: it changes what a sandbox escape reaches, so it is a choice an operator makes in
+/// one place and can read back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SecretsMode {
+    /// **The default.** No broker, no node keypair, no capability ever minted. A pipeline's
+    /// `secrets = [...]` is warned about at plan time and delivered to nobody, and the sandbox's
+    /// credential-shaped-name refusal keeps its pre-M3 meaning exactly.
+    Off,
+    /// A broker whose key material lives in this process's memory
+    /// ([`hull_ci_secrets::DevKeyManager`]), announced loudly at startup. Development and test only;
+    /// the [`KeyManager`](hull_ci_secrets::KeyManager) trait is where a KMS goes.
+    Dev,
+}
+
+impl SecretsMode {
+    fn parse(raw: &str) -> Result<SecretsMode, ConfigError> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "off" | "none" | "disabled" => Ok(SecretsMode::Off),
+            "dev" | "development" => Ok(SecretsMode::Dev),
+            other => Err(ConfigError::Value {
+                var: "HULL_CI_SECRETS",
+                // No fuzzy matching, for the same reason `SandboxChoice` has none: a typo must not
+                // resolve to a mode that hands out credentials.
+                detail: format!("expected `off` or `dev`, got `{other}`"),
+            }),
+        }
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
     #[error("{var} is invalid: {detail}")]
@@ -92,6 +126,14 @@ pub struct Config {
     /// surface in this system is partitioned by tenant, and this one is not), so a deployment that
     /// did not ask for it must not get it.
     pub admin_token: Option<String>,
+    /// Whether tenant secrets can be delivered at all (design D§7.4). See [`SecretsMode`].
+    pub secrets: SecretsMode,
+    /// `tenant/NAME=value,…` seeded into a [`SecretsMode::Dev`] broker at startup.
+    ///
+    /// Ignored in [`SecretsMode::Off`], and documented dev-only where it is read
+    /// ([`crate::secrets::seed_dev_secrets`]) — it is the one place in this configuration that holds
+    /// a plaintext credential, and it exists so a dev stack can be tried at all.
+    pub dev_secrets: Option<String>,
 }
 
 impl Default for Config {
@@ -116,6 +158,10 @@ impl Default for Config {
             timeouts: Timeouts::default(),
             // Off. See the field's doc: an operator surface that shows every tenant's jobs is opt-in.
             admin_token: None,
+            // Off: a runner nobody asked to hold credentials holds none, so there is nothing for a
+            // sandbox escape to reach and nothing for a misconfiguration to hand out.
+            secrets: SecretsMode::Off,
+            dev_secrets: None,
         }
     }
 }
@@ -150,6 +196,11 @@ impl Config {
             // `var` treats an empty value as unset, which matters more here than anywhere else:
             // `HULL_CI_ADMIN_TOKEN=` must disable the panel, never authenticate the empty string.
             admin_token: var("HULL_CI_ADMIN_TOKEN"),
+            secrets: match var("HULL_CI_SECRETS") {
+                Some(v) => SecretsMode::parse(&v)?,
+                None => d.secrets,
+            },
+            dev_secrets: var("HULL_CI_DEV_SECRETS"),
         })
     }
 }
@@ -179,6 +230,21 @@ mod tests {
             "least privilege: an unconfigured deployment has no trusted tenant, so it runs nothing"
         );
         assert!(d.admin_token.is_none(), "the cross-tenant operator panel is off unless asked for");
+        assert_eq!(
+            d.secrets,
+            SecretsMode::Off,
+            "a runner nobody asked to hold tenant credentials holds none (D§7.4)"
+        );
+    }
+
+    #[test]
+    fn the_secrets_mode_refuses_anything_it_does_not_recognise() {
+        // Same reasoning as the sandbox choice: a typo must not resolve to the mode that hands out
+        // credentials, so there is no fuzzy match and no fallback.
+        assert_eq!(SecretsMode::parse("off").unwrap(), SecretsMode::Off);
+        assert_eq!(SecretsMode::parse(" DEV ").unwrap(), SecretsMode::Dev);
+        assert!(SecretsMode::parse("kms").is_err(), "no KMS mode exists yet, so it must not parse");
+        assert!(SecretsMode::parse("").is_err());
     }
 
     #[test]

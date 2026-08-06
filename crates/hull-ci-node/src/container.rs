@@ -352,6 +352,17 @@ pub fn create_argv(
             a.push(format!("{k}={v}"));
         }
 
+        // Broker-delivered secrets go in by **name only** (D§7.4). `--env NAME=VALUE` would put the
+        // plaintext in the runtime CLI's argv, which is world-readable through `/proc` on Linux for
+        // as long as `create` runs — a local disclosure to every other user on the node, against a
+        // value §14.2's whole discipline exists to contain. The bare `--env NAME` form tells the
+        // runtime to copy the variable out of *its own* environment instead, and `control_command`
+        // below is what puts it there. See `ContainerInstance::exec`.
+        for name in spec.secret_names() {
+            a.push("--env".into());
+            a.push(name.to_string());
+        }
+
         // Labels let an operator find and reap orphans after a node crash without guessing names.
         a.push("--label".into());
         a.push(format!("hull-ci.job={}", spec.job_id));
@@ -369,11 +380,18 @@ pub fn create_argv(
 }
 
 /// Run one runtime control command (`create`, `kill`, `rm`) and return its status and output.
+///
+/// `extra_env` is added to the **CLI's own** environment, not the job's. It exists for exactly one
+/// caller: `create`, which passes broker-delivered secrets by name (`--env NAME`) so the values never
+/// appear in an argv any other user on the host can read. Everything else passes an empty slice.
 async fn control_command(
     config: &ContainerConfig,
     argv: Vec<String>,
+    extra_env: &[(String, String)],
 ) -> Result<(ExecStatus, String), SandboxError> {
-    let mut cmd = command_from_argv(&argv, &runtime_env())?;
+    let mut env = runtime_env();
+    env.extend_from_slice(extra_env);
+    let mut cmd = command_from_argv(&argv, &env)?;
     let child = cmd.spawn()?;
     let mut capture = OutputCapture::new(crate::capture::OutputCaps::new(256 * 1024, 10_000));
     let outcome = run_to_completion(child, config.control_timeout, &mut capture).await?;
@@ -477,7 +495,12 @@ impl SandboxInstance for ContainerInstance {
             self.guard.begin_exec(&req.job_id)?;
 
             let create = create_argv(&self.config, &self.spec, &self.name, &req.argv);
-            let (status, out) = control_command(&self.config, create).await?;
+            // The one place a delivered secret is materialized on this host: the `create` CLI's own
+            // environment, for the length of that one process. `create_argv` named the variables;
+            // this supplies the values out of band (see the `--env NAME` block there).
+            let secrets: Vec<(String, String)> =
+                self.spec.secret_env.iter().map(|(n, v)| (n.clone(), v.to_string())).collect();
+            let (status, out) = control_command(&self.config, create, &secrets).await?;
             if status != ExecStatus::Exited(0) {
                 return Err(SandboxError::Runtime(format!("container create failed ({status:?}): {out}")));
             }
@@ -499,7 +522,7 @@ impl SandboxInstance for ContainerInstance {
                 // Killing the CLI we attached with does not stop the container: the daemon owns it.
                 // §14.4's wall clock only means something if the process actually dies.
                 let kill = vec![self.config.runtime.clone(), "kill".into(), self.name.clone()];
-                if let Err(e) = control_command(&self.config, kill).await {
+                if let Err(e) = control_command(&self.config, kill, &[]).await {
                     tracing::error!(container = %self.name, error = %e, "could not kill a timed-out container");
                 }
             }
@@ -528,7 +551,7 @@ impl SandboxInstance for ContainerInstance {
         let created = self.created;
         Box::pin(async move {
             let result = if created {
-                match control_command(&self.config, argv).await {
+                match control_command(&self.config, argv, &[]).await {
                     Ok((ExecStatus::Exited(0), _)) => Ok(()),
                     Ok((status, out)) => Err(SandboxError::Runtime(format!(
                         "container rm failed ({status:?}): {out}"
@@ -577,6 +600,7 @@ mod tests {
             env: crate::env::base_env("/tmp"),
             author_class: AuthorClass::Member,
             broker_authorised: Vec::new(),
+            secret_env: Vec::new(),
         }
     }
 
@@ -663,6 +687,32 @@ mod tests {
     }
 
     #[test]
+    fn a_delivered_secret_never_appears_in_the_runtimes_argv() {
+        // A local disclosure that is easy to ship by accident: `--env NAME=VALUE` puts the plaintext
+        // in the `docker create` process's own argv, which on Linux every other user on the host can
+        // read out of `/proc` for as long as that process lives. Broker-delivered values therefore go
+        // in by name, and the value reaches the daemon through the CLI's environment instead (see
+        // `ContainerInstance::exec`).
+        let ws = tempfile::tempdir().unwrap();
+        let mut s = spec(ws.path());
+        s.broker_authorised = vec!["NPM_TOKEN".into()];
+        s.secret_env = vec![("NPM_TOKEN".into(), zeroize::Zeroizing::new("npm_s3cr3tvalue".into()))];
+
+        let argv = create_argv(&ContainerConfig::default(), &s, "sbx", &["cargo".into(), "test".into()]);
+        assert!(
+            argv.windows(2).any(|w| w[0] == "--env" && w[1] == "NPM_TOKEN"),
+            "the variable must be named: {argv:?}"
+        );
+        assert!(
+            !argv.iter().any(|a| a.contains("npm_s3cr3tvalue")),
+            "and its value must appear nowhere in the argv: {argv:?}"
+        );
+        // The ordinary allowlisted environment is unaffected and still travels as NAME=VALUE, which
+        // is fine — none of it is a credential.
+        assert!(argv.windows(2).any(|w| w[0] == "--env" && w[1] == "CI=true"));
+    }
+
+    #[test]
     fn a_hostile_job_id_cannot_become_an_argv_flag() {
         assert_eq!(sanitize_name("../../etc/passwd"), "..-..-etc-passwd");
         assert!(!sanitize_name("--privileged x").contains(' '));
@@ -711,6 +761,7 @@ mod tests {
         let (status, _) = control_command(
             &ContainerConfig::default(),
             vec!["docker".into(), "inspect".into(), name],
+            &[],
         )
         .await
         .unwrap();

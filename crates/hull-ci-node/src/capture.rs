@@ -204,6 +204,21 @@ impl CapturedOutput {
         }
     }
 
+    /// Rewrite the captured bytes through `f`, for secret masking (D§7.4).
+    ///
+    /// Deliberately generic over the transform rather than taking a masker: this module is about the
+    /// §14.4 output cap and has no business knowing what a secret is. The node agent supplies a
+    /// `hull_ci_secrets::Masker`.
+    ///
+    /// The caps still hold afterwards because the only registered transform replaces a value of at
+    /// least `MIN_MASKABLE_LEN` (6) bytes with a 3-byte `***`, so the result is never longer than the
+    /// input. The truncation counters are left alone on purpose — they describe what the *job*
+    /// printed and how much of it we dropped, which is a fact about §14.4 that redaction does not
+    /// change.
+    pub fn redact_with(&mut self, f: impl Fn(&[u8]) -> Vec<u8>) {
+        self.bytes = f(&self.bytes);
+    }
+
     /// The last `max_chars` characters, for building a one-line summary. Still untrusted — the caller
     /// must run this through `hull_ci_proto::sanitize_summary` before it reaches a `Verdict`.
     pub fn tail_text(&self, max_chars: usize) -> String {
