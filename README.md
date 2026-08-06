@@ -7,11 +7,15 @@ contract — queueing, scheduling, caching, isolation, scale — is this reposit
 speaks Hull's [CI Integration Standard](https://github.com/tankrap/hull/blob/main/CI-SPEC.md)
 (contract v1) and implements a **central orchestrator + fleet of execution nodes** behind it.
 
-**Status: pre-alpha.** M1 and M2 are done — it runs a real pipeline end to end and passes the
-contract's conformance checklist. It is **not safe for multi-tenant or untrusted input** until M3
-lands, and it says so at startup rather than in a footnote: no sandbox backend here can contain
-hostile code, so the server names every unenforced §14 clause when it boots and refuses work from
-authors it cannot vouch for.
+**Status: pre-alpha.** M1 and M2 are done, M3 is most of the way there, and M4 has started. It runs
+real pipelines end to end and scores 27/27 on the contract's conformance suite against a live
+container backend.
+
+It is **not safe for multi-tenant or untrusted input**, and that is enforced rather than asked for:
+no sandbox backend here reports `admits_untrusted()`, so the scheduler refuses to place work from an
+author it cannot vouch for, and the server names every unenforced §14 clause at startup instead of
+burying it in a footnote. Lifting the gate needs the Firecracker tier, which needs a Linux host with
+KVM. There is a [Known gaps](#known-gaps) section below, kept deliberately close to the claims.
 
 ## The idea
 
@@ -52,7 +56,9 @@ untrusted code or parsing attacker-controlled archives next to the secrets.
 | `hull-ci-control` | Ingest, job/step state, scheduling, aggregation, idempotent verdict delivery. |
 | `hull-ci-node` | The node agent and its sandbox backends. All job execution happens here. |
 | `hull-ci-plan` | `.hull/ci.star` → a validated, acyclic DAG. Hermetic Starlark, with the *parser* bounded before it ever sees the source. |
-| `hull-ci-server` | The binary: the composition root that wires the other crates into one running service. |
+| `hull-ci-secrets` | The secret broker: tenant secrets under per-tenant KEKs, delivered just-in-time to one job on one enrolled node, never to an outsider. Infisical KMS behind the `KeyManager` seam. |
+| `hull-ci-proxy` | The package proxy — §14.3's one permitted hole in egress-deny. Allowlisted upstreams, per-job grants, upstream credentials that the job never sees. |
+| `hull-ci-server` | The binary: the composition root that wires the other crates into one running service, plus the read-only operator panel. |
 
 ## Two axes that are not the same axis
 
@@ -83,22 +89,51 @@ admin grant rather than a string a pipeline can claim.
 - **M2 — pipelines. ✅ Done.** `.hull/ci.star` (hermetic Starlark) → DAG, parallel branches,
   cascading skips, fail-fast cancel. A tree without a pipeline still autodetects exactly as M1 did,
   so pointing an existing repo here does not change what its CI does.
-- **M3 — the multi-tenant untrusted core.** Firecracker default tier, node partitioning, fair-share +
-  admission control, egress-deny, package proxy, secret broker. **One instance safely serves many
-  tenants only after M3.**
-- **M4 — the performance layer.** Step cache keys, content store with within-tenant dedup, affinity
-  scheduling, CoW workspaces, warm pools.
+- **M3 — the multi-tenant untrusted core. Mostly done; the gate has not lifted.** Built and tested:
+  weighted fair queueing with per-tenant admission, the secret broker (per-tenant KEKs, Ed25519 node
+  identity, author-class gate), the package proxy, egress-deny verified by live probes, and Infisical
+  KMS behind the key seam. **Not done: Firecracker**, which needs a Linux host with KVM — so no
+  backend here reports `admits_untrusted()`, and **one instance still must not serve many tenants.**
+  That is enforced in code, not remembered: the scheduler refuses to place untrusted work on a
+  backend whose capabilities say it cannot contain it.
+- **M4 — the performance layer. Started.** The step memo (layer 2 of §6.1) is built and wired,
+  keyed on keel subtree digests, off by default behind `HULL_CI_MEMO=on`. Still to come: the internal
+  content store with within-tenant dedup, affinity scheduling, CoW workspaces, warm pools.
 - **M5 — scale-out.** Multi-replica control, autoscaling with cache-aware drain, sharding by history.
+  Nothing here yet, and note what that means today: **state is in memory**, so a restart forgets
+  in-flight jobs. Survivable because Hull re-dispatches a tree with no verdict, but it is why there
+  is no horizontal scaling — the fair-share clocks and the job store are process-local.
 
-The ordering is deliberate: multi-tenancy is the product, so isolation precedes the performance layer
-rather than following it.
+The ordering is deliberate: multi-tenancy is the product, so isolation precedes the performance
+layer rather than following it.
 
-## Running it (M1)
+## Known gaps
+
+Kept here rather than in a tracker, because a runner's honest limits belong next to its claims:
+
+- **Orphaned containers.** Killing a node mid-step can leave a container running, so `single_use` is
+  true in the ordinary path and not across a crash.
+- **Revocation does not reach a credential the package proxy already holds** — shredding a tenant
+  makes the ciphertext unrecoverable and says nothing about a copy already decrypted for a live job.
+- **On `HULL_CI_TRUSTED_TENANTS=*`, the dispatch chooses both the tenant and the author class**, and
+  dispatching needs one deployment-wide secret rather than a per-tenant credential. The default
+  (`empty`) fails closed; the `*` configuration trusts Hull completely.
+- **Crypto-shredding via Infisical is unverified** — the delete endpoint exists; whether it destroys
+  key material or soft-deletes is not documented, so it ships described as revocation.
+
+
+## Running it
 
 ```bash
 HULL_CI_SECRET=…                  # spec §8 — checked on dispatch, echoed on the callback
 HULL_CI_TRUSTED_TENANTS=acme      # whose authors count as members; empty means nobody, so nothing runs
 HULL_CI_SANDBOX=container         # the default. `local` additionally needs HULL_CI_ALLOW_UNSANDBOXED=1
+
+# Optional, all off by default — each turns on a subsystem, none degrades if misconfigured.
+HULL_CI_ADMIN_TOKEN=…             # read-only operator panel on /admin; unset means the route does not exist
+HULL_CI_MEMO=on                   # step memo (design §6.1): steps declaring `inputs` may resolve from a previous run
+HULL_CI_PROXY=on                  # package proxy — the only egress a sandbox gets (§14.3)
+HULL_CI_SECRETS=infisical         # tenant secrets with KEKs in Infisical KMS; needs --features hull-ci-server/infisical
 cargo run -p hull-ci-server
 ```
 
