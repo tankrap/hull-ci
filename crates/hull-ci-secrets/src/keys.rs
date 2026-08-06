@@ -135,8 +135,18 @@ struct TenantKeys {
 /// contains it, and there is no audit log of a single unwrap. It exists so the broker's *logic* can
 /// be tested end to end without a cloud dependency, and so a single-operator local stack can run.
 ///
-/// Production wires a `KmsKeyManager` (AWS KMS / GCP KMS / Vault transit) into the same trait. The
-/// broker cannot tell the difference, which is the entire reason the seam is a trait.
+/// Production wires a KMS-backed manager into the same trait — `infisical::InfisicalKeyManager`
+/// ships behind the `infisical` cargo feature, and AWS KMS / GCP KMS / Vault transit would each be
+/// another implementation of these six methods. The broker cannot tell the difference, which is the
+/// entire reason the seam is a trait.
+///
+/// One caveat that only shows up once a real KMS is behind the seam, and belongs here rather than in
+/// a backend's doc: **this implementation's rule that version numbers are never reused, even across a
+/// shred, is a property of `DevKeyManager`, not of the trait.** A backend that shreds by deleting the
+/// key and re-provisions by creating a new one starts again at version 1. That is safe for a
+/// different reason — the new key is different material, so a surviving ciphertext row still cannot
+/// be opened — but any code that treats a version number as globally unique for a tenant is relying
+/// on something only the dev manager promises.
 #[derive(Debug, Default)]
 pub struct DevKeyManager {
     tenants: Mutex<HashMap<String, TenantKeys>>,

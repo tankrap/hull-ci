@@ -6,6 +6,12 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+# Forwards to `hull-ci-secrets/infisical`. Declared here so `#[cfg(feature = "infisical")]` in this
+# crate is a real condition: without it the cfg silently never matches and the KMS arm is dead code
+# that looks wired — the "compiles, is tested, and is unreachable" failure this repo has hit before.
+infisical = ["hull-ci-secrets/infisical"]
+
 [dependencies]
 hull-ci-proto = { path = "../hull-ci-proto" }
 hull-ci-control = { path = "../hull-ci-control" }

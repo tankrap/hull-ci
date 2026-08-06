@@ -371,6 +371,12 @@ fn announce_isolation(config: &Config, backend: &dyn SandboxBackend) {
              declared secrets; outsider-authored jobs never do (D§7.4). Masking of job output is a \
              backstop against an accidental echo, not a control."
         ),
+        SecretsMode::Infisical => tracing::info!(
+            node_id = %config.node_id,
+            "tenant secret broker enabled with KEKs in Infisical KMS (D§7.4). This process holds no \
+             KEK material and every unwrap is a round trip, so a KMS outage refuses secret delivery \
+             rather than degrading it. Masking of job output remains a backstop, not a control."
+        ),
     }
 
     match (&config.admin_token, config.bind.ip().is_loopback()) {

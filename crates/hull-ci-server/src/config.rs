@@ -76,6 +76,17 @@ pub enum SecretsMode {
     /// ([`hull_ci_secrets::DevKeyManager`]), announced loudly at startup. Development and test only;
     /// the [`KeyManager`](hull_ci_secrets::KeyManager) trait is where a KMS goes.
     Dev,
+    /// A broker whose KEKs live in **Infisical KMS** and are never extractable from it
+    /// ([`hull_ci_secrets::InfisicalKeyManager`]) — design D§7.4's "the KEK's root lives in a
+    /// KMS/HSM and never leaves it", which until now described a seam rather than a product.
+    ///
+    /// Recognised in **every** build, but only *usable* in one compiled with
+    /// `--features hull-ci-secrets/infisical`. That is deliberate: an operator who sets
+    /// `HULL_CI_SECRETS=infisical` on a binary without the feature gets a startup error naming the
+    /// missing feature, rather than "expected `off` or `dev`" — which reads as though the mode does
+    /// not exist and invites a downgrade to `dev`, i.e. to keys in process memory. The failure has
+    /// to say *rebuild*, never *use something weaker*.
+    Infisical,
 }
 
 impl SecretsMode {
@@ -83,11 +94,12 @@ impl SecretsMode {
         match raw.trim().to_ascii_lowercase().as_str() {
             "off" | "none" | "disabled" => Ok(SecretsMode::Off),
             "dev" | "development" => Ok(SecretsMode::Dev),
+            "infisical" | "kms" => Ok(SecretsMode::Infisical),
             other => Err(ConfigError::Value {
                 var: "HULL_CI_SECRETS",
                 // No fuzzy matching, for the same reason `SandboxChoice` has none: a typo must not
                 // resolve to a mode that hands out credentials.
-                detail: format!("expected `off` or `dev`, got `{other}`"),
+                detail: format!("expected `off`, `dev` or `infisical`, got `{other}`"),
             }),
         }
     }
@@ -271,8 +283,15 @@ mod tests {
         // credentials, so there is no fuzzy match and no fallback.
         assert_eq!(SecretsMode::parse("off").unwrap(), SecretsMode::Off);
         assert_eq!(SecretsMode::parse(" DEV ").unwrap(), SecretsMode::Dev);
-        assert!(SecretsMode::parse("kms").is_err(), "no KMS mode exists yet, so it must not parse");
+        // The KMS mode now exists and parses in *every* build, feature or not. That is deliberate:
+        // a binary without the feature must fail at startup naming the missing feature, rather than
+        // rejecting the value as unknown — an "unknown mode" error reads as though the mode is not a
+        // thing, and the obvious next move is to set `dev`, which puts every tenant KEK in this
+        // process's memory. The failure has to say *rebuild*, never *use something weaker*.
+        assert_eq!(SecretsMode::parse("infisical").unwrap(), SecretsMode::Infisical);
+        assert_eq!(SecretsMode::parse("kms").unwrap(), SecretsMode::Infisical);
         assert!(SecretsMode::parse("").is_err());
+        assert!(SecretsMode::parse("infisicl").is_err(), "still no fuzzy matching");
     }
 
     #[test]

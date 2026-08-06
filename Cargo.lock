@@ -1240,17 +1240,20 @@ dependencies = [
 name = "hull-ci-secrets"
 version = "0.0.1"
 dependencies = [
+ "base64",
  "blake3",
  "chacha20poly1305",
  "ed25519-dalek",
  "hex",
  "hull-ci-proto",
  "rand 0.8.7",
+ "reqwest",
  "serde",
  "serde_json",
  "subtle",
  "tempfile",
  "thiserror",
+ "tokio",
  "tracing",
  "zeroize",
 ]

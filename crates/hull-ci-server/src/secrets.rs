@@ -51,6 +51,7 @@ pub struct SecretPlane {
 pub fn assemble(config: &Config) -> Option<SecretPlane> {
     match config.secrets {
         SecretsMode::Off => None,
+        SecretsMode::Infisical => assemble_infisical(config),
         SecretsMode::Dev => {
             tracing::warn!(
                 "HULL_CI_SECRETS=dev: tenant secrets are sealed under keys held IN THIS PROCESS'S \
@@ -59,32 +60,41 @@ pub fn assemble(config: &Config) -> Option<SecretPlane> {
                  Development and test only — production needs a KMS behind the KeyManager trait."
             );
 
-            let broker = Arc::new(SecretBroker::new(
-                Arc::new(DevKeyManager::new()),
-                Arc::new(MemorySealedStore::new()),
-            ));
-            let service = Arc::new(SecretService::new(broker, Arc::new(NodeRegistry::new())));
-
-            let identity = Arc::new(NodeIdentity::generate());
-            // An `Err` here means this key is already enrolled to a different node, which cannot
-            // happen for a key generated one line above. Logged rather than propagated so a startup
-            // path stays free of an impossible error case.
-            if let Err(e) = service.enrol_node(config.node_id.clone(), identity.public()) {
-                tracing::error!(error = %e, "could not enrol this node's identity; it will redeem nothing");
-            }
-            tracing::info!(
-                node_id = %config.node_id,
-                public_key = %identity.public(),
-                "enrolled this node's Ed25519 identity (D§7.4); redemptions are verified against it"
-            );
-
-            let client = Arc::new(SecretsClient::new(
-                identity,
-                Arc::new(InProcessRedeemer { service: Arc::clone(&service) }),
-            ));
-            Some(SecretPlane { service, client })
+            Some(build_plane(config, Arc::new(DevKeyManager::new())))
         }
     }
+}
+
+/// Assemble the plane around whichever [`KeyManager`] the mode chose.
+///
+/// Shared by every mode on purpose: the enrolment, the node identity and the redemption path must be
+/// **identical** whatever holds the KEKs. If the KMS mode built its own plane, the signature check
+/// that makes `WrongNode` a control rather than a comment would be a second implementation, and the
+/// one that gets exercised least is the one that would rot.
+///
+/// [`KeyManager`]: hull_ci_secrets::KeyManager
+fn build_plane(config: &Config, keys: Arc<dyn hull_ci_secrets::KeyManager>) -> SecretPlane {
+    let broker = Arc::new(SecretBroker::new(keys, Arc::new(MemorySealedStore::new())));
+    let service = Arc::new(SecretService::new(broker, Arc::new(NodeRegistry::new())));
+
+    let identity = Arc::new(NodeIdentity::generate());
+    // An `Err` here means this key is already enrolled to a different node, which cannot happen for
+    // a key generated one line above. Logged rather than propagated so a startup path stays free of
+    // an impossible error case.
+    if let Err(e) = service.enrol_node(config.node_id.clone(), identity.public()) {
+        tracing::error!(error = %e, "could not enrol this node's identity; it will redeem nothing");
+    }
+    tracing::info!(
+        node_id = %config.node_id,
+        public_key = %identity.public(),
+        "enrolled this node's Ed25519 identity (D§7.4); redemptions are verified against it"
+    );
+
+    let client = Arc::new(SecretsClient::new(
+        identity,
+        Arc::new(InProcessRedeemer { service: Arc::clone(&service) }),
+    ));
+    SecretPlane { service, client }
 }
 
 /// The node→broker seam, as a struct call in this one-process runner.
@@ -141,6 +151,46 @@ pub fn seed_dev_secrets(plane: &SecretPlane, raw: &str) {
             Err(e) => tracing::warn!(tenant, name, error = %e, "could not store a development secret"),
         }
     }
+}
+
+/// Build the plane with KEKs in Infisical KMS (design D§7.4).
+///
+/// Two arms compiled by feature, and the `else` arm is the point of the whole shape: a binary built
+/// without `hull-ci-secrets/infisical` **refuses to start** in this mode rather than falling back.
+/// Falling back to `Dev` would move every tenant KEK into this process's memory while the operator
+/// believed they were in a KMS — a silent downgrade of the one property §7.4 exists to state, on a
+/// deployment that had explicitly asked for the strong thing. The error names the missing feature,
+/// so the remedy is "rebuild", never "use something weaker".
+#[cfg(feature = "infisical")]
+fn assemble_infisical(config: &Config) -> Option<SecretPlane> {
+    use hull_ci_secrets::{InfisicalConfig, InfisicalKeyManager};
+
+    let built = InfisicalConfig::from_env()
+        .map_err(|e| e.to_string())
+        .and_then(|cfg| InfisicalKeyManager::new(cfg).map_err(|e| e.to_string()));
+    let kms = match built {
+        Ok(k) => k,
+        Err(e) => {
+            // Fail the startup rather than the first job: a misconfigured KMS discovered at
+            // dispatch time is an outage wearing an infrastructure error, and it would be
+            // indistinguishable from Infisical being down.
+            tracing::error!(alert = true, error = %e, "HULL_CI_SECRETS=infisical: could not reach or configure Infisical KMS");
+            return None;
+        }
+    };
+    tracing::info!(
+        "HULL_CI_SECRETS=infisical: tenant KEKs live in Infisical KMS and are not extractable from          it. This process holds no KEK material; every unwrap is a round trip, and a KMS outage          refuses secret delivery rather than degrading it."
+    );
+    Some(build_plane(config, Arc::new(kms)))
+}
+
+#[cfg(not(feature = "infisical"))]
+fn assemble_infisical(_config: &Config) -> Option<SecretPlane> {
+    tracing::error!(
+        alert = true,
+        "HULL_CI_SECRETS=infisical, but this binary was built without the `infisical` feature.          Refusing to start the broker: falling back to the dev key manager would put every tenant          KEK in this process's memory while the operator believes they are in a KMS. Rebuild with          `--features hull-ci-secrets/infisical`."
+    );
+    None
 }
 
 #[cfg(test)]

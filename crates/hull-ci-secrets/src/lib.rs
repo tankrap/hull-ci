@@ -17,7 +17,10 @@
 //!    merely discouraged: hostile code never receives the value in the first place.
 //! 2. **Envelope encryption under a per-tenant KEK** ([`keys`]). Every value gets a fresh DEK; the
 //!    DEK is wrapped by that tenant's KEK; the KEK's root lives behind [`keys::KeyManager`] so a real
-//!    KMS/HSM holds it and it never leaves. One KEK per tenant is the unit of tenancy: it buys
+//!    KMS/HSM holds it and it never leaves. The shipping backend that makes that last clause true is
+//!    `infisical::InfisicalKeyManager`, behind the off-by-default `infisical` cargo feature;
+//!    [`DevKeyManager`] is the fallback and holds raw KEKs in this process.
+//!    One KEK per tenant is the unit of tenancy: it buys
 //!    single-call **crypto-shredding** ([`SecretBroker::shred_tenant`]) and hard blast-radius
 //!    isolation.
 //! 3. **Just-in-time delivery** ([`capability`]). A short-TTL, single-use capability bound to
@@ -60,6 +63,8 @@
 pub mod broker;
 pub mod capability;
 pub mod identity;
+#[cfg(feature = "infisical")]
+pub mod infisical;
 pub mod keys;
 pub mod mask;
 pub mod package;
@@ -70,6 +75,8 @@ pub mod store;
 pub use broker::{CapabilityRequest, DeliveredSecrets, SecretBroker};
 pub use capability::{CapId, CapabilityGrant, CapabilityToken, DEFAULT_TTL_SECS};
 pub use identity::{NodeIdentity, NodePublicKey, NodeRegistry, SignedRedemption, MAX_SKEW_SECS};
+#[cfg(feature = "infisical")]
+pub use infisical::{InfisicalAuth, InfisicalConfig, InfisicalConfigError, InfisicalKeyManager, Redacted};
 pub use keys::{DevKeyManager, KekVersion, KeyManager};
 pub use package::{
     ProxyCapabilityRequest, ProxyCredentialGrant, ProxyCredentialService, ProxyIdentity,
@@ -193,6 +200,17 @@ pub enum SecretError {
     /// next to a secret.
     #[error("secret store failure: {0}")]
     Store(String),
+    /// The **key service** — the KMS/HSM behind [`keys::KeyManager`] — could not be reached, refused
+    /// the call, or answered with something unusable.
+    ///
+    /// Distinct from [`SecretError::Store`] because the two failures have different operator
+    /// responses and different blast radii: a store outage stops one read, a key-service outage stops
+    /// every seal and every open for every tenant. It is also the error that **must not degrade**: a
+    /// key manager that cannot reach its KMS returns this and delivers nothing, rather than falling
+    /// back to any local key. The message names the operation and the HTTP status, never a response
+    /// body and never a credential — see the `infisical` module for why bodies are excluded.
+    #[error("key service failure: {0}")]
+    KeyService(String),
 }
 
 /// A source of wall-clock seconds, injectable so TTL behaviour is testable without sleeping.

@@ -6,6 +6,12 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+# D§7.4's "the KEK's root … never leaves it", made real. Off by default so the ordinary build — and
+# every crate that depends on this one — takes no HTTP, TLS or async-runtime dependency at all: a
+# secret broker is the last place to widen a supply chain for a backend most deployments do not use.
+infisical = ["dep:reqwest", "dep:tokio", "dep:base64"]
+
 [dependencies]
 hull-ci-proto = { path = "../hull-ci-proto" }
 serde.workspace = true
@@ -24,6 +30,18 @@ subtle = "2"
 hex.workspace = true
 # Digest of a capability's secret half. The registry stores the digest, never the token.
 blake3.workspace = true
+
+# ── `infisical` feature only ─────────────────────────────────────────────────────────────────────
+# The workspace's existing HTTP client rather than a second one: hull-ci-fetch, -proxy, -control and
+# -server already pull `reqwest`, so the KMS backend adds no new TLS stack to the tree.
+reqwest = { workspace = true, optional = true }
+# [`keys::KeyManager`] is a synchronous trait and must stay one — it is called from `Vault::seal`,
+# which is called from code that is not async. `reqwest::blocking` cannot serve it: it *panics* when
+# used from inside an async runtime, and the control plane is async. So the backend owns a small
+# runtime of its own and bridges to it; see `infisical::Bridge`.
+tokio = { workspace = true, optional = true }
+# Infisical's KMS API takes and returns base64 on the wire.
+base64 = { version = "0.22", optional = true }
 
 [dev-dependencies]
 tempfile.workspace = true
