@@ -384,8 +384,26 @@ impl NodeAgent {
                 "package proxy access granted for this step (§14.3)"
             );
         }
-        let mut env = crate::env::base_env_with_path("/tmp", &self.backend.job_path());
-        env.extend(package_env);
+        let env = crate::env::base_env_with_path("/tmp", &self.backend.job_path());
+
+        // **The grant is a live bearer credential, so it takes the by-name channel, not `env`.**
+        //
+        // These variables carry a token that spends the tenant's upstream registry credentials until
+        // the step's clock runs out. Merged into `env` they reach the runtime as `--env NAME=VALUE`,
+        // which puts the token on the `docker create` command line — world-readable through
+        // `/proc/<pid>/cmdline` and `ps` for the life of that process, and captured by anything that
+        // records argv. That is exactly the disclosure the `--env NAME` treatment exists to prevent
+        // for broker secrets, and the grant is no less a credential for having been minted locally.
+        //
+        // `secret_env` is therefore "values that must never appear in argv", not "values the broker
+        // sealed" — and `broker_authorised` carries their names for the same reason it carries the
+        // broker's, because `validate_spec` refuses any `secret_env` name that is not vouched for.
+        let mut broker_authorised = broker_authorised;
+        let mut secret_env = secret_env;
+        for (name, value) in package_env {
+            broker_authorised.push(name.clone());
+            secret_env.push((name, zeroize::Zeroizing::new(value)));
+        }
 
         let spec = SandboxSpec {
             job_id: a.job_id.clone(),

@@ -1612,6 +1612,34 @@ probe_done=1
         assert!(!controls_for(&probe, &ContainerConfig::default()).seccomp_default_deny);
     }
 
+    /// A value delivered by name never becomes a command-line element — whatever put it there.
+    ///
+    /// Found by audit: the package-proxy grant, a live bearer token that spends the tenant's upstream
+    /// registry credentials, was travelling in `spec.env` and therefore rendering as
+    /// `--env NAME=VALUE` on the `docker create` command line. That is readable by any other local
+    /// user through `/proc/<pid>/cmdline` for the life of the process, and it is exactly the
+    /// disclosure the by-name channel exists to prevent for broker secrets. The grant is no less a
+    /// credential for having been minted locally, so it now takes the same channel.
+    #[test]
+    fn a_by_name_value_is_never_rendered_into_a_command_line() {
+        let t = tempfile::tempdir().unwrap();
+        let mut s = spec(t.path());
+        s.broker_authorised = vec!["npm_config_registry".into()];
+        s.secret_env = vec![(
+            "npm_config_registry".into(),
+            zeroize::Zeroizing::new("http://gw/j/GRANT-TOKEN-xyz/u/npm/".to_string()),
+        )];
+
+        let joined =
+            create_argv(&ContainerConfig::default(), &s, "hull-ci-test", &["/bin/true".into()])
+                .join(" ");
+        assert!(!joined.contains("GRANT-TOKEN-xyz"), "the value reached argv: {joined}");
+        assert!(
+            joined.contains("--env npm_config_registry"),
+            "…the name should travel by itself: {joined}"
+        );
+    }
+
     #[test]
     fn create_argv_carries_every_14_4_flag_and_never_a_shell() {
         let t = tempfile::tempdir().unwrap();
