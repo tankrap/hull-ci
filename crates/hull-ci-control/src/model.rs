@@ -316,6 +316,13 @@ pub struct Job {
     /// was delivered somewhere else. §9's own wording is the hint — be idempotent "per `(tree_id)`
     /// **or** per `callback_url`": the tree keys the *work*, the callback keys the *answer*.
     pub callback_urls: Vec<String>,
+    /// What the callback sender is doing right now, while it is doing it.
+    ///
+    /// `None` before delivery starts and after it stops. Everything else about a job is observable
+    /// while it happens; delivery was the exception, and it is the one an operator asks about when a
+    /// deployment looks stuck (design D§11.1). `report_attempts` remains the *settled* count — this
+    /// is the live one, and they answer different questions.
+    pub delivery: Option<crate::callback::DeliveryProgress>,
     /// When this job first reached a terminal state, for retention (see [`JobStore::evict`]).
     ///
     /// `None` while the job is live, which is what makes eviction safe by construction: there is no
@@ -359,6 +366,7 @@ impl Job {
             deadline_at: now + job_timeout,
             report_attempts: 0,
             callback_urls,
+            delivery: None,
             settled_at: None,
         }
     }

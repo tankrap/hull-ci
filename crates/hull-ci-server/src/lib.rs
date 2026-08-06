@@ -59,7 +59,7 @@ use std::sync::Arc;
 
 use axum::Router;
 use hull_ci_control::callback::HttpCallback;
-use hull_ci_control::{Control, ControlConfig, Deps};
+use hull_ci_control::{Control, ControlConfig, Deps, FairShare};
 use hull_ci_fetch::{ContentStore, FetchBroker};
 use hull_ci_node::{ContainerConfig, LocalProcessBackend, NodeAgent, NodeConfig, SandboxBackend};
 use hull_ci_proto::IsolationTier;
@@ -151,6 +151,27 @@ pub async fn assemble(config: &Config) -> Result<Runner, StartupError> {
         None => InProcessFleet::new(agent, config.work_root.clone()),
     };
 
+    // Tell the scheduler how big the fleet actually is (design D§11.1). Without this it holds
+    // per-tenant quotas and no notion of total capacity, so it can only *offer* work in fair order
+    // and take the fleet's refusal for an answer: fair ordering is real, fair allocation is not. The
+    // composition root is the only place that knows both numbers, so it is the only place that can
+    // reconcile them.
+    let node_slots = usize::try_from(NodeConfig::default().slots_total).unwrap_or(1).max(1);
+    let mut fair_share = FairShare { fleet_slots: Some(node_slots), ..FairShare::default() };
+
+    // A quota larger than the fleet is not a quota. The default plan permitted more concurrent steps
+    // than this deployment can run, which means the number an operator reads constrains nothing —
+    // worse than no number, because someone will read it and believe it. Clamp the policy ceiling to
+    // the physical one rather than the reverse: policy should never promise more than physics.
+    if fair_share.default_plan.max_running_steps > node_slots {
+        tracing::info!(
+            plan_cap = fair_share.default_plan.max_running_steps,
+            node_slots,
+            "default per-tenant concurrency exceeded fleet capacity; clamped to the fleet"
+        );
+        fair_share.default_plan.max_running_steps = node_slots;
+    }
+
     let control_config = ControlConfig {
         secret: config.secret.clone(),
         timeouts: config.timeouts,
@@ -158,6 +179,7 @@ pub async fn assemble(config: &Config) -> Result<Runner, StartupError> {
         // node refuses a tier it does not implement.
         tier: IsolationTier::Container,
         details_base_url: config.details_base_url.clone(),
+        fair_share,
         ..ControlConfig::default()
     };
 

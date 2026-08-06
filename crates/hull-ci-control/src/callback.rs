@@ -129,14 +129,46 @@ impl Delivery {
     }
 }
 
+/// What a delivery is doing *right now*, reported as it happens.
+///
+/// Exists because an operator could not distinguish "retrying, attempt 3 of 12" from "has not tried
+/// at all": the outcome was recorded only once every retry had finished, so for the whole retry
+/// budget — up to an hour (D§10.1) — a job mid-delivery looked identical to one that had never
+/// started. That is exactly the window in which someone is looking, and exactly the question they are
+/// asking (D§11.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeliveryProgress {
+    /// The attempt now in flight, 1-based.
+    pub attempt: u32,
+    pub max_attempts: u32,
+    /// `true` while sleeping before the next attempt, `false` while a request is outstanding.
+    pub waiting: bool,
+}
+
+/// Sink for [`DeliveryProgress`]. A closure rather than a channel, so the caller can write straight
+/// into the record it already holds and `deliver_reporting` stays testable with a plain `Vec`.
+pub type ProgressSink<'a> = &'a (dyn Fn(DeliveryProgress) + Send + Sync);
+
 /// Send the verdict, retrying until it lands or the schedule is exhausted.
 pub async fn deliver(
     transport: &dyn CallbackTransport,
     req: &CallbackRequest,
     policy: &RetryPolicy,
 ) -> Delivery {
+    deliver_reporting(transport, req, policy, &|_| {}).await
+}
+
+/// [`deliver`], announcing each attempt as it begins and each wait as it starts.
+pub async fn deliver_reporting(
+    transport: &dyn CallbackTransport,
+    req: &CallbackRequest,
+    policy: &RetryPolicy,
+    progress: ProgressSink<'_>,
+) -> Delivery {
+    let max_attempts = policy.max_attempts.max(1);
     let mut last = String::from("no attempt made");
-    for attempt in 1..=policy.max_attempts.max(1) {
+    for attempt in 1..=max_attempts {
+        progress(DeliveryProgress { attempt, max_attempts, waiting: false });
         match transport.post(req).await {
             Ok(resp) if resp.is_success() => {
                 tracing::info!(
@@ -161,11 +193,14 @@ pub async fn deliver(
             Err(e) => last = e.to_string(),
         }
 
-        if attempt == policy.max_attempts {
+        if attempt == max_attempts {
             break;
         }
         let wait = policy.delay(attempt);
         tracing::warn!(job_id = %req.job_id, attempt, ?wait, error = %last, "callback failed, retrying");
+        // Announced before the sleep, not after: the wait is most of the elapsed time, so a panel
+        // that only learned about attempts would show nothing for the majority of the retry budget.
+        progress(DeliveryProgress { attempt, max_attempts, waiting: true });
         tokio::time::sleep(wait).await;
     }
 
@@ -173,11 +208,11 @@ pub async fn deliver(
     tracing::error!(
         alert = true,
         job_id = %req.job_id,
-        attempts = policy.max_attempts,
+        attempts = max_attempts,
         error = %last,
         "verdict UNDELIVERED after all retries — job parked in report_failed"
     );
-    Delivery::Parked { attempts: policy.max_attempts, last }
+    Delivery::Parked { attempts: max_attempts, last }
 }
 
 /// The real transport: `reqwest`, JSON body, secret echoed, URL untouched.
@@ -219,6 +254,73 @@ impl CallbackTransport for HttpCallback {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The defect this exists to prevent: progress was only knowable once delivery *finished*, so a
+    /// job retrying for the better part of an hour was indistinguishable from one that had never
+    /// tried. Assert that every attempt — and every wait between them — is announced as it starts.
+    #[tokio::test]
+    async fn every_attempt_and_every_wait_is_announced_while_it_happens() {
+        use std::sync::Mutex;
+
+        let seen: Mutex<Vec<DeliveryProgress>> = Mutex::new(Vec::new());
+        let transport = crate::testing::ScriptedTransport::failing_then_ok(2);
+        let req = CallbackRequest {
+            url: "https://hull.example/cb".into(),
+            secret: None,
+            verdict: hull_ci_proto::Verdict::green("ok"),
+            job_id: "job-1".into(),
+        };
+        // Milliseconds, so the test exercises the schedule without waiting out a real one.
+        let policy = RetryPolicy { base: Duration::from_millis(1), max_delay: Duration::from_millis(4), ..RetryPolicy::default() };
+
+        let outcome = deliver_reporting(&transport, &req, &policy, &|p| {
+            seen.lock().unwrap().push(p);
+        })
+        .await;
+
+        assert!(outcome.is_delivered(), "the third attempt succeeds");
+        let seen = seen.into_inner().unwrap();
+
+        // Three attempts announced before they ran, and a wait announced before each of the two
+        // sleeps. The waits matter most: they are nearly all of the elapsed time, so a sink that only
+        // heard about attempts would still leave the panel blank for most of the window.
+        let attempts: Vec<u32> = seen.iter().filter(|p| !p.waiting).map(|p| p.attempt).collect();
+        assert_eq!(attempts, [1, 2, 3], "each attempt is announced as it begins");
+        let waits: Vec<u32> = seen.iter().filter(|p| p.waiting).map(|p| p.attempt).collect();
+        assert_eq!(waits, [1, 2], "and each backoff is announced before it is slept");
+        assert!(seen.iter().all(|p| p.max_attempts == policy.max_attempts));
+    }
+
+    /// A delivery that never lands still reports throughout — this is the case an operator is
+    /// actually staring at, and the one where silence used to be indistinguishable from inactivity.
+    #[tokio::test]
+    async fn a_delivery_that_never_lands_still_reports_every_step_of_the_way() {
+        use std::sync::Mutex;
+
+        let seen: Mutex<Vec<DeliveryProgress>> = Mutex::new(Vec::new());
+        let transport = crate::testing::ScriptedTransport::always_failing();
+        let req = CallbackRequest {
+            url: "https://hull.example/cb".into(),
+            secret: None,
+            verdict: hull_ci_proto::Verdict::red("2 failed"),
+            job_id: "job-1".into(),
+        };
+        let policy = RetryPolicy { max_attempts: 4, base: Duration::from_millis(1), max_delay: Duration::from_millis(4) };
+
+        let outcome = deliver_reporting(&transport, &req, &policy, &|p| {
+            seen.lock().unwrap().push(p);
+        })
+        .await;
+
+        assert!(!outcome.is_delivered());
+        let seen = seen.into_inner().unwrap();
+        let attempts: Vec<u32> = seen.iter().filter(|p| !p.waiting).map(|p| p.attempt).collect();
+        assert_eq!(attempts, [1, 2, 3, 4], "all four announced, not just the last");
+        // No wait after the final attempt: there is nothing left to wait for.
+        let waits: Vec<u32> = seen.iter().filter(|p| p.waiting).map(|p| p.attempt).collect();
+        assert_eq!(waits, [1, 2, 3]);
+    }
+
     use crate::testing::ScriptedTransport;
     use hull_ci_proto::Verdict;
 

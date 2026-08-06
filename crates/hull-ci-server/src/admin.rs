@@ -869,7 +869,8 @@ mod tests {
                         state,
                         age: Duration::from_secs(3),
                         settled_for: state.has_verdict().then(|| Duration::from_secs(1)),
-                        report_attempts: 2,
+                        delivering: None,
+            report_attempts: 2,
                         callback_targets: 2,
                         steps: vec![StepSnapshot {
                             step_id: "step_00".into(),
@@ -986,6 +987,7 @@ mod tests {
             state: hull_ci_control::model::JobState::Red,
             age: Duration::from_secs(1),
             settled_for: Some(Duration::from_secs(1)),
+            delivering: None,
             report_attempts: 1,
             callback_targets: 1,
             steps: vec![hull_ci_control::snapshot::StepSnapshot {

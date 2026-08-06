@@ -37,7 +37,9 @@ use hull_ci_proto::{
 use tokio::sync::Notify;
 
 use crate::aggregate::{fold, Decision, Fold};
-use crate::callback::{deliver, CallbackRequest, CallbackTransport, Delivery, RetryPolicy};
+use crate::callback::{
+    deliver_reporting, CallbackRequest, CallbackTransport, Delivery, DeliveryProgress, RetryPolicy,
+};
 use crate::fairshare::{Admission, Depth, FairQueue, FairShare, Grant, JobView, StepView};
 use crate::graph;
 use crate::ids::new_step_id;
@@ -773,12 +775,26 @@ impl Control {
         let mut attempts_total = 0;
         let mut any_delivered = false;
         for req in &reqs {
-            let outcome = deliver(&*self.deps.transport, req, &self.config.retry).await;
+            // Publish each attempt into the job record as it happens, so a stuck delivery is visible
+            // while it is stuck rather than only in the post-mortem (D§11.1).
+            let jobs = &self.jobs;
+            let id = job_id.to_string();
+            let sink = move |p: DeliveryProgress| {
+                if let Ok(mut store) = jobs.lock() {
+                    if let Some(job) = store.get_mut(&id) {
+                        job.delivery = Some(p);
+                    }
+                }
+            };
+            let outcome =
+                deliver_reporting(&*self.deps.transport, req, &self.config.retry, &sink).await;
             attempts_total += match &outcome {
                 Delivery::Delivered { attempts, .. } | Delivery::Parked { attempts, .. } => *attempts,
             };
             any_delivered |= outcome.is_delivered();
         }
+        // Delivery is over, one way or the other; `report_attempts` below is the settled record.
+        self.with_job_mut(job_id, |job| job.delivery = None);
         let outcome_delivered = any_delivered;
         self.with_job_mut(job_id, |job| {
             job.report_attempts += attempts_total;

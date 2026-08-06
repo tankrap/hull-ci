@@ -77,7 +77,15 @@ pub struct JobSnapshot {
     pub age: Duration,
     /// Since the job reached a verdict, or `None` while it is live.
     pub settled_for: Option<Duration>,
+    /// Attempts made, known once delivery has *finished*. See [`delivering`](Self::delivering) for
+    /// the live view — the two answer different questions, and reading the settled one as though it
+    /// were live is exactly what made a retrying job look inert.
     pub report_attempts: u32,
+    /// The delivery in flight right now, or `None` when there is none.
+    ///
+    /// "attempt 3 of 12, waiting" and "nothing happening" are genuinely different states, and before
+    /// this existed an operator could only ever see the second (design D§11.1).
+    pub delivering: Option<crate::callback::DeliveryProgress>,
     /// How many distinct `callback_url`s are waiting on this verdict — the *count*, because two
     /// changes sharing a tree is the interesting operational fact and the URLs themselves are not
     /// ours to hand out (see [`Job::callback_urls`]).
@@ -172,6 +180,7 @@ fn snapshot_job(job: &Job, now: Instant) -> JobSnapshot {
         age: now.saturating_duration_since(job.created_at),
         settled_for: job.settled_at.map(|t| now.saturating_duration_since(t)),
         report_attempts: job.report_attempts,
+        delivering: job.delivery,
         callback_targets: job.callback_urls.len(),
         steps: job
             .steps
