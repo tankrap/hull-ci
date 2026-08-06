@@ -49,6 +49,7 @@ pub mod admin;
 pub mod config;
 pub mod fetch;
 pub mod membership;
+pub mod memo;
 pub mod node;
 pub mod pipeline;
 pub mod proxy;
@@ -199,6 +200,10 @@ pub async fn assemble(config: &Config) -> Result<Runner, StartupError> {
         tier: IsolationTier::Container,
         details_base_url: config.details_base_url.clone(),
         fair_share,
+        // Layer 2 of D§6.1, or an inert placeholder that refuses every glob. Never an `Option`: the
+        // driver takes one path either way, so "memo off" is the configuration every existing test
+        // already exercises rather than a branch nobody runs.
+        memo: memo::assemble(config),
         ..ControlConfig::default()
     };
 

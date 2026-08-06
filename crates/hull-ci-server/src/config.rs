@@ -142,6 +142,13 @@ pub struct Config {
     /// ([`crate::secrets::seed_dev_secrets`]) — it is the one place in this configuration that holds
     /// a plaintext credential, and it exists so a dev stack can be tried at all.
     pub dev_secrets: Option<String>,
+    /// Whether layer 2 of the design's memoization is on (design D§6.1, [`crate::memo`]).
+    ///
+    /// Off by default. A memo that answers wrongly reports a verdict about code nobody ran, and Hull
+    /// memoizes `green`/`red` by `tree_id` permanently (spec §7) — so a bad hit is not something a
+    /// re-check dislodges, and it is silent, because a wrongly-cached pass looks exactly like a fast
+    /// one. Opting in is the operator saying they want that trade.
+    pub memo: bool,
 }
 
 impl Default for Config {
@@ -173,6 +180,7 @@ impl Default for Config {
             // changes that is never implicit.
             proxy: hull_ci_proxy::ProxyConfig::default(),
             dev_secrets: None,
+            memo: false,
         }
     }
 }
@@ -214,6 +222,7 @@ impl Config {
             proxy: hull_ci_proxy::ProxyConfig::from_env()
                 .map_err(|e| ConfigError::Value { var: "HULL_CI_PROXY", detail: e.to_string() })?,
             dev_secrets: var("HULL_CI_DEV_SECRETS"),
+            memo: var("HULL_CI_MEMO").as_deref().is_some_and(is_truthy),
         })
     }
 }

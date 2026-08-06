@@ -129,7 +129,17 @@ fn to_step_spec(step: &PlanStep, pipeline: &Pipeline, default_image: &str) -> St
     // evaluator ran on attacker-controlled input, so nothing it produced may be treated as authority.
     // Whether any of these is ever *delivered* is decided at placement, by the broker, from the job's
     // author class — a fact about the actor that no edit to this file can raise.
-    .secrets(step.secrets.clone());
+    .secrets(step.secrets.clone())
+    // The globs that decide this step's memo key (design D§6.1). Carried verbatim: they are author
+    // text, resolved against the *verified* tree by the digester, and a step that declares none is
+    // refused a key rather than given an empty one — an empty input set folds the same digest on
+    // every tree that has ever existed.
+    //
+    // Worth knowing when writing a pipeline: a directory-prefix glob (`crates/**`) resolves by
+    // descent to a subtree address keel already computed, while a pattern (`**/*.rs`) walks the tree's
+    // node structure. Measured on 100k entries that is 464ns against 23.9ms — the advice to prefer
+    // prefixes is five orders of magnitude, not a rounding note.
+    .inputs(step.inputs.clone());
     spec.timeout = step.timeout;
     spec.continue_on_error = step.continue_on_error;
     spec

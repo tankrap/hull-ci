@@ -429,3 +429,152 @@ async fn a_malformed_pipeline_is_errored_and_never_silently_autodetected() {
         v.summary()
     );
 }
+
+// ── M4: the step memo, on the live path ──────────────────────────────────────────────────────────
+
+/// A runner with the step memo enabled, and a Hull stub, both kept alive so two dispatches can share
+/// one process — which is the only way to observe a memo at all.
+struct MemoRunner {
+    addr: SocketAddr,
+    _work: tempfile::TempDir,
+}
+
+impl MemoRunner {
+    async fn start() -> MemoRunner {
+        let work = tempfile::tempdir().unwrap();
+        let config = Config {
+            secret: Some(SECRET.into()),
+            store_root: work.path().join("store"),
+            work_root: work.path().join("workspaces"),
+            sandbox: SandboxChoice::LocalProcess,
+            allow_unsandboxed: true,
+            trusted: TrustedTenants::parse("acme"),
+            node_id: "node-memo".into(),
+            memo: true,
+            ..Config::default()
+        };
+        let runner = hull_ci_server::assemble(&config).await.expect("the runner assembles");
+        let listener = tokio::net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0))).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, runner.router).await.unwrap() });
+        MemoRunner { addr, _work: work }
+    }
+}
+
+/// A tree whose pipeline declares `inputs`, so its steps are cacheable at all, and whose step writes
+/// a marker file on the host each time it actually runs. Counting markers is how a cached step is
+/// distinguished from a fast one — the verdict looks identical either way, which is exactly why a
+/// wrong memo is dangerous.
+fn cacheable_tree(marker: &Path, extra: Option<(&str, &str)>) -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join(".hull")).unwrap();
+    std::fs::create_dir_all(dir.path().join("src")).unwrap();
+    std::fs::write(dir.path().join("src/lib.rs"), "fn main() {}\n").unwrap();
+    std::fs::write(
+        dir.path().join(".hull/ci.star"),
+        format!(
+            r#"step("build", run = "echo ran >> {}", inputs = ["src/**"])"#,
+            marker.display()
+        ),
+    )
+    .unwrap();
+    if let Some((path, body)) = extra {
+        std::fs::write(dir.path().join(path), body).unwrap();
+    }
+    dir
+}
+
+fn runs_recorded(marker: &Path) -> usize {
+    std::fs::read_to_string(marker).map(|s| s.lines().count()).unwrap_or(0)
+}
+
+async fn dispatch_to(runner: &MemoRunner, hull: &HullStub, repo: &str, tree: &Path) -> Received {
+    let tree_id = keel_tree_id(tree);
+    hull.publish(&tree_id, hull_style_archive(tree));
+    let (status, _) = reqwest::Client::new()
+        .post(format!("http://{}/hull", runner.addr))
+        .header(SECRET_HEADER, SECRET)
+        .json(&dispatch_body(repo, &tree_id, &hull.source_url(&tree_id), &hull.callback_url(&tree_id)))
+        .send()
+        .await
+        .map(|r| (r.status(), ()))
+        .unwrap();
+    assert_eq!(status, StatusCode::ACCEPTED);
+    hull.verdict().await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_identical_tree_resolves_from_the_memo_without_running_the_step_again() {
+    let marker = tempfile::NamedTempFile::new().unwrap();
+    let tree = cacheable_tree(marker.path(), None);
+    let runner = MemoRunner::start().await;
+
+    let hull1 = HullStub::start().await;
+    let first = dispatch_to(&runner, &hull1, "acme/widget", tree.path()).await;
+    assert_eq!(first.status(), "green", "{}", first.summary());
+    assert_eq!(runs_recorded(marker.path()), 1, "the first dispatch must actually run the step");
+
+    // A *different* repo of the same tenant, so it is not Hull's own tree memo or our
+    // (repo, tree_id) idempotency answering — it is layer 2 (D§1 makes the tenant the boundary).
+    let hull2 = HullStub::start().await;
+    let second = dispatch_to(&runner, &hull2, "acme/other", tree.path()).await;
+    assert_eq!(second.status(), "green", "{}", second.summary());
+    assert_eq!(
+        runs_recorded(marker.path()),
+        1,
+        "the second dispatch must resolve from the memo without running the step"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_change_inside_the_declared_inputs_misses_the_memo() {
+    // The other half, and the one that makes the test above mean anything: if this also hit, the memo
+    // would be returning a constant and the first test would pass for the worst possible reason.
+    let marker = tempfile::NamedTempFile::new().unwrap();
+    let runner = MemoRunner::start().await;
+
+    let first_tree = cacheable_tree(marker.path(), None);
+    let hull1 = HullStub::start().await;
+    dispatch_to(&runner, &hull1, "acme/widget", first_tree.path()).await;
+    assert_eq!(runs_recorded(marker.path()), 1);
+
+    // Same pipeline, same command, one changed byte *inside* `src/**`.
+    let changed = cacheable_tree(marker.path(), None);
+    std::fs::write(changed.path().join("src/lib.rs"), "fn main() { /* changed */ }\n").unwrap();
+    let hull2 = HullStub::start().await;
+    let second = dispatch_to(&runner, &hull2, "acme/widget2", changed.path()).await;
+    assert_eq!(second.status(), "green", "{}", second.summary());
+    assert_eq!(
+        runs_recorded(marker.path()),
+        2,
+        "a change inside a declared input glob must miss the memo and run again"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_change_outside_every_declared_glob_still_hits() {
+    // The point of declaring `inputs` at all: a doc-only edit produces a fresh tree_id — so Hull must
+    // dispatch it — and resolves without touching a node (design D§6.1, D§8).
+    let marker = tempfile::NamedTempFile::new().unwrap();
+    let runner = MemoRunner::start().await;
+
+    let base = cacheable_tree(marker.path(), None);
+    let hull1 = HullStub::start().await;
+    dispatch_to(&runner, &hull1, "acme/widget", base.path()).await;
+    assert_eq!(runs_recorded(marker.path()), 1);
+
+    let doc_edit = cacheable_tree(marker.path(), Some(("README.md", "# docs only\n")));
+    assert_ne!(
+        keel_tree_id(base.path()),
+        keel_tree_id(doc_edit.path()),
+        "the trees must genuinely differ, or this test proves nothing"
+    );
+    let hull2 = HullStub::start().await;
+    let second = dispatch_to(&runner, &hull2, "acme/widget3", doc_edit.path()).await;
+    assert_eq!(second.status(), "green", "{}", second.summary());
+    assert_eq!(
+        runs_recorded(marker.path()),
+        1,
+        "a change outside every declared glob must still resolve from the memo"
+    );
+}
