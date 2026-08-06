@@ -103,6 +103,7 @@ struct Harness {
     audit: Arc<MemoryAudit>,
     grants: Arc<GrantRegistry>,
     upstream_base: String,
+    proxy: Arc<PackageProxy>,
 }
 
 impl Harness {
@@ -114,6 +115,16 @@ impl Harness {
 
 /// Bring up a fake upstream and a proxy in front of it, both on loopback.
 async fn harness(rate: RateLimit) -> Harness {
+    let creds = Arc::new(StaticCredentials::new().with("acme", "NPM_TOKEN", UPSTREAM_SECRET));
+    stand_up(rate, |_| creds).await
+}
+
+/// The shared bring-up. `credentials` is built from the upstream's base URL because a broker-backed
+/// source needs to know which secret names the allowlist references before it can mint anything.
+async fn stand_up<F>(rate: RateLimit, credentials: F) -> Harness
+where
+    F: FnOnce(&str) -> Arc<dyn hull_ci_proxy::UpstreamCredentials>,
+{
     let seen: SharedSeen = Arc::new(Mutex::new(Seen::default()));
     let upstream = Router::new()
         .route("/pkg", get(upstream_pkg))
@@ -136,19 +147,21 @@ async fn harness(rate: RateLimit) -> Harness {
     ])
     .unwrap();
 
-    let creds = Arc::new(StaticCredentials::new().with("acme", "NPM_TOKEN", UPSTREAM_SECRET));
     let audit = Arc::new(MemoryAudit::new());
     let grants = Arc::new(GrantRegistry::new());
-    let proxy = PackageProxy::new(allowlist, creds)
-        .with_audit(audit.clone())
-        .with_grants(grants.clone());
+    let proxy = Arc::new(
+        PackageProxy::new(allowlist, credentials(&upstream_base))
+            .with_audit(audit.clone())
+            .with_grants(grants.clone()),
+    );
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move { proxy.serve(listener).await.unwrap() });
+    let serving = Arc::clone(&proxy);
+    tokio::spawn(async move { serving.serve(listener).await.unwrap() });
 
     let _ = rate;
-    Harness { proxy_base: format!("http://{addr}"), seen, audit, grants, upstream_base }
+    Harness { proxy_base: format!("http://{addr}"), seen, audit, grants, upstream_base, proxy }
 }
 
 fn upstreams(names: &[&str]) -> BTreeSet<String> {
@@ -495,4 +508,327 @@ async fn healthz_answers_without_a_grant_and_says_nothing_else() {
     let body = response.text().await.unwrap();
     assert_eq!(body.trim(), "ok");
     assert!(!body.contains("npm"), "liveness must not enumerate the allowlist");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────────────────────────
+// The broker path
+//
+// Everything above proves the proxy's *rules* over a socket, with a development credential map
+// standing in for the real source. This section replaces that map with the actual secret broker —
+// per-tenant KEK envelope encryption, an enrolled proxy principal, and a job-scoped single-use
+// capability minted alongside each job's package grant (D§7.4, `hull_ci_secrets::package`).
+//
+// It is a separate section rather than a parameterisation of the tests above because the questions
+// are different. Above: does the proxy spend a credential correctly? Here: whose credential, on
+// whose authority, and for how long — which are the questions a static map cannot be asked.
+// ─────────────────────────────────────────────────────────────────────────────────────────────────
+
+use hull_ci_proto::AuthorClass;
+use hull_ci_proxy::brokered::{BrokeredCredentials, InProcessRedeemer};
+use hull_ci_proxy::credentials::NoCredentials;
+use hull_ci_secrets::{
+    DevKeyManager, MemorySealedStore, ProxyCapabilityRequest, ProxyCredentialService, ProxyIdentity,
+    ProxyRegistry, SecretBroker,
+};
+
+/// The second tenant's credential. Distinct from [`UPSTREAM_SECRET`] and stored under the **same
+/// name**, which is what makes "a tenant cannot obtain another tenant's credential" a real question
+/// rather than a naming coincidence.
+const GLOBEX_SECRET: &str = "globex_s3cr3t_do_not_leak";
+
+struct Brokered {
+    service: Arc<ProxyCredentialService>,
+    creds: Arc<BrokeredCredentials>,
+}
+
+impl Brokered {
+    /// Do what control does at placement: mint the job's package grant *and* the proxy's
+    /// credential capability for it, then register the capability with the proxy.
+    ///
+    /// Returns the grant token the job would be handed. The two mints happen together on purpose —
+    /// the proxy's authority to spend the tenant's credential exists because this job does.
+    fn place(&self, h: &Harness, tenant: &str, job_id: &str, class: AuthorClass) -> String {
+        let expires_at = now() + 3_600;
+        let (token, _) =
+            h.grants.mint(tenant, job_id, upstreams(&["private", "public"]), expires_at, RateLimit::default());
+
+        match self.service.mint(&ProxyCapabilityRequest {
+            tenant: tenant.into(),
+            job_id: job_id.into(),
+            proxy_id: "proxy-a".into(),
+            // What the deployment allowlist says this job's granted upstreams need.
+            declared: h
+                .proxy
+                .allowlist()
+                .credential_names_for(["private", "public"])
+                .into_iter()
+                .collect(),
+            author_class: class,
+            expires_at,
+        }) {
+            Ok((capability, _)) => self.creds.authorise_job(tenant, job_id, capability),
+            // The outsider path, exactly as a composition root drives it: the broker refuses, so
+            // control registers the refusal rather than leaving the job unknown.
+            Err(e) => self.creds.deny_job(tenant, job_id, e.to_string()),
+        }
+        token.expose().to_string()
+    }
+}
+
+fn now() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs()
+}
+
+/// The proxy in front of the real broker, with two tenants who each hold a registry token.
+async fn brokered_harness() -> (Harness, Brokered) {
+    let broker =
+        Arc::new(SecretBroker::new(Arc::new(DevKeyManager::new()), Arc::new(MemorySealedStore::new())));
+    for (tenant, value) in [("acme", UPSTREAM_SECRET), ("globex", GLOBEX_SECRET)] {
+        broker.provision_tenant(tenant).unwrap();
+        broker.put_secret(tenant, "NPM_TOKEN", value.as_bytes()).unwrap();
+    }
+    let service = Arc::new(ProxyCredentialService::new(broker, Arc::new(ProxyRegistry::new())));
+
+    let identity = Arc::new(ProxyIdentity::generate());
+    service.enrol_proxy("proxy-a", identity.public()).unwrap();
+    let creds = Arc::new(BrokeredCredentials::new(
+        identity,
+        Arc::new(InProcessRedeemer::new(Arc::clone(&service))),
+    ));
+
+    let for_proxy = Arc::clone(&creds);
+    let h = stand_up(RateLimit::default(), move |_| for_proxy).await;
+    (h, Brokered { service, creds })
+}
+
+#[tokio::test]
+async fn a_brokered_credential_reaches_the_upstream_and_never_the_job() {
+    // The strengthened version of this crate's most important assertion. The credential now comes
+    // out of an envelope-encrypted store via a single-use capability, and the job must still see no
+    // trace of it — not in a success, not in an upstream 401, not in a refusal the proxy itself
+    // wrote, and not in a redirect it followed. Every one of those is a *different* response
+    // constructor, and it only takes one of them to be a copy-and-remove for the guarantee to fail.
+    let (h, b) = brokered_harness().await;
+    let token = b.place(&h, "acme", "job-1", AuthorClass::Member);
+
+    let mut bodies = Vec::new();
+    for tail in ["pkg", "needs-auth", "redirect-internal", "redirect-offlist", "../escape"] {
+        let response = client().get(h.url(&token, "private", tail)).send().await.unwrap();
+        for (name, value) in response.headers().iter() {
+            let rendered = format!("{name}: {}", value.to_str().unwrap_or(""));
+            assert!(!rendered.contains(UPSTREAM_SECRET), "credential in a response header: {rendered}");
+        }
+        assert!(response.headers().get("www-authenticate").is_none());
+        assert!(response.headers().get("set-cookie").is_none());
+        bodies.push(response.text().await.unwrap());
+    }
+    for body in &bodies {
+        assert!(!body.contains(UPSTREAM_SECRET), "credential in a job-visible body: {body}");
+    }
+    assert_eq!(bodies[0], "package-bytes", "…and the fetch genuinely worked");
+
+    // The upstream *did* receive it, which is what makes the above a result rather than an artefact
+    // of the credential never being spent at all.
+    let seen = h.seen.lock().unwrap();
+    assert!(
+        seen.authorization.iter().any(|a| a.as_deref() == Some(&*format!("Bearer {UPSTREAM_SECRET}"))),
+        "the broker's value never reached the upstream: {seen:?}"
+    );
+
+    // Nor does it reach the audit trail, which is the other thing a job's operator reads.
+    for fetch in h.audit.fetches() {
+        assert!(!format!("{fetch:?}").contains(UPSTREAM_SECRET));
+    }
+    for refusal in h.audit.refusals() {
+        assert!(!format!("{refusal:?}").contains(UPSTREAM_SECRET));
+    }
+}
+
+#[tokio::test]
+async fn a_tenant_cannot_obtain_another_tenants_upstream_credential() {
+    // Both tenants have a secret named `NPM_TOKEN`, both jobs reach the same upstream through the
+    // same proxy process, and each must spend its own. This is the D§1 "secret bleed" row, checked
+    // where it would actually break: a single shared process holding both.
+    let (h, b) = brokered_harness().await;
+    let acme = b.place(&h, "acme", "job-acme", AuthorClass::Member);
+    let globex = b.place(&h, "globex", "job-globex", AuthorClass::Member);
+
+    assert_eq!(client().get(h.url(&acme, "private", "pkg")).send().await.unwrap().status(), 200);
+    assert_eq!(
+        h.seen.lock().unwrap().authorization.last().unwrap().as_deref(),
+        Some(&*format!("Bearer {UPSTREAM_SECRET}"))
+    );
+
+    assert_eq!(client().get(h.url(&globex, "private", "pkg")).send().await.unwrap().status(), 200);
+    let seen = h.seen.lock().unwrap();
+    assert_eq!(
+        seen.authorization,
+        vec![
+            Some(format!("Bearer {UPSTREAM_SECRET}")),
+            Some(format!("Bearer {GLOBEX_SECRET}")),
+        ],
+        "each job spent its own tenant's token, in order, and neither ever spent the other's"
+    );
+}
+
+#[tokio::test]
+async fn a_grant_whose_tenant_disagrees_with_the_registration_is_refused_not_resolved() {
+    // The cross-tenant *bug* shape rather than the attack shape: the job's package grant says one
+    // tenant and the capability the proxy holds for that job says another. Serving either would be a
+    // disclosure, so neither is preferred.
+    let (h, b) = brokered_harness().await;
+    // Control registered the job's credential capability under `acme`…
+    b.place(&h, "acme", "job-x", AuthorClass::Member);
+    // …and minted the package grant for `globex` under the same job id.
+    let (mismatched, _) = h.grants.mint(
+        "globex",
+        "job-x",
+        upstreams(&["private"]),
+        now() + 3_600,
+        RateLimit::default(),
+    );
+
+    let response = client().get(h.url(mismatched.expose(), "private", "pkg")).send().await.unwrap();
+    assert_eq!(response.status(), 403, "a policy refusal, not an outage");
+    let body = response.text().await.unwrap();
+    assert!(body.contains("registered under tenant"), "{body}");
+    assert!(!body.contains(UPSTREAM_SECRET) && !body.contains(GLOBEX_SECRET));
+    assert!(h.seen.lock().unwrap().paths.is_empty(), "no request went upstream on either token");
+}
+
+#[tokio::test]
+async fn an_outsider_authored_job_cannot_spend_the_tenants_registry_credential() {
+    // Decided in `hull_ci_secrets::package`: the job never sees the value, but *use* is authority —
+    // a fork PR that can make the proxy fetch a private package has pulled it into a build it
+    // controls. The refusal is per-upstream, so the public one in the same grant still resolves.
+    let (h, b) = brokered_harness().await;
+    let token = b.place(&h, "acme", "job-fork", AuthorClass::Outsider);
+
+    let response = client().get(h.url(&token, "private", "pkg")).send().await.unwrap();
+    assert_eq!(response.status(), 403, "the author's authority, not an infrastructure failure");
+    let body = response.text().await.unwrap();
+    assert!(body.contains("outsider"), "the refusal has to be actionable by the author: {body}");
+    assert!(h.seen.lock().unwrap().paths.is_empty(), "nothing was fetched on the tenant's token");
+
+    // …and the same fork PR still builds against anything public.
+    let response = client().get(h.url(&token, "public", "pkg")).send().await.unwrap();
+    assert_eq!(response.status(), 200);
+    assert_eq!(h.seen.lock().unwrap().authorization.last().unwrap(), &None);
+}
+
+#[tokio::test]
+async fn revoking_a_tenant_stops_its_proxy_access() {
+    // D§7.4 break-glass path one, checked at the proxy. Revocation must bite *before* the capability
+    // is spent, which is why the fetch below is this job's first.
+    let (h, b) = brokered_harness().await;
+    let token = b.place(&h, "acme", "job-1", AuthorClass::Member);
+    assert_eq!(b.service.broker().revoke_tenant("acme"), 1, "the proxy capability, revoked with the rest");
+
+    let response = client().get(h.url(&token, "private", "pkg")).send().await.unwrap();
+    assert_eq!(response.status(), 502);
+    assert!(response.text().await.unwrap().contains("revoked"));
+    assert!(h.seen.lock().unwrap().paths.is_empty());
+}
+
+#[tokio::test]
+async fn crypto_shredding_a_tenant_stops_its_proxy_access_and_leaves_others_alone() {
+    // Break-glass path two. Deleting the KEK makes the tenant's stored registry token unrecoverable
+    // — including from any backup — and the proxy simply cannot serve it any more.
+    let (h, b) = brokered_harness().await;
+    let acme = b.place(&h, "acme", "job-acme", AuthorClass::Member);
+    let globex = b.place(&h, "globex", "job-globex", AuthorClass::Member);
+
+    b.service.broker().shred_tenant("acme").unwrap();
+
+    let response = client().get(h.url(&acme, "private", "pkg")).send().await.unwrap();
+    assert_eq!(response.status(), 502);
+    assert!(!response.text().await.unwrap().contains(UPSTREAM_SECRET));
+
+    // Blast-radius isolation: one KEK per tenant is what makes this a local event.
+    assert_eq!(client().get(h.url(&globex, "private", "pkg")).send().await.unwrap().status(), 200);
+    assert_eq!(
+        h.seen.lock().unwrap().authorization.last().unwrap().as_deref(),
+        Some(&*format!("Bearer {GLOBEX_SECRET}"))
+    );
+}
+
+#[tokio::test]
+async fn releasing_a_job_drops_its_grant_and_its_credentials_together() {
+    // §14.1's "nothing survives into the next job", applied to the two pieces of a job's state that
+    // do not live in a rootfs. One call, because the half that gets forgotten when they are two is
+    // always the one that frees a secret.
+    let (h, b) = brokered_harness().await;
+    let token = b.place(&h, "acme", "job-1", AuthorClass::Member);
+    assert_eq!(client().get(h.url(&token, "private", "pkg")).send().await.unwrap().status(), 200);
+    assert_eq!(b.creds.live_jobs(), 1);
+
+    assert_eq!(h.proxy.release_job("job-1"), 1);
+    assert_eq!(b.creds.live_jobs(), 0, "the credential went with the grant");
+    assert_eq!(client().get(h.url(&token, "private", "pkg")).send().await.unwrap().status(), 401);
+}
+
+#[tokio::test]
+async fn a_job_the_proxy_was_never_told_about_is_refused_rather_than_served() {
+    // A package grant minted without the matching credential capability — the wiring bug. It fails
+    // closed, and the refusal names the bug rather than blaming the registry.
+    let (h, b) = brokered_harness().await;
+    let (orphan, _) =
+        h.grants.mint("acme", "ghost", upstreams(&["private"]), now() + 3_600, RateLimit::default());
+    let _ = &b;
+
+    let response = client().get(h.url(orphan.expose(), "private", "pkg")).send().await.unwrap();
+    assert_eq!(response.status(), 502);
+    let body = response.text().await.unwrap();
+    assert!(body.contains("no upstream-credential capability"), "{body}");
+    assert!(h.seen.lock().unwrap().paths.is_empty(), "never sent anonymously in its place");
+}
+
+#[tokio::test]
+async fn with_no_credential_source_an_authenticated_upstream_is_refused_not_downgraded() {
+    // The honest-degradation rule, over a socket: a proxy with no broker refuses the upstreams that
+    // need one and serves the ones that do not. It never makes the request anonymously, because a
+    // deployment that looks configured and is quietly unauthenticated is the one failure mode this
+    // path must not have.
+    let h = stand_up(RateLimit::default(), |_| Arc::new(NoCredentials)).await;
+    let (token, _) = h.grants.mint(
+        "acme",
+        "job-1",
+        upstreams(&["private", "public"]),
+        now() + 3_600,
+        RateLimit::default(),
+    );
+
+    let response = client().get(h.url(token.expose(), "private", "pkg")).send().await.unwrap();
+    assert_eq!(response.status(), 502);
+    assert!(response.text().await.unwrap().contains("no credential source"));
+    assert!(h.seen.lock().unwrap().paths.is_empty(), "no anonymous request in place of the refusal");
+
+    // A public upstream is unaffected: it never wanted a credential.
+    assert_eq!(client().get(h.url(token.expose(), "public", "pkg")).send().await.unwrap().status(), 200);
+    assert_eq!(h.seen.lock().unwrap().authorization.last().unwrap(), &None);
+}
+
+#[tokio::test]
+async fn one_capability_serves_a_whole_install_and_a_concurrent_burst() {
+    // The shape mismatch this design resolves: a single-use capability against the hundreds of
+    // parallel requests an `npm install` makes. Redeemed once, then served from memory — a lost race
+    // here would surface as an intermittent build failure, which is why the redemption is
+    // serialised per job.
+    let (h, b) = brokered_harness().await;
+    let token = b.place(&h, "acme", "job-1", AuthorClass::Member);
+
+    let mut requests = Vec::new();
+    for _ in 0..24 {
+        let url = h.url(&token, "private", "pkg");
+        requests.push(tokio::spawn(async move { client().get(url).send().await.unwrap().status() }));
+    }
+    for request in requests {
+        assert_eq!(request.await.unwrap(), 200);
+    }
+    let seen = h.seen.lock().unwrap();
+    assert_eq!(seen.paths.len(), 24);
+    assert!(
+        seen.authorization.iter().all(|a| a.as_deref() == Some(&*format!("Bearer {UPSTREAM_SECRET}"))),
+        "every request carried the credential, and none of them raced the capability away"
+    );
 }

@@ -78,6 +78,18 @@ impl NodePublicKey {
     fn verifying_key(&self) -> Result<VerifyingKey, SecretError> {
         VerifyingKey::from_bytes(&self.0).map_err(|_| SecretError::BadNodeSignature)
     }
+
+    /// Check a signature over already-built, domain-separated bytes.
+    ///
+    /// `pub(crate)` and takes a finished payload, because the one way a signature scheme fails
+    /// silently is two modules each growing their own serializer (see the module doc). A caller
+    /// outside this crate has no business building the bytes; a caller inside it must build them in
+    /// the module that also signs them.
+    pub(crate) fn verify_raw(&self, payload: &[u8], signature: &[u8; SIGNATURE_LEN]) -> Result<(), SecretError> {
+        self.verifying_key()?
+            .verify(payload, &Signature::from_bytes(signature))
+            .map_err(|_| SecretError::BadNodeSignature)
+    }
 }
 
 impl std::fmt::Display for NodePublicKey {
@@ -121,6 +133,17 @@ impl NodeIdentity {
 
     pub fn public(&self) -> NodePublicKey {
         NodePublicKey(self.signing.verifying_key().to_bytes())
+    }
+
+    /// Sign already-built, domain-separated bytes.
+    ///
+    /// The counterpart to [`NodePublicKey::verify_raw`], and `pub(crate)` for the same reason: an
+    /// enrolment keypair signs *this crate's* payloads, each of which is built in exactly one module
+    /// alongside its verifier. Exposing a general-purpose signing oracle over an enrolled key would
+    /// let any future payload be signed by a key whose meaning was fixed at provisioning.
+    pub(crate) fn sign_raw(&self, payload: &[u8]) -> [u8; SIGNATURE_LEN] {
+        let signature: Signature = self.signing.sign(payload);
+        signature.to_bytes()
     }
 
     /// Sign a redemption of `token` for `job_id`, asking for `requested` names.
@@ -264,6 +287,17 @@ impl NodeRegistry {
 
     pub fn is_enrolled(&self, key: &NodePublicKey) -> bool {
         self.by_key.lock().expect("node registry poisoned").contains_key(key.as_bytes())
+    }
+
+    /// The id `key` is enrolled under, if any.
+    ///
+    /// Exposed so a second principal family can reuse this table's properties (injective in both
+    /// directions, replace-on-re-enrol, revocable) rather than growing a parallel copy of them — see
+    /// [`crate::package::ProxyRegistry`]. It deliberately does **not** verify anything: a caller that
+    /// resolves a key without first checking a signature over the request has learned nothing, which
+    /// is why [`NodeRegistry::verify`] exists and this is not it.
+    pub fn resolve(&self, key: &NodePublicKey) -> Option<String> {
+        self.by_key.lock().expect("node registry poisoned").get(key.as_bytes()).cloned()
     }
 
     /// Verify a redemption and return the node id **derived from the verified key**.

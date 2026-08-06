@@ -204,6 +204,25 @@ pub(crate) fn parse_token(token: &CapabilityToken) -> Result<(CapId, [u8; 32]), 
     token.parse()
 }
 
+/// Mint a bare token, id and verifier, for a capability family that is not the node one.
+///
+/// The package proxy's capability ([`crate::package`]) authorises a different principal over a
+/// different set, so it cannot reuse [`CapabilityGrant`] — but it *must* reuse the token: one
+/// construction, one parser, one constant-time comparison. Two bearer formats in one system is how a
+/// reviewer stops being able to tell at a glance whether a given string is dangerous.
+pub(crate) fn mint_token() -> (CapabilityToken, CapId, [u8; 32]) {
+    CapabilityToken::mint()
+}
+
+/// Constant-time comparison of a stored verifier against a presented one.
+///
+/// Shared with [`crate::package`] so there is exactly one place in this crate that decides what
+/// "this token authenticates" means. A second capability family that hand-rolled `==` would be a
+/// timing oracle nobody would think to look for, precisely because the node path does it correctly.
+pub(crate) fn authenticates(stored: &[u8; 32], presented: &[u8; 32]) -> bool {
+    stored.ct_eq(presented).into()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -62,6 +62,7 @@ pub mod capability;
 pub mod identity;
 pub mod keys;
 pub mod mask;
+pub mod package;
 pub mod seal;
 pub mod service;
 pub mod store;
@@ -70,6 +71,10 @@ pub use broker::{CapabilityRequest, DeliveredSecrets, SecretBroker};
 pub use capability::{CapId, CapabilityGrant, CapabilityToken, DEFAULT_TTL_SECS};
 pub use identity::{NodeIdentity, NodePublicKey, NodeRegistry, SignedRedemption, MAX_SKEW_SECS};
 pub use keys::{DevKeyManager, KekVersion, KeyManager};
+pub use package::{
+    ProxyCapabilityRequest, ProxyCredentialGrant, ProxyCredentialService, ProxyIdentity,
+    ProxyRegistry, SignedProxyRedemption,
+};
 pub use mask::{Masker, MASK, MIN_MASKABLE_LEN};
 pub use seal::{SealedSecret, SecretBytes, Vault};
 pub use service::SecretService;
@@ -136,9 +141,24 @@ pub enum SecretError {
     /// string the caller supplied against a string the caller could have supplied differently.
     #[error("capability is bound to another node")]
     WrongNode,
+    /// Presented by a package proxy other than the one the capability was minted for.
+    ///
+    /// The proxy-side sibling of [`SecretError::WrongNode`], and load-bearing for the same reason:
+    /// [`package::ProxyCredentialService`] derives the presenting proxy's id from a verified Ed25519
+    /// signature, so this is a fact the caller cannot restate.
+    #[error("capability is bound to another package proxy")]
+    WrongProxy,
     /// The capability was minted for a different job than the node signed its redemption for.
     #[error("capability is bound to job `{bound}` but was presented for `{presented}`")]
     WrongJob { bound: String, presented: String },
+    /// The capability was minted for a different tenant than the redemption was signed for.
+    ///
+    /// Only reachable on the package-proxy path, and it exists because that path has a property the
+    /// node path does not: one proxy process serves every tenant on the fleet, so "the credential I
+    /// just fetched belongs to the tenant whose job asked for it" is a claim that has to be checked
+    /// rather than a consequence of the topology.
+    #[error("capability is bound to tenant `{bound}` but was presented for `{presented}`")]
+    WrongTenant { bound: String, presented: String },
     /// The redemption's Ed25519 signature does not verify — a forged, corrupted, or tampered-with
     /// request. Covers a malformed public key too: both mean "this was not signed by the key it
     /// claims", and there is no reason to help a caller tell them apart.
@@ -150,6 +170,14 @@ pub enum SecretError {
     /// who cannot forge a signature learns nothing actionable from the difference.
     #[error("node public key `{0}` is not enrolled")]
     UnenrolledNode(String),
+    /// A correctly signed proxy redemption from a key no operator enrolled as a package proxy.
+    ///
+    /// Distinct from [`SecretError::UnenrolledNode`] because the two enrolment tables are distinct:
+    /// a key enrolled as a *node* must not resolve as a proxy, since the two principal families
+    /// authorise different disclosures, and an operator debugging one needs to be told which table
+    /// was consulted.
+    #[error("package-proxy public key `{0}` is not enrolled")]
+    UnenrolledProxy(String),
     /// The redemption's timestamp is further from ours than [`identity::MAX_SKEW_SECS`] — a replay,
     /// or a node whose clock is broken. Refused before it can consume a capability.
     #[error("redemption is {skew_secs}s away from this clock")]

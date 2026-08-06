@@ -49,10 +49,24 @@
 //!   dependency-confusion defence are the ecosystem's (`npm` lockfile integrity hashes, `cargo`'s
 //!   `Cargo.lock`). The proxy narrows *where* bytes may come from; it does not vouch for them.
 //! * **It holds no key material.** Credentials are resolved through
-//!   [`credentials::UpstreamCredentials`], which a deployment backs with the secret broker.
+//!   [`credentials::UpstreamCredentials`], which a deployment backs with the secret broker
+//!   ([`brokered::BrokeredCredentials`]). The proxy holds a *value* in memory for the life of a job
+//!   and never on disk (D§7.4); it holds no KEK, implements no `KeyManager`, and cannot decrypt
+//!   anything itself.
+//!
+//! # The one credential the proxy does hold, and how it gets it
+//!
+//! D§7.4 calls the upstream registry credential "just a tenant secret", which makes the broker its
+//! only legitimate source — and the broker delivers tenant secrets as job-scoped, single-use
+//! capabilities redeemed by an *enrolled principal*. So the proxy is one: it has its own Ed25519
+//! enrolment keypair, and control mints it a capability alongside each job's package grant, bounded
+//! by that job and that job's upstreams. [`brokered`] is that machinery and
+//! [`hull_ci_secrets::package`] is the argument for it, including why an `outsider`-authored job
+//! gets none even though it never sees the value.
 
 pub mod allowlist;
 pub mod audit;
+pub mod brokered;
 pub mod config;
 pub mod credentials;
 pub mod grant;
@@ -62,8 +76,11 @@ pub mod server;
 
 pub use allowlist::{Allowlist, AllowlistError, AuthScheme, DenyReason, Upstream, ALLOWED_METHODS};
 pub use audit::{AuditSink, Fetch, MemoryAudit, Refusal, TracingAudit};
+pub use brokered::{BrokeredCredentials, InProcessRedeemer, ProxyCredentialRedeemer};
 pub use config::{ProxyConfig, ProxyMode};
-pub use credentials::{StaticCredentials, UpstreamCredentials};
+pub use credentials::{
+    CredentialError, CredentialRequest, NoCredentials, StaticCredentials, UpstreamCredentials,
+};
 pub use grant::{Grant, GrantError, GrantId, GrantRegistry, GrantToken};
 pub use jobenv::JobProxyEndpoint;
 pub use ratelimit::RateLimit;

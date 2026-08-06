@@ -27,6 +27,7 @@ use zeroize::Zeroizing;
 use crate::capability::{mint_record, parse_token, CapId, CapabilityGrant, CapabilityToken, DEFAULT_TTL_SECS};
 use crate::keys::KeyManager;
 use crate::mask::Masker;
+use crate::package::{mint_proxy_record, ProxyCapRecord, ProxyCapabilityRequest, ProxyCredentialGrant};
 use crate::seal::{SecretBytes, Vault};
 use crate::store::SealedStore;
 use crate::{validate_name, Clock, SecretError, SystemClock};
@@ -124,11 +125,21 @@ impl DeliveredSecrets {
 }
 
 /// Store tenant secrets encrypted; hand one job's declared secrets to one node, once.
+///
+/// Two capability families live here, not one, and they live in the *same* type on purpose. A
+/// package-proxy capability ([`crate::package`]) authorises a different principal over a different
+/// set for a different lifetime, so it gets its own request, grant and registry — but it discloses
+/// the same tenant plaintext, so it must be behind the same gate, the same tenant revocation and the
+/// same crypto-shred. Putting the proxy registry in a sibling type would mean
+/// [`SecretBroker::shred_tenant`] silently missed half the outstanding capabilities, and that is
+/// exactly the kind of gap D§7.4's break-glass paths cannot afford.
 #[derive(Debug)]
 pub struct SecretBroker {
     vault: Vault,
     store: Arc<dyn SealedStore>,
     caps: Mutex<HashMap<CapId, crate::capability::CapRecord>>,
+    /// Outstanding package-proxy capabilities. Separate map, same lock discipline, same lifecycle.
+    proxy_caps: Mutex<HashMap<CapId, ProxyCapRecord>>,
     clock: Arc<dyn Clock>,
     ttl_secs: u64,
 }
@@ -139,6 +150,7 @@ impl SecretBroker {
             vault: Vault::new(keys),
             store,
             caps: Mutex::new(HashMap::new()),
+            proxy_caps: Mutex::new(HashMap::new()),
             clock: Arc::new(SystemClock),
             ttl_secs: DEFAULT_TTL_SECS,
         }
@@ -328,6 +340,169 @@ impl SecretBroker {
         Ok(DeliveredSecrets { tenant: grant.tenant, job_id: grant.job_id, values })
     }
 
+    // ── The package proxy's gate ─────────────────────────────────────────────────────────────────
+
+    /// Mint a capability that lets the package proxy spend one job's upstream registry credentials.
+    ///
+    /// The argument for why the proxy gets a *job*-scoped capability rather than a standing
+    /// per-tenant one is in [`crate::package`]; this method is the gate that makes it true. The
+    /// order of checks is [`SecretBroker::mint`]'s, and for the same reasons:
+    ///
+    /// 1. **Outsider first**, before a name is validated or the store is touched, so an
+    ///    outsider-authored job cannot use the error as an oracle for which credentials a tenant has.
+    ///    D§7.4's gate is unqualified, and it applies here even though the job never receives the
+    ///    value — see [`crate::package`] for why *use* is authority.
+    /// 2. **Tenant key material**, so a crypto-shredded tenant fails at placement rather than inside
+    ///    a package fetch, where it would read as a registry outage.
+    /// 3. **Names validated and required to exist**, so a misconfigured upstream is a legible startup
+    ///    error rather than a mid-build 502.
+    /// 4. **Expiry sanity.** Control computing an expiry in the past is a bug; minting anyway moves
+    ///    the failure to the request path.
+    pub fn mint_proxy_capability(
+        &self,
+        req: &ProxyCapabilityRequest,
+    ) -> Result<(CapabilityToken, ProxyCredentialGrant), SecretError> {
+        if !req.author_class.may_receive_secrets() {
+            return Err(SecretError::OutsiderRefused);
+        }
+        self.vault.keys().current_version(&req.tenant)?;
+
+        let mut names = BTreeSet::new();
+        for name in &req.declared {
+            validate_name(name)?;
+            if self.store.get(&req.tenant, name)?.is_none() {
+                return Err(SecretError::UnknownSecret { tenant: req.tenant.clone(), name: name.clone() });
+            }
+            names.insert(name.clone());
+        }
+
+        let now = self.clock.now_secs();
+        if req.expires_at <= now {
+            return Err(SecretError::CapabilityExpired);
+        }
+        let (token, id, record) = mint_proxy_record(
+            req.tenant.clone(),
+            req.job_id.clone(),
+            req.proxy_id.clone(),
+            names,
+            req.author_class,
+            req.expires_at,
+        );
+        let issued = record.grant.clone();
+
+        let mut caps = self.proxy_caps.lock().expect("proxy capability registry poisoned");
+        // Same opportunistic sweep, and the same reason a *consumed* record is kept until it expires:
+        // dropping it early turns a replay into a generic "unknown capability" instead of
+        // [`SecretError::CapabilityConsumed`], which is the alarm that says someone redeemed first.
+        caps.retain(|_, r| r.grant.expires_at > now);
+        caps.insert(id, record);
+        Ok((token, issued))
+    }
+
+    /// Redeem a package-proxy capability: authenticate it, burn it, and return the whole covered set.
+    ///
+    /// `proxy_id` must come from a verified signature — [`crate::package::ProxyCredentialService`] is
+    /// the only thing that should call this, for the same reason
+    /// [`crate::service::SecretService`] is the only thing that should call
+    /// [`SecretBroker::redeem`]: reached directly, it compares a string the caller supplied against a
+    /// string the caller could have supplied differently.
+    ///
+    /// Check order matches [`SecretBroker::redeem`] exactly. The one difference worth naming is that
+    /// there is **no per-name request**: the proxy cannot know which upstream a job will reach for
+    /// before it reaches for it, so it takes the covered set or nothing. That removes the
+    /// probe-the-declared-set attack by removing the thing it probes rather than by burning on a
+    /// wrong guess.
+    pub fn redeem_proxy_capability(
+        &self,
+        token: &CapabilityToken,
+        proxy_id: &str,
+    ) -> Result<DeliveredSecrets, SecretError> {
+        let (id, digest) = parse_token(token)?;
+        let now = self.clock.now_secs();
+
+        let grant = {
+            let mut caps = self.proxy_caps.lock().expect("proxy capability registry poisoned");
+            let record = caps.get_mut(&id).ok_or(SecretError::BadCapability)?;
+            if !record.authenticates(&digest) {
+                return Err(SecretError::BadCapability);
+            }
+            if record.revoked {
+                return Err(SecretError::CapabilityRevoked);
+            }
+            if record.consumed {
+                return Err(SecretError::CapabilityConsumed);
+            }
+            if now >= record.grant.expires_at {
+                return Err(SecretError::CapabilityExpired);
+            }
+            // Checked *without* burning, matching the node path: a misrouted request must not kill a
+            // healthy job, and an attacker holding the token could burn it anyway by presenting the
+            // right id, so the strictness would buy nothing.
+            if record.grant.proxy_id != proxy_id {
+                return Err(SecretError::WrongProxy);
+            }
+            record.consumed = true;
+            record.grant.clone()
+        };
+
+        if !grant.author_class.may_receive_secrets() {
+            return Err(SecretError::OutsiderRefused);
+        }
+
+        // Note the tenant: it comes off the *grant*, never off the request. A cross-tenant read is
+        // not refused here, it is unreachable — there is no expression in this loop that could name
+        // another tenant's row, and the AAD would refuse it if there were.
+        let mut values = Vec::with_capacity(grant.names.len());
+        for name in &grant.names {
+            let sealed = self.store.get(&grant.tenant, name)?.ok_or_else(|| SecretError::UnknownSecret {
+                tenant: grant.tenant.clone(),
+                name: name.clone(),
+            })?;
+            let plaintext = self.vault.open(&grant.tenant, name, &sealed)?;
+            values.push((name.clone(), plaintext));
+        }
+
+        tracing::debug!(
+            cap_id = %grant.cap_id,
+            tenant = %grant.tenant,
+            job_id = %grant.job_id,
+            proxy_id = %grant.proxy_id,
+            count = values.len(),
+            // Names, never values. This line is the audit trail for "which job's packages, when".
+            names = ?values.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>(),
+            "delivered upstream registry credentials to the package proxy"
+        );
+
+        Ok(DeliveredSecrets { tenant: grant.tenant, job_id: grant.job_id, values })
+    }
+
+    /// Revoke one outstanding package-proxy capability. Returns whether it existed.
+    pub fn revoke_proxy_capability(&self, cap_id: CapId) -> bool {
+        let mut caps = self.proxy_caps.lock().expect("proxy capability registry poisoned");
+        match caps.get_mut(&cap_id) {
+            Some(record) => {
+                record.revoked = true;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Revoke every outstanding package-proxy capability for one job.
+    ///
+    /// The counterpart to the proxy dropping a job's grant when the job ends (§14.1's "nothing
+    /// survives into the next job", applied to a credential): even if the proxy process never hears
+    /// that the job finished, an unredeemed capability for it is dead.
+    pub fn revoke_job_proxy_capabilities(&self, job_id: &str) -> usize {
+        let mut caps = self.proxy_caps.lock().expect("proxy capability registry poisoned");
+        let mut n = 0;
+        for record in caps.values_mut().filter(|r| r.grant.job_id == job_id && !r.revoked) {
+            record.revoked = true;
+            n += 1;
+        }
+        n
+    }
+
     // ── Break glass ──────────────────────────────────────────────────────────────────────────────
 
     /// Revoke one outstanding capability (D§7.4 break-glass path one). Returns whether it existed.
@@ -346,11 +521,22 @@ impl SecretBroker {
         }
     }
 
-    /// Revoke every outstanding capability for a tenant.
+    /// Revoke every outstanding capability for a tenant — **both** families.
+    ///
+    /// Both, because "revoke this tenant" that left the package proxy able to keep spending the
+    /// tenant's registry token would be a revocation in name only. The two registries are separate
+    /// maps precisely so this method has to name them both, where a reviewer can see it.
     pub fn revoke_tenant(&self, tenant: &str) -> usize {
-        let mut caps = self.caps.lock().expect("capability registry poisoned");
         let mut n = 0;
-        for record in caps.values_mut().filter(|r| r.grant.tenant == tenant && !r.revoked) {
+        {
+            let mut caps = self.caps.lock().expect("capability registry poisoned");
+            for record in caps.values_mut().filter(|r| r.grant.tenant == tenant && !r.revoked) {
+                record.revoked = true;
+                n += 1;
+            }
+        }
+        let mut proxy_caps = self.proxy_caps.lock().expect("proxy capability registry poisoned");
+        for record in proxy_caps.values_mut().filter(|r| r.grant.tenant == tenant && !r.revoked) {
             record.revoked = true;
             n += 1;
         }

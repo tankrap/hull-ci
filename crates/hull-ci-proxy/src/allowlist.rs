@@ -22,7 +22,7 @@
 //! path prefix. If the answer moved, it is refused. Two independent checks, because the failure of
 //! either one alone is an open proxy.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use url::Url;
 
@@ -165,6 +165,37 @@ impl Allowlist {
 
     pub fn get(&self, label: &str) -> Option<&Upstream> {
         self.by_label.get(label)
+    }
+
+    /// The tenant-secret names backing the authenticated upstreams among `labels`.
+    ///
+    /// This is what control puts in a job's
+    /// [`ProxyCapabilityRequest`](hull_ci_secrets::ProxyCapabilityRequest): the credentials the proxy
+    /// may spend for this job are bounded by *this job's* slice of the allowlist, not by the
+    /// deployment's whole set. A job granted only `npm` cannot cause the private registry's token to
+    /// be redeemed, because that token was never in the capability.
+    ///
+    /// A label with no entry is silently skipped rather than erroring: the grant's set is the
+    /// caller's, this function's job is to describe what exists under it, and a request naming an
+    /// unknown label is already refused at [`Allowlist::resolve`] with a reason that says so.
+    pub fn credential_names_for<'a>(
+        &self,
+        labels: impl IntoIterator<Item = &'a str>,
+    ) -> BTreeSet<String> {
+        labels
+            .into_iter()
+            .filter_map(|label| self.by_label.get(label))
+            .filter_map(|u| u.credential.clone())
+            .collect()
+    }
+
+    /// Whether any configured upstream authenticates at all.
+    ///
+    /// Used at startup to decide whether an absent credential source is a benign fact (every
+    /// upstream is public) or a deployment that will refuse half its requests — see
+    /// [`crate::server::PackageProxy::new`].
+    pub fn has_authenticated_upstream(&self) -> bool {
+        self.by_label.values().any(|u| u.credential.is_some())
     }
 
     /// Resolve `/u/<label>/<tail>` into an absolute upstream URL.

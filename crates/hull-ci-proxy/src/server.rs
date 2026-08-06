@@ -133,7 +133,19 @@ impl PackageProxy {
     /// proxy whose allowlist can change at runtime is a proxy whose allowlist can be changed by
     /// whoever finds a way to talk to it, and the set of hosts a fleet may reach is a deployment
     /// decision, not a request-time one.
+    ///
+    /// Says at startup whether the credential posture is coherent. An authenticated upstream with no
+    /// credential source refuses every request for that upstream, and it refuses them *correctly* —
+    /// but a deployment discovering that from a failed build hours later is a deployment that looked
+    /// configured and was not, which is the one failure mode the credential path must never have.
     pub fn new(allowlist: Allowlist, credentials: Arc<dyn UpstreamCredentials>) -> Self {
+        if allowlist.has_authenticated_upstream() {
+            tracing::info!(
+                source = ?credentials,
+                "package proxy will authenticate outbound for at least one upstream; \
+                 credentials come from this source and never enter a job (D§7.4)"
+            );
+        }
         PackageProxy {
             state: ProxyState {
                 allowlist: Arc::new(allowlist),
@@ -169,6 +181,19 @@ impl PackageProxy {
 
     pub fn allowlist(&self) -> &Allowlist {
         &self.state.allowlist
+    }
+
+    /// End a job: drop its bearer **and** anything its credential source is holding for it.
+    ///
+    /// One call rather than two, because the two halves are the same fact — §14.1's "nothing
+    /// survives into the next job" — and the half that gets forgotten when they are separate is
+    /// always the one that frees a secret. A composition root that revoked the grant and left the
+    /// credential in memory would have a proxy holding a tenant's registry token for a job that no
+    /// longer exists, which is exactly the standing access this design refuses to have.
+    pub fn release_job(&self, job_id: &str) -> usize {
+        let dropped = self.state.grants.revoke_job(job_id);
+        self.state.credentials.release_job(job_id);
+        dropped
     }
 
     /// The router. A single fallback rather than a route table, because a forward proxy's "path" is
@@ -292,10 +317,19 @@ impl From<GrantError> for Denied {
 }
 
 impl From<CredentialError> for Denied {
-    // A misconfigured upstream credential is the operator's problem, not the job's, and 502 says so:
-    // the job's request was fine and the proxy could not complete it.
+    /// Two statuses, and which one depends on *whose* problem it is
+    /// ([`CredentialError::is_policy_refusal`]).
+    ///
+    /// A misconfigured or unwired credential is the operator's, and 502 says so: the job's request
+    /// was fine and the proxy could not complete it. A job with no authority to spend a tenant
+    /// credential — an `outsider`-authored one (D§7.4), or a cross-tenant mismatch — is 403, on the
+    /// same footing as an upstream outside its grant, because it is the same kind of answer: the
+    /// request was understood and refused. Reporting that as 502 would tell a fork PR's author their
+    /// build hit an infrastructure problem, and would tell an operator to go looking for one.
     fn from(c: CredentialError) -> Self {
-        Denied::new(StatusCode::BAD_GATEWAY, c.to_string())
+        let status =
+            if c.is_policy_refusal() { StatusCode::FORBIDDEN } else { StatusCode::BAD_GATEWAY };
+        Denied::new(status, c.to_string())
     }
 }
 
@@ -385,7 +419,10 @@ async fn forward(
     let mut redirects = 0u8;
 
     loop {
-        let injected = inject(upstream, &grant.tenant, state.credentials.as_ref())?;
+        // The credential is derived from the *authenticated grant*, never from anything in the
+        // request: the grant's tenant and job were fixed when control minted it, and the credential
+        // source refuses a lookup whose job it was not told about (D§7.4, [`crate::brokered`]).
+        let injected = inject(upstream, grant, state.credentials.as_ref())?;
         let authenticated = injected.is_some();
         let response = send(state, method, &url, headers, injected.as_ref()).await?;
         let status = response.status().as_u16();
