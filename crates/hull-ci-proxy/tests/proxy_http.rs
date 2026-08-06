@@ -300,6 +300,51 @@ async fn a_grant_cannot_reach_an_allowlisted_upstream_it_was_not_minted_for() {
 }
 
 #[tokio::test]
+async fn a_job_cannot_enumerate_the_deployment_allowlist_from_the_refusals_it_gets_back() {
+    // The status codes were always identical (`Denied::from(DenyReason)` says why). The *bodies*
+    // were not, and a body is just as readable from inside a sandbox: send `/j/<g>/u/<label>/x` for
+    // every label a job can think of, and "no upstream named `x`" versus "not in this job's grant"
+    // sorts them into "does not exist" and "exists, not yours". That recovers the deployment's
+    // private registry topology — the internal mirror labels, and which of them this tenant is
+    // scoped to — from a sandbox with no other egress at all. Both doors are checked, because
+    // closing only the mirror one moves the oracle to absolute-form rather than shutting it.
+    let h = harness(RateLimit::default()).await;
+    let (token, _) =
+        h.grants.mint("acme", "job-1", upstreams(&["private"]), far_future(), RateLimit::default());
+
+    let exists = client().get(h.url(token.expose(), "public", "pkg")).send().await.unwrap();
+    let absent = client().get(h.url(token.expose(), "pypi", "pkg")).send().await.unwrap();
+    assert_eq!(exists.status(), 403);
+    assert_eq!(absent.status(), 403);
+    let exists_body = exists.text().await.unwrap();
+    let absent_body = absent.text().await.unwrap();
+    assert_eq!(exists_body, absent_body, "the two refusals must be the same bytes");
+    assert!(!exists_body.contains("public"), "{exists_body}");
+    assert!(!absent_body.contains("pypi"), "{absent_body}");
+
+    // Absolute-form: a host nobody allowlisted must answer the same way, or the oracle just moves.
+    let proxied = reqwest::Client::builder()
+        .proxy(
+            reqwest::Proxy::http(&h.proxy_base)
+                .unwrap()
+                .custom_http_auth(format!("Bearer {}", token.expose()).parse().unwrap()),
+        )
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap();
+    let off_list = proxied.get("http://not-allowlisted.example.test/pkg").send().await.unwrap();
+    assert_eq!(off_list.status(), 403);
+    assert_eq!(off_list.text().await.unwrap(), exists_body);
+
+    // The operator keeps every distinction the job lost.
+    let reasons: Vec<String> = h.audit.refusals().iter().map(|r| r.reason.clone()).collect();
+    assert!(reasons.iter().any(|r| r.contains("not in this job's grant")), "{reasons:?}");
+    assert!(reasons.iter().any(|r| r.contains("no upstream named `pypi`")), "{reasons:?}");
+    assert!(reasons.iter().any(|r| r.contains("not-allowlisted.example.test")), "{reasons:?}");
+    assert!(h.seen.lock().unwrap().paths.is_empty(), "nothing reached an upstream");
+}
+
+#[tokio::test]
 async fn a_forged_or_expired_grant_buys_nothing() {
     let h = harness(RateLimit::default()).await;
     for bad in ["hpkg_deadbeef.cafe", "nonsense", ""] {

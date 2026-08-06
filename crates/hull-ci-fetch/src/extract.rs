@@ -234,8 +234,9 @@ impl State<'_> {
             return Ok(());
         }
 
-        // Display form of the raw path, for errors only. Never trusted, never used to build a path.
-        let display = String::from_utf8_lossy(&entry.path_bytes()).into_owned();
+        // Display form of the raw path, for errors only. Never trusted, never used to build a path,
+        // and **bounded** — see `display_path`.
+        let display = display_path(&entry.path_bytes());
 
         if self.out.files + self.out.dirs + self.out.symlinks >= self.limits.max_entries {
             return Err(ExtractError::TooManyEntries { limit: self.limits.max_entries });
@@ -443,6 +444,31 @@ impl State<'_> {
         self.symlinks.insert(rel.to_path_buf());
         Ok(())
     }
+}
+
+/// How much of an entry's raw path an error message may quote.
+///
+/// Comfortably above [`Limits::max_name_bytes`], so every path a conforming archive can hold is
+/// shown whole and only a path we were always going to refuse is ever elided.
+const MAX_DISPLAY_BYTES: usize = 512;
+
+/// The raw path of an entry, rendered for an error message and nothing else — **length-capped**.
+///
+/// The cap is not cosmetic. A tar path is not limited to the 100-byte header field: a GNU
+/// `././@LongLink` entry or a PAX `path=` record carries a name of whatever length the archive
+/// declares, and `tar` materializes the whole thing before we are handed the entry. Quoting it
+/// verbatim then multiplied it — the lossy conversion, the `Rejected { path }` copy, and the
+/// `Display` render are three more copies of the same bytes — so a 512 MiB name in a single-entry
+/// archive cost gigabytes of the broker's memory *while being rejected* for having a name over
+/// [`Limits::max_name_bytes`]. The rejection is still the right answer; paying a gigabyte to phrase
+/// it is not.
+fn display_path(raw: &[u8]) -> String {
+    let cut = raw.len().min(MAX_DISPLAY_BYTES);
+    let mut out = String::from_utf8_lossy(&raw[..cut]).into_owned();
+    if raw.len() > cut {
+        out.push('…');
+    }
+    out
 }
 
 #[cfg(unix)]
@@ -668,6 +694,45 @@ mod tests {
             Err(ExtractError::Rejected { reason: Rejection::TooDeep { limit: 4 }, .. }) => {}
             other => panic!("expected TooDeep, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn a_giant_entry_name_is_not_quoted_back_at_full_length() {
+        // A GNU `././@LongLink` header (or a PAX `path=` record) carries a name of any declared
+        // length, and `tar` has it in memory before our `max_name_bytes` check exists. Quoting it
+        // whole into the error, then copying that into `Rejected { path }`, then rendering it, made
+        // one hostile entry cost several times its own size in broker memory.
+        let huge = vec![b'A'; 4 * 1024 * 1024];
+        let mut bytes = Vec::new();
+        let mut long = tar::Header::new_gnu();
+        long.set_size(huge.len() as u64 + 1);
+        long.set_entry_type(EntryType::GNULongName);
+        long.set_cksum();
+        {
+            let mut b = tar::Builder::new(&mut bytes);
+            let mut with_nul = huge.clone();
+            with_nul.push(0);
+            b.append(&long, &with_nul[..]).unwrap();
+            let mut h = tar::Header::new_gnu();
+            h.set_size(1);
+            h.set_mode(0o644);
+            h.set_entry_type(EntryType::Regular);
+            h.set_path("placeholder").unwrap();
+            h.set_cksum();
+            b.append(&h, &b"x"[..]).unwrap();
+            b.finish().unwrap();
+        }
+
+        let dir = TempDir::new().unwrap();
+        let err = extract_into(&bytes[..], dir.path(), &Limits::default())
+            .expect_err("a 4 MiB entry name is over max_name_bytes and must be refused");
+        let rendered = err.to_string();
+        assert!(
+            rendered.len() < 4 * 1024,
+            "the error quoted {} bytes of an attacker-chosen name",
+            rendered.len()
+        );
+        assert!(rendered.contains('…'), "and it says it elided something: {rendered}");
     }
 
     #[test]

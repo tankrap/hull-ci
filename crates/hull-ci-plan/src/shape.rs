@@ -68,6 +68,18 @@ pub struct Shape {
     /// The deepest leading indentation, in columns. A cheap over-estimate of block nesting: each
     /// nested suite costs at least one column, so columns bound depth.
     pub indent_columns: usize,
+    /// The longest run of `elif` branches at one indentation level.
+    ///
+    /// **The fourth way to build a deep AST, and the one the other three cannot see.** An `elif`
+    /// chain nests the parser's recursion once per branch while adding no brackets, no indentation
+    /// and no single large statement — so `code_nesting`, `indent_columns` and `statement_weight` all
+    /// read flat at any depth. Found by audit: at a 1 MiB stack, fifty branches in 559 bytes aborted
+    /// the process, and even at the default stack the only thing bounding it was `max_source_bytes`,
+    /// a knob that reads as unrelated to stack safety.
+    ///
+    /// Counted per indentation column so that separate `if`/`elif` ladders elsewhere in the file do
+    /// not add together — it is the depth of one chain that costs stack, not the total in the file.
+    pub block_chain: usize,
 }
 
 /// Measure a pipeline file. Never fails: an unterminated string or an unbalanced bracket is the
@@ -99,7 +111,9 @@ fn raw_nesting(bytes: &[u8]) -> usize {
 
 fn scan(bytes: &[u8]) -> Shape {
     let mut shape =
-        Shape { code_nesting: 0, raw_nesting: 0, statement_weight: 0, indent_columns: 0 };
+        Shape { code_nesting: 0, raw_nesting: 0, statement_weight: 0, indent_columns: 0, block_chain: 0 };
+    // Longest `elif` run seen at each indentation column, and the run currently open there.
+    let mut chain_at: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
     let mut depth: usize = 0;
     let mut weight: usize = 0;
     let mut at_line_start = true;
@@ -119,6 +133,19 @@ fn scan(bytes: &[u8]) -> Shape {
         // record, hence the `\n` exclusion.
         if at_line_start && b != b'\n' {
             shape.indent_columns = shape.indent_columns.max(indent);
+            // A keyword at column `indent` either extends the chain open there or starts a new one.
+            // Anything else at that column ends it: the ladder is over.
+            let rest = &bytes[i..];
+            let entry = chain_at.entry(indent).or_insert(0);
+            if rest.starts_with(b"elif") {
+                *entry += 1;
+                shape.block_chain = shape.block_chain.max(*entry);
+            } else if rest.starts_with(b"if ") || rest.starts_with(b"if(") {
+                *entry = 1;
+                shape.block_chain = shape.block_chain.max(*entry);
+            } else if !rest.starts_with(b"else") {
+                *entry = 0;
+            }
             at_line_start = false;
         }
 

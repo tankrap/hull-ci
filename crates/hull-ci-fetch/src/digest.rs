@@ -259,7 +259,28 @@ pub enum GlobError {
     /// escaped the tree root would key it against paths that are not in the tree at all.
     #[error("`{0}` is not a valid inputs glob: it must be a relative path with no `.` or `..` segments")]
     Malformed(String),
+    /// Too many `**` segments — see [`MAX_GLOBSTARS`]. The glob itself is not quoted back: it is
+    /// author text, and the point of this variant is that the glob was too big to handle.
+    #[error("an inputs glob may hold at most {limit} `**` segments")]
+    TooManyGlobstars { limit: usize },
 }
+
+/// The most `**` segments one `inputs` glob may hold.
+///
+/// **This is a complexity bound, not a style rule.** `**` matches zero *or more* segments, so
+/// [`collect`] explores every way of splitting the tree's depth across the pattern's globstars: with
+/// `k` of them over a tree `d` deep, the number of routes is `C(k + d, d)` and nothing memoizes the
+/// `(pattern index, node)` pairs. Measured on a 12-deep tree, `**/…/f.rs` costs 5 ms at `k = 4`,
+/// 0.4 s at `k = 8`, and 25 s and a gigabyte of `matched` at `k = 14` — and both halves of that
+/// input are attacker-chosen: the glob comes from `.hull/ci.star` and the depth from the tar. A
+/// pipeline could name a glob (`hull_ci_plan` allows 1 024 characters, so ~340 globstars) that no
+/// amount of waiting resolves.
+///
+/// Four is well past what a glob means: consecutive globstars are redundant (`**/**/x` selects
+/// exactly what `**/x` does) and separated ones are how a real pattern spends them
+/// (`**/tests/**/*.rs` uses two). Refused rather than collapsed, because this module refuses rather
+/// than repairs — see [`GlobError::Malformed`].
+pub const MAX_GLOBSTARS: usize = 4;
 
 /// What kind of resolution a glob needs — the D§6.1 distinction, made explicit.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -302,6 +323,10 @@ impl Shape {
         }
         if segments.is_empty() {
             return Err(bad());
+        }
+        // Before anything walks anything: the cost of a pattern is exponential in this count.
+        if segments.iter().filter(|s| s.as_str() == "**").count() > MAX_GLOBSTARS {
+            return Err(GlobError::TooManyGlobstars { limit: MAX_GLOBSTARS });
         }
 
         let wild = |s: &String| s.contains('*') || s.contains('?');
@@ -615,6 +640,37 @@ mod tests {
         assert_eq!(Shape::parse("**").unwrap(), Shape::Prefix(vec![]));
         assert!(matches!(Shape::parse("**/*.rs").unwrap(), Shape::Pattern(_)));
         assert!(matches!(Shape::parse("crates/*/src/**").unwrap(), Shape::Pattern(_)));
+    }
+
+    #[test]
+    fn a_glob_cannot_make_the_walk_exponential() {
+        // `**` matches zero-or-more segments, so each one multiplies the number of routes through
+        // the tree. Both inputs are attacker-chosen — the glob from `.hull/ci.star`, the depth from
+        // the archive — and `hull_ci_plan` permits a 1 024-character glob, i.e. ~340 globstars.
+        // Unbounded, that is a planner thread and a gigabyte of `matched` that never come back.
+        let hostile = "**/".repeat(340) + "f.rs";
+        assert_eq!(
+            Shape::parse(&hostile),
+            Err(GlobError::TooManyGlobstars { limit: MAX_GLOBSTARS })
+        );
+        // The bound applies wherever the globstars sit, not just when they are adjacent.
+        let spread = (0..MAX_GLOBSTARS + 1).map(|i| format!("**/d{i}")).collect::<Vec<_>>().join("/");
+        assert!(matches!(Shape::parse(&spread), Err(GlobError::TooManyGlobstars { .. })));
+
+        // …and every shape a real pipeline writes still resolves, on a deep tree, quickly.
+        let d = TempDir::new().unwrap();
+        let mut p = d.path().to_path_buf();
+        for i in 0..60 {
+            p = p.join(format!("d{i}"));
+            fs::create_dir(&p).unwrap();
+            fs::write(p.join("lib.rs"), b"x").unwrap();
+        }
+        let idx = index(&d);
+        for glob in ["crates/**", "**/*.rs", "**/tests/**/*.rs", "**/**/**/**/lib.rs"] {
+            let started = std::time::Instant::now();
+            idx.subtree_digest(glob).unwrap_or_else(|e| panic!("{glob} rejected: {e}"));
+            assert!(started.elapsed().as_secs() < 5, "{glob} took {:?}", started.elapsed());
+        }
     }
 
     #[test]

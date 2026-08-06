@@ -196,7 +196,10 @@ pub struct MemoPolicy {
     /// failure is the thing an author is actively trying to change, and because a flaky failure
     /// should cost minutes of wrongness, not days.
     pub failed_ttl: Duration,
-    /// Hard ceiling on entries. Oldest-first eviction; every eviction costs a re-run and can never
+    /// Hard ceiling on entries across every tenant. Eviction takes from the tenant holding the
+    /// **most** entries (oldest of that tenant first), never simply the oldest in the store: the
+    /// capacity is a shared surface, and plain oldest-first lets one tenant's writes evict a
+    /// neighbour's whole cache (D§1, noisy-neighbour). Every eviction costs a re-run and can never
     /// cause a wrong answer.
     pub capacity: usize,
 }
@@ -280,8 +283,8 @@ impl StepMemo for InMemoryStepMemo {
         let seq = self.next_seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let mut entries = self.lock();
         if entries.len() >= self.policy.capacity {
-            if let Some(oldest) = entries.iter().min_by_key(|(_, e)| e.seq).map(|(k, _)| k.clone()) {
-                entries.remove(&oldest);
+            if let Some(victim) = evictee(&entries, tenant) {
+                entries.remove(&victim);
             }
         }
         entries.insert(
@@ -289,6 +292,48 @@ impl StepMemo for InMemoryStepMemo {
             Entry { outcome, expires_at: now + ttl, seq },
         );
     }
+}
+
+/// Which entry to drop to make room for a write by `recording`.
+///
+/// **Not the oldest entry in the store.** The capacity is the one part of this memo that every
+/// tenant shares, and oldest-first eviction turns it into a cross-tenant channel in both directions
+/// of D§1's threat table: a tenant that writes `capacity` entries evicts every neighbour's cache
+/// (noisy neighbour — the neighbour then re-runs work it had already paid for), and a tenant that
+/// fills the store and re-reads its own keys can *count* its neighbours' writes by watching how many
+/// of its own survive (existence oracle).
+///
+/// So the largest holder pays. Ties go to the tenant doing the writing, which is what makes a
+/// flooding tenant evict itself rather than anyone else; the remaining tie-break is the tenant name,
+/// so the choice is deterministic and testable. This is max-min fairness over a fixed store: a
+/// tenant with fewer entries than the flooder can never be the one evicted, so no volume of writes
+/// by one tenant can displace a smaller neighbour.
+///
+/// It does **not** make the shared capacity signal-free — a tenant holding the largest share still
+/// sees its own entries go when it is the one over quota. Removing that last bit needs a per-tenant
+/// partition of the store, which is a storage-layout decision rather than an eviction one.
+fn evictee(
+    entries: &HashMap<(String, StepKey), Entry>,
+    recording: &str,
+) -> Option<(String, StepKey)> {
+    let mut held: HashMap<&str, usize> = HashMap::new();
+    for (tenant, _) in entries.keys() {
+        *held.entry(tenant.as_str()).or_default() += 1;
+    }
+    // Most entries first; a tie is won by the writer, then by name.
+    let fullest = held
+        .into_iter()
+        .max_by(|(a_name, a), (b_name, b)| {
+            a.cmp(b)
+                .then_with(|| (*a_name == recording).cmp(&(*b_name == recording)))
+                .then_with(|| b_name.cmp(a_name))
+        })
+        .map(|(name, _)| name.to_string())?;
+    entries
+        .iter()
+        .filter(|((tenant, _), _)| *tenant == fullest)
+        .min_by_key(|(_, e)| e.seq)
+        .map(|(k, _)| k.clone())
 }
 
 // ── Configuration ────────────────────────────────────────────────────────────────────────────────
@@ -932,6 +977,46 @@ mod tests {
         assert_eq!(memo.lookup("other", &k("same-key"), now), None, "no cross-tenant read");
         assert_eq!(memo.lookup("", &k("same-key"), now), None);
         assert_eq!(memo.lookup("acme ", &k("same-key"), now), None, "and no near-miss either");
+    }
+
+    #[test]
+    fn a_flooding_tenant_cannot_evict_a_neighbours_memo() {
+        // D§1's noisy-neighbour row, at the memo's one shared dimension: its capacity. With plain
+        // oldest-first eviction `attacker` wiped all 50 of `victim`'s entries — a tenant could
+        // silently delete a neighbour's whole cache and make it re-run (and re-pay for) work it had
+        // already done. The largest holder pays instead, so the flood evicts only itself.
+        let memo = InMemoryStepMemo::new(MemoPolicy { capacity: 100, ..MemoPolicy::default() });
+        let now = Instant::now();
+        for i in 0..50 {
+            memo.record("victim", &k(&format!("v{i}")), MemoOutcome::Passed, now);
+        }
+        for i in 0..5_000 {
+            memo.record("attacker", &k(&format!("a{i}")), MemoOutcome::Passed, now);
+        }
+
+        let survivors =
+            (0..50).filter(|i| memo.lookup("victim", &k(&format!("v{i}")), now).is_some()).count();
+        assert_eq!(survivors, 50, "a neighbour's writes must not cost this tenant a single entry");
+        assert!(memo.len() <= 100, "and the store is still bounded: {}", memo.len());
+    }
+
+    #[test]
+    fn a_tenant_below_its_share_is_never_the_one_evicted() {
+        // The general form of the rule above, asserted against the *smaller* holder rather than a
+        // fixed count: whoever holds fewer entries cannot be displaced, however hard the other side
+        // writes. This is what stops the shared capacity from being a lever one tenant aims at
+        // another.
+        let memo = InMemoryStepMemo::new(MemoPolicy { capacity: 10, ..MemoPolicy::default() });
+        let now = Instant::now();
+        memo.record("small", &k("only"), MemoOutcome::Passed, now);
+        for i in 0..1_000 {
+            memo.record("big", &k(&format!("b{i}")), MemoOutcome::Passed, now);
+        }
+        assert_eq!(
+            memo.lookup("small", &k("only"), now),
+            Some(MemoOutcome::Passed),
+            "one entry belonging to a quiet tenant outlives a thousand from a loud one"
+        );
     }
 
     #[test]

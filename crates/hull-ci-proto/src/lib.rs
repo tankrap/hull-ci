@@ -209,9 +209,19 @@ pub fn sanitize_summary(raw: &str, max_chars: usize) -> String {
         }
         // Control characters (including newlines and NUL) collapse to a single space: a summary is
         // one line by definition, and embedded newlines are how output smuggles fake structure.
-        let c = if c.is_control() { ' ' } else { c };
-        // Bidi overrides and other invisible formatting can reorder displayed text misleadingly.
-        if matches!(c, '\u{200e}'..='\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}') {
+        //
+        // `char::is_control` is `General_Category=Cc` and **nothing else**, so it does not cover
+        // U+2028 LINE SEPARATOR (Zl) or U+2029 PARAGRAPH SEPARATOR (Zp). Those are unconditional
+        // forced line breaks in CSS — they break a line even under `white-space: normal` — so a job
+        // that printed one put a second *visible* line into a field this function promises is one
+        // line, and could render a forged `SECURITY SCAN: clean` under a real summary in the
+        // operator panel. They collapse to a space with the rest.
+        let c = if c.is_control() || matches!(c, '\u{2028}' | '\u{2029}') { ' ' } else { c };
+        // Invisible formatting: bidi controls that reorder displayed text, and zero-width characters
+        // that hide or pad it. Enumerated rather than sampled — the previous three ranges missed
+        // U+061C ARABIC LETTER MARK (a bidi control), every zero-width joiner/space, the BOM, and
+        // the Unicode tag block, all of which are invisible in every renderer a summary reaches.
+        if is_invisible_formatting(c) {
             continue;
         }
         if c == ' ' {
@@ -228,6 +238,42 @@ pub fn sanitize_summary(raw: &str, max_chars: usize) -> String {
         out.push(c);
     }
     out.trim().to_string()
+}
+
+/// Characters that occupy no width but change how the text around them reads.
+///
+/// Two families, one rule. **Bidi controls** (U+061C, the LRM/RLM pair, the embedding/override set,
+/// the isolate set) reorder the glyphs on either side of them, so `0 failed` can be made to read as
+/// something else without a single visible character changing. **Zero-width formatting** (the
+/// joiners, the word joiner, the BOM, soft hyphen, the interlinear-annotation and Unicode tag
+/// blocks) is invisible padding: it splits a word a reader scans for, and the tag block in
+/// particular is a whole hidden side-channel that survives copy-paste.
+///
+/// Written as an explicit table because this crate has no Unicode-property dependency and should not
+/// grow one for a one-line label. It is the `General_Category=Cf` set plus U+180E, which is the list
+/// every renderer treats as zero-width. What it deliberately does **not** try to do is defeat
+/// *homoglyphs* (Cyrillic `р` for Latin `p`) or stacked combining marks: those need a confusables
+/// table and a normalization pass, they are a property of the font more than of the string, and
+/// pretending a one-line sanitizer handles them would be the more dangerous claim.
+fn is_invisible_formatting(c: char) -> bool {
+    matches!(
+        c,
+        '\u{00ad}'                  // SOFT HYPHEN
+        | '\u{061c}'                // ARABIC LETTER MARK — a bidi control the old ranges missed
+        | '\u{180e}'                // MONGOLIAN VOWEL SEPARATOR
+        | '\u{200b}'..='\u{200f}'   // ZWSP, ZWNJ, ZWJ, LRM, RLM
+        | '\u{202a}'..='\u{202e}'   // bidi embedding and override
+        | '\u{2060}'..='\u{2064}'   // word joiner and the invisible operators
+        | '\u{2066}'..='\u{206f}'   // bidi isolates and the deprecated formatting set
+        | '\u{feff}'                // BOM / zero-width no-break space
+        | '\u{fff9}'..='\u{fffb}'   // interlinear annotation
+        | '\u{110bd}' | '\u{110cd}' // Kaithi number signs
+        | '\u{13430}'..='\u{1343f}' // Egyptian hieroglyph format controls
+        | '\u{1bca0}'..='\u{1bca3}' // shorthand format controls
+        | '\u{1d173}'..='\u{1d17a}' // musical format controls
+        | '\u{e0001}'               // deprecated language tag
+        | '\u{e0020}'..='\u{e007f}' // tag characters — an invisible channel that survives copy-paste
+    )
 }
 
 /// The default cap for a summary line (design D§6.6).
@@ -485,6 +531,35 @@ mod tests {
         assert!(!clean.contains('\u{0}'));
         assert!(!clean.contains('\u{202e}'), "bidi override can misrepresent the text");
         assert_eq!(clean, "ok RED line2 reversed");
+    }
+
+    #[test]
+    fn a_summary_really_is_one_line() {
+        // U+2028/U+2029 are `Zl`/`Zp`, not `Cc`, so `char::is_control` says nothing about them —
+        // and CSS makes them *unconditional* forced line breaks. A job that printed one got a second
+        // visible line in the operator panel's verdict cell, under a summary the panel labels as
+        // one line: exactly the "forge additional structure" §14.5 forbids.
+        let forged = "3 tests, 0 failed\u{2028}\u{2028}SECURITY SCAN: clean";
+        let clean = sanitize_summary(forged, SUMMARY_MAX_CHARS);
+        assert!(!clean.contains('\u{2028}'), "a line separator is a line break: {clean:?}");
+        assert!(!clean.contains('\u{2029}'));
+        assert_eq!(clean, "3 tests, 0 failed SECURITY SCAN: clean");
+    }
+
+    #[test]
+    fn invisible_formatting_does_not_survive() {
+        // Every one of these is zero-width or a bidi control, so none of them can be seen in the
+        // label the summary becomes — which is what makes them useful for hiding or reordering text.
+        for hidden in [
+            '\u{00ad}', '\u{061c}', '\u{180e}', '\u{200b}', '\u{200c}', '\u{200d}', '\u{200e}',
+            '\u{200f}', '\u{202a}', '\u{202e}', '\u{2060}', '\u{2066}', '\u{2069}', '\u{feff}',
+            '\u{e0041}',
+        ] {
+            let clean = sanitize_summary(&format!("0{hidden} failed"), SUMMARY_MAX_CHARS);
+            assert_eq!(clean, "0 failed", "U+{:04X} survived", hidden as u32);
+        }
+        // …and ordinary text is untouched, including non-ASCII a real summary may legitimately hold.
+        assert_eq!(sanitize_summary("café — 3 ok ✓", SUMMARY_MAX_CHARS), "café — 3 ok ✓");
     }
 
     #[test]

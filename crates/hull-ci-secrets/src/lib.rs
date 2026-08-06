@@ -220,8 +220,30 @@ impl Clock for SystemClock {
     }
 }
 
-/// Names the job environment owns (hull-ci-node `env::base_env`). A tenant secret may not shadow one.
-const RESERVED_NAMES: &[&str] = &["PATH", "HOME", "LANG", "CI", "TMPDIR", "IFS", "LD_PRELOAD", "LD_LIBRARY_PATH"];
+/// Names the job environment owns (hull-ci-node `env::base_env`), plus the dynamic loader's.
+///
+/// The loader family is here for a different reason from the `base_env` names and the whole family
+/// has to be present or none of it is doing anything: `LD_PRELOAD` and `LD_AUDIT` are two spellings
+/// of "run this code before `main`", and `DYLD_INSERT_LIBRARIES` is the same instruction on macOS.
+/// Reserving one and not its siblings reserves nothing.
+///
+/// A denylist is the wrong shape for this and it is worth saying so where the list is: the real
+/// property wanted is "a tenant secret may not be a variable the runtime already assigns meaning to",
+/// and no finite list of names delivers that across every interpreter a job might run. What this list
+/// buys is the loader — the one case where the injected value executes before the step does.
+const RESERVED_NAMES: &[&str] = &[
+    "PATH",
+    "HOME",
+    "LANG",
+    "CI",
+    "TMPDIR",
+    "IFS",
+    "LD_PRELOAD",
+    "LD_AUDIT",
+    "LD_LIBRARY_PATH",
+    "DYLD_INSERT_LIBRARIES",
+    "DYLD_LIBRARY_PATH",
+];
 
 /// Validate a secret name at the door, both when storing and when declaring.
 ///
@@ -280,6 +302,19 @@ mod tests {
         // A secret named PATH would rewrite the job's toolchain lookup from inside the delivery path.
         for name in ["PATH", "HOME", "LD_PRELOAD"] {
             assert!(matches!(validate_name(name), Err(SecretError::ReservedName(_))), "{name}");
+        }
+    }
+
+    #[test]
+    fn every_loader_preload_variable_is_reserved_not_just_ld_preload() {
+        // `LD_AUDIT` loads a shared object before `main` exactly as `LD_PRELOAD` does, and
+        // `DYLD_INSERT_LIBRARIES` is the macOS spelling. Reserving one of a family and not the rest
+        // reserves nothing: the value still executes before the step it was delivered to.
+        for name in ["LD_AUDIT", "DYLD_INSERT_LIBRARIES", "DYLD_LIBRARY_PATH"] {
+            assert!(
+                matches!(validate_name(name), Err(SecretError::ReservedName(_))),
+                "{name} must be reserved for the same reason LD_PRELOAD is"
+            );
         }
     }
 

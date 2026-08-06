@@ -773,3 +773,43 @@ fn continue_on_error_round_trips() {
     assert!(p.steps[0].continue_on_error);
     assert!(!evaluate(r#"step("s", run = "x")"#).unwrap().steps[0].continue_on_error);
 }
+
+
+/// The fourth route to a deep AST, found by security audit: an `elif` chain nests the parser's
+/// recursion once per branch while adding no brackets, no indentation and no single large statement.
+/// Every other shape measure reads flat at any depth, so before this bound the only thing between a
+/// pipeline and a `SIGABRT` was `max_source_bytes` — a knob that reads as unrelated to stack safety,
+/// and which left a margin of about 1.5× rather than the ~4× the measured shapes are sized for.
+#[test]
+fn an_elif_chain_is_bounded_like_every_other_route_to_a_deep_ast() {
+    let limits = hull_ci_plan::Limits::default();
+
+    // A ladder past the bound is refused, and refused by *name* — the author is told which rule.
+    let long = (0..limits.max_block_chain + 50)
+        .map(|i| format!("elif x == {i}:\n    pass\n"))
+        .collect::<String>();
+    let src = format!("x = 1\nif x == -1:\n    pass\n{long}else:\n    pass\n");
+    let err = hull_ci_plan::evaluate(&src).expect_err("a chain past the bound must be refused");
+    let msg = err.to_string();
+    assert!(msg.contains("conditional chain"), "the rule should name itself: {msg}");
+
+    // And an ordinary ladder still evaluates — a bound that refuses real pipelines is not a bound,
+    // it is an outage.
+    let ok = "\n".to_string()
+        + &(0..20).map(|i| format!("if False:\n    pass\nelif {i} == -1:\n    pass\n")).collect::<String>()
+        + "step(\"build\", run = \"true\", inputs = [\"src/**\"])\n";
+    let p = hull_ci_plan::evaluate(&ok).expect("twenty separate short ladders are ordinary");
+    assert_eq!(p.steps.len(), 1);
+}
+
+/// Separate ladders must not add together: it is the depth of *one* chain that costs stack, and a
+/// file of many short `if`/`elif` pairs is a normal pipeline, not an attack.
+#[test]
+fn separate_conditional_chains_are_not_summed() {
+    let src = (0..300)
+        .map(|i| format!("if {i} == -1:\n    pass\nelif {i} == -2:\n    pass\n"))
+        .collect::<String>()
+        + "step(\"b\", run = \"true\", inputs = [\"src/**\"])\n";
+    let p = hull_ci_plan::evaluate(&src).expect("300 two-branch ladders are not one 600-branch chain");
+    assert_eq!(p.steps.len(), 1);
+}

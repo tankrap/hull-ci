@@ -283,18 +283,52 @@ fn bearer(headers: &HeaderMap) -> Option<GrantToken> {
 }
 
 /// Everything a refusal needs to become both a response and an audit record.
+///
+/// Two texts, not one, and the split is a control rather than tidiness. `reason` is the rule that
+/// fired and goes to the **audit sink**, which an operator reads. `public` is what goes back to the
+/// **job**, which is untrusted code, and for some refusals it has to say strictly less — see
+/// [`Denied::from`] for [`DenyReason`].
 struct Denied {
     status: StatusCode,
     reason: String,
+    public: String,
 }
 
 impl Denied {
+    /// A refusal whose rule is safe to hand back verbatim.
     fn new(status: StatusCode, reason: impl Into<String>) -> Self {
-        Denied { status, reason: reason.into() }
+        let reason = reason.into();
+        Denied { status, public: reason.clone(), reason }
+    }
+
+    /// A refusal that tells the audit more than it tells the job.
+    fn opaque(status: StatusCode, reason: impl Into<String>, public: impl Into<String>) -> Self {
+        Denied { status, reason: reason.into(), public: public.into() }
     }
 }
 
+/// What a job is told when it names an upstream it may not reach, for *any* of the reasons it may
+/// not reach it.
+///
+/// One string for three refusals, because the difference between them is exactly the thing the
+/// shared 403 exists to hide. See [`Denied::from`].
+const UPSTREAM_UNAVAILABLE: &str = "that upstream is not available to this job";
+
 impl From<DenyReason> for Denied {
+    /// The status was already chosen to be uninformative; the **body** has to be too.
+    ///
+    /// "No upstream named `x` is allowlisted", "upstream `x` is not in this job's grant" and "host
+    /// `h` is not allowlisted" are three different answers to one question a job should not get an
+    /// answer to: *does this deployment have an upstream here, and is it mine?* A job that can tell
+    /// them apart walks the label space one guess at a time and recovers the deployment's private
+    /// registry topology — the internal mirror labels, which vendors are behind them, which of them
+    /// its own tenant is scoped to — from a sandbox that has no other egress at all. Matching
+    /// statuses stop that only if the bytes match too, and before this they did not.
+    ///
+    /// Everything else keeps its text. `PathEscape` and `OriginEscape` quote the job's own input
+    /// back at it and reveal nothing it did not send, and `MethodNotAllowed` is a fact about the
+    /// proxy rather than about the allowlist. The precise rule still reaches [`Refusal::reason`]
+    /// either way, so an operator debugging a build loses nothing.
     fn from(d: DenyReason) -> Self {
         let status = match d {
             DenyReason::MethodNotAllowed(_) => StatusCode::METHOD_NOT_ALLOWED,
@@ -302,7 +336,14 @@ impl From<DenyReason> for Denied {
             // job cannot probe which upstreams exist by timing or status.
             _ => StatusCode::FORBIDDEN,
         };
-        Denied::new(status, d.to_string())
+        match d {
+            DenyReason::UnknownUpstream(_)
+            | DenyReason::NotGranted(_)
+            | DenyReason::HostNotAllowlisted(_) => {
+                Denied::opaque(status, d.to_string(), UPSTREAM_UNAVAILABLE)
+            }
+            other => Denied::new(status, other.to_string()),
+        }
     }
 }
 
@@ -350,7 +391,9 @@ async fn handle(
             reason: d.reason.clone(),
             status: d.status.as_u16(),
         });
-        text(d.status, &format!("hull-ci package proxy: {}\n", d.reason))
+        // `public`, never `reason`: the audit record above is the operator's copy, and this one goes
+        // to untrusted code.
+        text(d.status, &format!("hull-ci package proxy: {}\n", d.public))
     };
 
     // `CONNECT` first, and by name, because it is the request whose *refusal* is the design decision
@@ -697,6 +740,33 @@ mod tests {
         assert!(out.get("set-cookie").is_none());
         assert!(out.get("www-authenticate").is_none());
         assert_eq!(out.len(), 1, "rebuilt from the allowlist, not copied and pruned");
+    }
+
+    #[test]
+    fn the_refusal_body_does_not_leak_which_upstreams_exist_either() {
+        // Matching statuses are only half of it. Before this, a job could send `/j/<g>/u/<label>/x`
+        // for every label it could think of and read the deployment's allowlist straight out of the
+        // 403 bodies — "no upstream named `x`" for one that does not exist, "not in this job's
+        // grant" for one that does. The audit still records which was which.
+        let absent = Denied::from(DenyReason::UnknownUpstream("acme-internal-mirror".into()));
+        let present = Denied::from(DenyReason::NotGranted("acme-internal-mirror".into()));
+        let host = Denied::from(DenyReason::HostNotAllowlisted("art.internal.test".into()));
+
+        assert_eq!(absent.status, present.status);
+        assert_eq!(absent.public, present.public, "the job must not be able to tell these apart");
+        assert_eq!(host.public, present.public, "…including through the absolute-form door");
+        assert!(!absent.public.contains("acme-internal-mirror"));
+        assert!(!host.public.contains("art.internal.test"));
+
+        // The operator's copy keeps every distinction that was taken away from the job.
+        assert!(absent.reason.contains("no upstream named"));
+        assert!(present.reason.contains("not in this job's grant"));
+        assert!(host.reason.contains("art.internal.test"));
+
+        // A refusal about the job's own input is still quoted back: it reveals nothing it did not
+        // send, and a silent 403 there is just a broken pipeline nobody can debug.
+        let escape = Denied::from(DenyReason::PathEscape("../../etc/passwd".into()));
+        assert_eq!(escape.public, escape.reason);
     }
 
     #[test]

@@ -488,6 +488,9 @@ fn evaluate_on_this_stack(
     if shape.statement_weight > limits.max_statement_weight {
         return Err(PlanError::new(Bound::StatementSize { limit: limits.max_statement_weight }));
     }
+    if shape.block_chain > limits.max_block_chain {
+        return Err(PlanError::new(Bound::BlockChain { limit: limits.max_block_chain }));
+    }
     if shape.indent_columns > limits.max_indent_columns {
         return Err(PlanError::new(Bound::Indent { limit: limits.max_indent_columns }));
     }

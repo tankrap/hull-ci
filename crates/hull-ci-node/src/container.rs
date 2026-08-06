@@ -403,6 +403,7 @@ pub const PROBE_IMAGE: &str = "alpine:3";
 /// them anyway makes `nc` exit non-zero on the unrecognised option — which reads exactly like
 /// "unreachable" and would make every one of these probes silently vacuous.
 const POSTURE_SCRIPT: &str = r#"
+ip route >/dev/null 2>&1; echo "iprc=$?"
 echo "default_route=$(ip route 2>/dev/null | grep -c '^default')"
 timeout 3 nc 1.1.1.1 80 </dev/null >/dev/null 2>&1; echo "raw_ip=$?"
 timeout 3 nc 169.254.169.254 80 </dev/null >/dev/null 2>&1; echo "metadata=$?"
@@ -588,11 +589,27 @@ fn exclude_proxy_port(posture: &mut NetworkPosture, gateway: &str, proxy_host: &
 /// testable without a daemon.
 pub fn parse_posture(output: &str, mut posture: NetworkPosture, had_peer: bool) -> NetworkPosture {
     let mut done = false;
+    let mut ip_works = false;
+    // A tool the probe image does not have. Every reachability line here is "rc != 0 means
+    // unreachable", so a missing `nc`, `timeout` or `nslookup` — `127` from the shell — reads as the
+    // *strongest possible* posture: nothing was reachable because nothing was ever tried. The live
+    // tests pair each probe with an open-network control that would catch it, but those are
+    // `#[ignore]`d and run on a developer's machine; this runs on the node, against whatever
+    // `PROBE_IMAGE` resolved to there. So the rc that means "no such command" is refused here rather
+    // than believed.
+    let mut missing_tool: Option<(&str, &str)> = None;
     let mut saw: std::collections::BTreeSet<&str> = Default::default();
     for line in output.lines().map(str::trim) {
         let Some((key, value)) = line.split_once('=') else { continue };
         saw.insert(key);
+        if value == "127" {
+            missing_tool = Some((key, value));
+        }
         match key {
+            // `ip route` failing is not the same question as "is there a default route": the
+            // `default_route` line counts matching lines, so an absent `ip` yields `0`, which reads
+            // as the good answer. This is the rc that tells them apart.
+            "iprc" => ip_works = value == "0",
             "default_route" => posture.no_default_route = value == "0",
             // `0` means the connection was accepted. Anything else — refused (`1`), timed out
             // (`124`/`143`) — means it was not, which is what "unreachable" means here.
@@ -619,6 +636,17 @@ pub fn parse_posture(output: &str, mut posture: NetworkPosture, had_peer: bool) 
         // (`no_default_route: false` is safe, but `public_ip_unreachable: false` is too). Refusing
         // the whole thing is the only reading that cannot flatter.
         posture.failure = Some(format!("posture probe output was truncated: {output}"));
+    } else if let Some((key, rc)) = missing_tool {
+        posture.failure = Some(format!(
+            "posture probe step `{key}` exited {rc} (no such command in `{PROBE_IMAGE}`), so its \
+             `unreachable` answer is the absence of a tool rather than the absence of a route"
+        ));
+    } else if !ip_works {
+        posture.failure = Some(
+            "posture probe could not run `ip route`, so `no default route` would be the absence of \
+             a tool rather than a fact about the network"
+                .to_string(),
+        );
     }
     posture
 }
@@ -729,7 +757,12 @@ pub fn controls_for(probe: &DockerProbe, config: &ContainerConfig) -> EnforcedCo
         no_inbound: net.no_inbound,
 
         // §14.4 — flags we pass and the daemon applies
-        non_root: namespaced,
+        //
+        // `non_root` is the one that has to look at the *value*, not just at the flag: `--user` is
+        // always passed, but `--user 0:0` and `--user ""` both put the job at uid 0 (verified live —
+        // `id -u` answers `0` for both, and `65534` for the default). A flag that is present and
+        // means "root" is not the §14.4 control, so the claim follows the configured user.
+        non_root: namespaced && runs_as_non_root(&config.user),
         read_only_rootfs: namespaced,
         tmpfs_scratch: namespaced,
         caps_dropped: namespaced,
@@ -745,6 +778,38 @@ pub fn controls_for(probe: &DockerProbe, config: &ContainerConfig) -> EnforcedCo
         wall_clock_timeout: true,
         output_cap: true,
     }
+}
+
+/// Whether `--user <value>` actually lands the job somewhere other than uid 0 (§14.4).
+///
+/// The uid half is all that matters here: a supplementary gid does not make a root process
+/// unprivileged. An empty value means the flag carries nothing and the image's own `USER` decides,
+/// which for most base images is root — so it is not a control either.
+fn runs_as_non_root(user: &str) -> bool {
+    let uid = user.split(':').next().unwrap_or("").trim();
+    !uid.is_empty() && uid != "0" && uid != "root"
+}
+
+/// Resource ceilings the runtime would read as **no ceiling at all**, named for a refusal message.
+///
+/// `--memory 0`, `--pids-limit 0` and any `--cpus` that renders as `0.00` are all "unset" to the
+/// daemon — verified live: `docker create --cpus 0.00 --memory 0 --pids-limit 0` inspects to
+/// `NanoCpus=0 Memory=0 PidsLimit=<unset>`, i.e. an unbounded container. [`controls_for`] reports
+/// these three from what the daemon *can* enforce, which is a fact about the host and cannot see a
+/// per-job limit set to zero. So the two are kept consistent from the other end: a backend that
+/// claims the limit never runs a job without it.
+fn unlimited_resources(l: &crate::sandbox::ResourceLimits) -> Vec<&'static str> {
+    let mut out = Vec::new();
+    if format!("{:.2}", l.cpus) == "0.00" {
+        out.push("cpus");
+    }
+    if l.memory_bytes == 0 {
+        out.push("memory");
+    }
+    if l.pids == 0 {
+        out.push("pids");
+    }
+    out
 }
 
 /// The M1 container backend.
@@ -930,6 +995,26 @@ pub fn create_argv(
         // argv we were told to run.
         a.push("--entrypoint".into());
         a.push(argv[0].clone());
+
+        // `--` ends the runtime's flag parsing, and it is load-bearing rather than decorative.
+        //
+        // `spec.image` is a *pipeline-controlled* string (`image("rust:1.83")` in `.hull/ci.star`,
+        // validated only for length and control characters), and it lands in the first positional
+        // slot. Without a terminator the CLI parses flags right up to that slot, so an image of
+        // `--privileged` is not an image at all — it is a flag, and the next argv element becomes the
+        // image. Verified against docker 28.0.4:
+        //
+        //   docker create --entrypoint /bin/echo --privileged alpine:3
+        //     → HostConfig.Privileged = true, image = alpine:3
+        //   docker create --entrypoint /bin/echo -- --privileged alpine:3
+        //     → `invalid reference format`, i.e. read as an image name, which is what it is
+        //
+        // Today's two argv shapes (`/bin/sh -c <script>` from a pipeline, `cargo test` from
+        // autodetection) happen to strand the parser before it finds an image, so the injection is a
+        // create failure rather than a privileged container. That is an accident of the argv shape,
+        // not a control — one two-element argv anywhere upstream turns it back into a host takeover.
+        // The terminator makes the shape irrelevant.
+        a.push("--".into());
         a.push(spec.image.clone());
         a.extend(argv[1..].iter().cloned());
         a
@@ -978,6 +1063,17 @@ impl SandboxBackend for ContainerBackend {
                 return Err(SandboxError::Unavailable(format!(
                     "`{}` daemon is not reachable",
                     self.config.runtime
+                )));
+            }
+            // §14.4's cpu/memory/pid clauses, checked against the values rather than against the
+            // daemon's ability to apply them. `controls_for` says this backend enforces them; a job
+            // whose limits are all "unset" would make that a lie, so it does not run.
+            let unlimited = unlimited_resources(&spec.limits);
+            if !unlimited.is_empty() {
+                return Err(SandboxError::Runtime(format!(
+                    "refusing to run without the resource limits this backend reports as enforced \
+                     (§14.4): {} would be passed to the runtime as `no limit`",
+                    unlimited.join(", ")
                 )));
             }
             let name = format!("hull-ci-{}-{}", sanitize_name(&spec.job_id), short_id());
@@ -1382,6 +1478,7 @@ mod tests {
     #[test]
     fn probe_output_is_parsed_into_exactly_what_it_says() {
         let output = "\
+iprc=0
 default_route=0
 raw_ip=1
 metadata=124
@@ -1411,6 +1508,7 @@ probe_done=1
         // The control case: the same script run on an ordinary bridge. If this ever parsed as a
         // locked-down posture, every probe in this file would be decorative.
         let output = "\
+iprc=0
 default_route=1
 raw_ip=0
 metadata=0
@@ -1436,7 +1534,7 @@ probe_done=1
         // `public_ip_unreachable` that reads as "the internet was reachable" — but for
         // `no_default_route` it reads as "there was a default route". Half the defaults flatter and
         // half do not, so a probe that did not finish must be refused wholesale.
-        let p = parse_posture("default_route=0\nraw_ip=1\n", NetworkPosture::default(), true);
+        let p = parse_posture("iprc=0\ndefault_route=0\nraw_ip=1\n", NetworkPosture::default(), true);
         assert!(p.failure.is_some(), "no `probe_done` sentinel means no answer");
         assert!(!p.egress_denied());
     }
@@ -1445,7 +1543,7 @@ probe_done=1
     fn a_peer_that_never_started_does_not_become_evidence_of_isolation() {
         // If the peer container failed to start there is no peer, and "could not connect to nothing"
         // is not a demonstration that ICC is off.
-        let output = "default_route=0\nraw_ip=1\nmetadata=1\npublic_dns=1\nproxy=0\npeer=skip\nroute_add=1\nprobe_done=1\n";
+        let output = "iprc=0\ndefault_route=0\nraw_ip=1\nmetadata=1\npublic_dns=1\nproxy=0\npeer=skip\nroute_add=1\nprobe_done=1\n";
         let p = parse_posture(output, NetworkPosture { declared_internal: true, ..Default::default() }, false);
         assert!(!p.peer_unreachable, "no peer means no result, not a passing result");
         assert!(p.egress_denied(), "the egress facts are independent and still hold");
@@ -2219,6 +2317,134 @@ probe_done=1
             !out.contains(E2E_UPSTREAM_SECRET),
             "the upstream credential must never appear in a job's output (D§7.4): {out}"
         );
+    }
+
+    // ── the isolation audit's regressions ───────────────────────────────────────────────────────
+
+    #[test]
+    fn a_hostile_image_ref_cannot_become_a_runtime_flag() {
+        // The image is a *pipeline*-controlled string and it sits in the first positional slot, which
+        // is the slot the runtime CLI parses flags right up to. Verified against docker 28.0.4:
+        // `docker create --entrypoint /bin/echo --privileged alpine:3` creates a **privileged**
+        // container from `alpine:3`, because `--privileged` was read as a flag and the next element
+        // became the image. Putting `--` in front of the image is what stops the image from ever
+        // being read as anything else.
+        let t = tempfile::tempdir().unwrap();
+        let mut s = spec(t.path());
+        s.image = "--privileged".into();
+        let argv = create_argv(&ContainerConfig::default(), &s, "sbx", &["/bin/sh".into(), "-c".into(), "id".into()]);
+
+        let end = argv.iter().position(|a| a == "--").expect("the flag list must be terminated");
+        assert_eq!(argv[end + 1], "--privileged", "the image sits immediately after the terminator");
+        assert!(
+            !argv[..end].iter().any(|a| a == "--privileged"),
+            "nothing the pipeline wrote may appear where the CLI is still parsing flags: {argv:?}"
+        );
+        // And the ordinary case is unchanged: image, then the command's arguments.
+        let ok = create_argv(&ContainerConfig::default(), &spec(t.path()), "sbx", &["cargo".into(), "test".into()]);
+        let end = ok.iter().position(|a| a == "--").unwrap();
+        assert_eq!(&ok[end + 1..], &["hull-ci/base:1".to_string(), "test".to_string()]);
+    }
+
+    #[test]
+    fn a_root_user_is_not_reported_as_the_non_root_control() {
+        // `--user` is always passed, so the flag's presence proves nothing: `--user 0:0` and
+        // `--user ""` both run the job as uid 0 (verified live). The claim has to follow the value.
+        for user in ["0:0", "0", "root", ""] {
+            let config = ContainerConfig { user: user.into(), ..Default::default() };
+            let c = controls_for(&linux_probe(), &config);
+            assert!(!c.non_root, "`--user {user}` is uid 0, which is not §14.4's non-root control");
+            assert!(c.unmet_clauses().iter().any(|s| s.contains("non-root")));
+            // Everything else about the box is unaffected — only the claim that was untrue moves.
+            assert!(c.read_only_rootfs && c.caps_dropped && c.egress_deny);
+        }
+        assert!(controls_for(&linux_probe(), &ContainerConfig::default()).non_root);
+        assert!(runs_as_non_root("nobody") && runs_as_non_root("65534:65534"));
+    }
+
+    #[tokio::test]
+    async fn a_job_with_no_real_resource_ceiling_is_refused_rather_than_run_unbounded() {
+        // `--memory 0`, `--pids-limit 0` and a `--cpus` that renders `0.00` are "unset" to the daemon:
+        // `docker create --cpus 0.00 --memory 0 --pids-limit 0` inspects to `NanoCpus=0 Memory=0`
+        // and no PidsLimit at all. `controls_for` reads those three off the *daemon's* controllers, so
+        // it cannot see a zeroed per-job limit — which would leave the backend claiming a ceiling that
+        // no container ever got.
+        let t = tempfile::tempdir().unwrap();
+        let backend = ContainerBackend::from_probe(ContainerConfig::default(), linux_probe());
+        assert!(backend.controls().memory_limit && backend.controls().cpu_limit && backend.controls().pid_limit);
+
+        use crate::sandbox::ResourceLimits;
+        for limits in [
+            ResourceLimits { memory_bytes: 0, ..Default::default() },
+            ResourceLimits { pids: 0, ..Default::default() },
+            ResourceLimits { cpus: 0.0, ..Default::default() },
+            // Not zero, but rounds to `--cpus 0.00`, which the daemon reads identically.
+            ResourceLimits { cpus: 0.004, ..Default::default() },
+        ] {
+            let mut s = spec(t.path());
+            s.limits = limits;
+            match backend.spawn(&s).await {
+                Err(SandboxError::Runtime(why)) => assert!(why.contains("§14.4"), "{why}"),
+                Err(other) => panic!("wrong refusal: {other}"),
+                Ok(_) => panic!("a backend claiming cpu/memory/pid limits must not run a job without them"),
+            }
+        }
+    }
+
+    #[test]
+    fn a_probe_image_without_the_tools_proves_nothing_instead_of_everything() {
+        // The failure mode this crate has already been bitten by three times, in its purest form: a
+        // probe that cannot fail. Every reachability line reads "rc != 0 means unreachable", so an
+        // image whose `nc`/`timeout`/`nslookup` are missing answers `127` to all of them and parses
+        // as a perfectly locked-down network. The live tests pair each probe with an open-network
+        // control, but they are `#[ignore]`d — the node runs this parse against whatever `PROBE_IMAGE`
+        // resolved to on *its* host.
+        let no_tools = "\
+iprc=0
+default_route=0
+raw_ip=127
+metadata=127
+public_dns=127
+proxy=127
+peer=127
+route_add=127
+probe_done=1
+";
+        let p = parse_posture(no_tools, NetworkPosture { declared_internal: true, ..Default::default() }, true);
+        assert!(p.failure.is_some(), "127 is `no such command`, not `unreachable`");
+        assert!(!p.egress_denied(), "so nothing may be certified from it");
+        assert!(!p.metadata_blackholed());
+        let c = controls_for(&linux_probe(), &proxy_config(Some(p)));
+        assert!(!c.egress_deny && !c.metadata_blackhole && !c.no_inbound);
+
+        // The same trap one level down: `default_route` counts lines out of `ip route`, so an absent
+        // `ip` produces `0` — which reads as "no default route", the fact the whole posture rests on.
+        let no_ip = "\
+iprc=127
+default_route=0
+raw_ip=1
+metadata=1
+public_dns=1
+proxy=0
+peer=1
+route_add=1
+probe_done=1
+";
+        let p = parse_posture(no_ip, NetworkPosture { declared_internal: true, ..Default::default() }, true);
+        assert!(p.failure.is_some(), "an absent `ip` must not read as an absent route");
+        assert!(!p.egress_denied());
+
+        // A probe that never emitted the line at all (an older image, a changed script) is refused
+        // for the same reason.
+        let silent = "default_route=0\nraw_ip=1\nmetadata=1\npublic_dns=1\nproxy=0\npeer=1\nroute_add=1\nprobe_done=1\n";
+        assert!(parse_posture(silent, NetworkPosture { declared_internal: true, ..Default::default() }, true)
+            .failure
+            .is_some());
+
+        // …and a genuinely locked-down network still certifies: 1 and 124 are answers, 127 is not.
+        let real = "iprc=0\ndefault_route=0\nraw_ip=1\nmetadata=124\npublic_dns=1\nproxy=0\npeer=1\nroute_add=1\nprobe_done=1\n";
+        let p = parse_posture(real, NetworkPosture { declared_internal: true, ..Default::default() }, true);
+        assert!(p.failure.is_none() && p.egress_denied(), "{p:?}");
     }
 
     #[tokio::test]

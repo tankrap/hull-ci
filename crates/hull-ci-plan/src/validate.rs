@@ -138,15 +138,21 @@ pub fn check_action(uses: &str, registry: &[&str]) -> Result<(), Invalid> {
 /// gets killed by the wrong clock an hour later.
 pub fn parse_timeout(raw: &str) -> Result<Duration, Invalid> {
     let bad = || Invalid::TimeoutSyntax { got: raw.to_string() };
-    let (digits, unit) = raw.split_at(raw.len().checked_sub(1).ok_or_else(bad)?);
+    // Split on the last **character**, never the last byte. `raw` comes straight out of an untrusted
+    // `.hull/ci.star`, and `split_at(raw.len() - 1)` panics on any multi-byte final character —
+    // `timeout = "1€"` is a two-token file that takes down whatever thread parses it. The panic was
+    // contained by `eval::evaluate_with`'s join, but a contained panic still turns an author's typo
+    // into `Internal` ("our bug") and prints a host path to the log, so it is fixed at the source.
+    let unit = raw.chars().next_back().ok_or_else(bad)?;
+    let digits = &raw[..raw.len() - unit.len_utf8()];
     let n: u64 = digits.parse().map_err(|_| bad())?;
     if n == 0 {
         return Err(bad());
     }
     let secs = match unit {
-        "s" => n,
-        "m" => n.checked_mul(60).ok_or_else(bad)?,
-        "h" => n.checked_mul(3600).ok_or_else(bad)?,
+        's' => n,
+        'm' => n.checked_mul(60).ok_or_else(bad)?,
+        'h' => n.checked_mul(3600).ok_or_else(bad)?,
         _ => return Err(bad()),
     };
     if secs > MAX_TIMEOUT_HOURS * 3600 {
@@ -232,6 +238,21 @@ mod tests {
             assert!(parse_timeout(bad).is_err(), "{bad:?} must be refused");
         }
         assert!(matches!(parse_timeout("25h"), Err(Invalid::TimeoutTooLong { .. })));
+    }
+
+    #[test]
+    fn a_multibyte_timeout_is_refused_rather_than_panicking() {
+        // The whole string is attacker-chosen. Splitting on `raw.len() - 1` lands inside the final
+        // character whenever it is multi-byte, and `str::split_at` panics on a non-boundary index —
+        // so `timeout = "1€"` in a pipeline was a remote panic on the evaluation thread.
+        for hostile in ["1\u{20ac}", "\u{20ac}", "20\u{4e00}", "1\u{e9}", "\u{1f600}", "5\u{202e}"] {
+            assert!(
+                matches!(parse_timeout(hostile), Err(Invalid::TimeoutSyntax { .. })),
+                "{hostile:?} must be a syntax error, not a panic"
+            );
+        }
+        // …and a multi-byte character *before* the unit is still just a bad number, not a crash.
+        assert!(parse_timeout("2\u{20ac}0s").is_err());
     }
 
     #[test]

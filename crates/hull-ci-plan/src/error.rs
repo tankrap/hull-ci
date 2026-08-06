@@ -42,6 +42,8 @@ pub enum Bound {
     /// Indentation deeper than the parser is safe at.
     #[error("indented more than {limit} columns")]
     Indent { limit: usize },
+    #[error("a conditional chain is longer than the {limit}-branch limit")]
+    BlockChain { limit: usize },
     #[error("evaluation exceeded its work budget of {limit} operations")]
     Work { limit: u64 },
     #[error("evaluation exceeded its memory budget of {limit} bytes")]

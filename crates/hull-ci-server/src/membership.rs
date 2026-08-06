@@ -116,6 +116,24 @@ mod tests {
     }
 
     #[test]
+    fn a_repo_whose_tenant_half_is_empty_is_never_a_member() {
+        // `Dispatch::tenant()` splits on `/` and takes the first component, so a `repo` of
+        // `/widget` — or `//x`, or a bare `/` — yields the empty tenant. Nothing upstream rejects
+        // that: `Dispatch::validate` only checks that `repo` is non-blank. The empty string is then
+        // a perfectly ordinary key in the memo, the fair-share plan table and this set, which makes
+        // it a namespace two different dispatches could share. Whatever else it is, it must not be
+        // privileged, and `parse` drops empty names so it can never be in the trusted set.
+        let t = TrustedTenants::parse("acme, , globex");
+        for repo in ["/widget", "//x", "/", "/acme/widget"] {
+            assert_eq!(
+                t.classify(repo, "justin"),
+                AuthorClass::Outsider,
+                "{repo} classified above outsider on an empty tenant"
+            );
+        }
+    }
+
+    #[test]
     fn the_author_string_cannot_choose_its_own_class() {
         // Spec §5: `author` is display only. Two dispatches differing only in `author` must classify
         // identically, or whoever wrote the change picks their own privileges.

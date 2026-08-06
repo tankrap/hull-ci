@@ -79,6 +79,19 @@ const ROLLING_WINDOW: Duration = Duration::from_secs(3600);
 /// estimate should track a pipeline that just got slower, not average it away over a week.
 const COST_SAMPLES: usize = 16;
 
+/// How many distinct step names one tenant may hold cost history for.
+///
+/// The estimator is keyed `(tenant, step_name)` and a step name comes out of the tenant's own
+/// pipeline, so without a bound the map grows once per name the tenant has ever used and is never
+/// reclaimed — an unbounded, tenant-driven allocation inside the one process every *other* tenant's
+/// scheduling also runs in (D§1, noisy neighbour). Oldest name first when the bound is hit; losing
+/// an estimate costs one step the default cost and nothing else.
+///
+/// Comfortably above any real pipeline: `hull-ci-plan` caps a plan at far fewer steps than this, so
+/// a tenant reaches the bound only by cycling through names across many jobs, which is the case the
+/// bound exists for.
+const COST_KEYS_PER_TENANT: usize = 1024;
+
 /// Floor on a step's estimated cost, in seconds.
 ///
 /// A zero-cost step would advance its tenant's virtual clock by nothing, so the tenant could take
@@ -302,6 +315,12 @@ struct Waiting {
 struct Placement {
     name: String,
     since: Option<Instant>,
+    /// Node-seconds this step was *charged* at selection.
+    ///
+    /// Kept so completion can true the charge up against what the step actually took. Without it the
+    /// estimate is the whole story, and the estimate is derived from a name the tenant chooses — see
+    /// the true-up in [`FairQueue::unplace`].
+    charged: Option<f64>,
 }
 
 #[derive(Debug, Clone)]
@@ -337,6 +356,9 @@ pub struct FairQueue {
     /// p50 node-seconds per `(tenant, step_name)`. Tenant-scoped so it can never answer "has anyone
     /// else run this" (design D§6.1).
     costs: HashMap<(String, String), VecDeque<f64>>,
+    /// Step names each tenant holds history for, oldest first — the eviction order that keeps
+    /// [`FairQueue::costs`] bounded per tenant (see [`COST_KEYS_PER_TENANT`]).
+    cost_keys: HashMap<String, VecDeque<String>>,
 }
 
 impl FairQueue {
@@ -347,6 +369,7 @@ impl FairQueue {
             tenants: BTreeMap::new(),
             jobs: HashMap::new(),
             costs: HashMap::new(),
+            cost_keys: HashMap::new(),
         }
     }
 
@@ -381,7 +404,7 @@ impl FairQueue {
         if let Some(meta) = self.jobs.get_mut(job_id) {
             meta.steps.insert(
                 step_id.to_string(),
-                Placement { name: step_name.to_string(), since: None },
+                Placement { name: step_name.to_string(), since: None, charged: None },
             );
         }
         let waiting =
@@ -414,9 +437,29 @@ impl FairQueue {
         let Some(since) = placement.since else { return };
 
         let ran = at.saturating_duration_since(since);
+        let weight = self.cfg.plan(&tenant).safe_weight();
         if let Some(t) = self.tenants.get_mut(&tenant) {
             t.running.remove(&(job_id.to_string(), step_id.to_string()));
             t.ledger.push_back((at, ran));
+
+            // **True the charge up against what the step actually took.**
+            //
+            // The selection charge is an *estimate*, and the estimate is keyed on a step name the
+            // tenant writes in its own `.hull/ci.star`. Left alone, that lets a tenant set its own
+            // scheduler weight: run one trivial step called `test`, and every later step of that
+            // name is tagged at the trivial cost however long it really runs. Measured before this
+            // existed — an attacker at *equal* weight took 40 of 40 turns and the neighbour was
+            // served zero, which is the exact inverse of the guarantee WFQ is here to provide.
+            //
+            // Charging the difference at completion makes an under-declared cost buy exactly one
+            // turn instead of all of them: the lie is corrected the moment the truth is observable,
+            // and the tenant's virtual clock ends up where honest accounting would have put it.
+            // Over-declaring is refunded by the same arithmetic, so there is no incentive either way
+            // — which is the property that makes it safe to keep estimating at all.
+            if let Some(charged) = placement.charged {
+                let actual = ran.as_secs_f64();
+                t.vft_last += (actual - charged) / weight;
+            }
         }
         if learn {
             self.observe_cost(&tenant, &placement.name, ran);
@@ -507,6 +550,7 @@ impl FairQueue {
             let Some(waiting) = self.pop_head(&tenant) else { break };
 
             // The charge lands whether or not the fleet takes the step (see `requeue`).
+            let charged = (vft - start) * self.cfg.plan(&tenant).safe_weight();
             if let Some(t) = self.tenants.get_mut(&tenant) {
                 t.vft_last = vft;
                 t.running.insert((waiting.job_id.clone(), waiting.step_id.clone()), now);
@@ -519,6 +563,8 @@ impl FairQueue {
                 self.jobs.get_mut(&waiting.job_id).and_then(|m| m.steps.get_mut(&waiting.step_id))
             {
                 placement.since = Some(now);
+                // Remember the charge so completion can true it up (see `unplace`).
+                placement.charged = Some(charged);
             }
 
             grants.push(Grant { job_id: waiting.job_id, step_id: waiting.step_id, tenant });
@@ -627,7 +673,7 @@ impl FairQueue {
         let Some(meta) = self.jobs.get_mut(job_id) else { return };
         let tenant = meta.tenant.clone();
         meta.steps
-            .insert(step_id.to_string(), Placement { name: name.to_string(), since: Some(since) });
+            .insert(step_id.to_string(), Placement { name: name.to_string(), since: Some(since), charged: None });
         self.tenants
             .entry(tenant)
             .or_default()
@@ -669,7 +715,19 @@ impl FairQueue {
     }
 
     fn observe_cost(&mut self, tenant: &str, step_name: &str, ran: Duration) {
-        let samples = self.costs.entry((tenant.to_string(), step_name.to_string())).or_default();
+        let key = (tenant.to_string(), step_name.to_string());
+        if !self.costs.contains_key(&key) {
+            // A name this tenant has not been costed for before. Recording it is what grows the map,
+            // so it is where the per-tenant bound is applied — see `COST_KEYS_PER_TENANT`.
+            let names = self.cost_keys.entry(tenant.to_string()).or_default();
+            names.push_back(step_name.to_string());
+            while names.len() > COST_KEYS_PER_TENANT {
+                if let Some(evicted) = names.pop_front() {
+                    self.costs.remove(&(tenant.to_string(), evicted));
+                }
+            }
+        }
+        let samples = self.costs.entry(key).or_default();
         samples.push_back(ran.as_secs_f64());
         while samples.len() > COST_SAMPLES {
             samples.pop_front();
@@ -1126,6 +1184,73 @@ mod tests {
 
         q.forget_job("t", now + Duration::from_secs(30));
         assert_eq!(q.depth("t"), Depth { queued: 0, running: 0 }, "a settled job holds nothing");
+    }
+
+    /// **KNOWN GAP — ignored, and the assertion is the property we do not currently hold.**
+    ///
+    /// D§4.5 keys the WFQ cost estimate on `step_key`: a content address, covering argv, image,
+    /// inputs and the tree. This module keys it on the step's *name* — a free-text label chosen by
+    /// the tenant's own `.hull/ci.star` — and freezes the estimate into the queue entry at
+    /// `enqueue`. Those two facts together let a tenant declare its own cost.
+    ///
+    /// The attack is one cheap step: run anything trivial called `test` once, and every future step
+    /// named `test` is tagged at that cost no matter how long it really runs. Below, `attacker` pays
+    /// 1 ms per turn and `honest` pays the 60 s default, so at equal weight the attacker takes
+    /// **every** turn and the neighbour is served zero times — the exact inverse of "a backlogged
+    /// flow gets exactly its weighted share, no more", and a direct breach of D§1's ≤10% fairness
+    /// SLO.
+    ///
+    /// Fixing it is a design decision rather than a local repair, which is why this is recorded
+    /// rather than patched: either key the estimator on the memo's `step_key` as D§4.5 says (and
+    /// decide what an uncacheable step costs), or keep the estimate but true the tenant's virtual
+    /// clock up against the measured duration when the step completes, so under-declaring buys one
+    /// turn instead of all of them.
+    #[test]
+        fn a_tenant_cannot_declare_its_own_weight_by_naming_a_step() {
+        let mut q = one_slot();
+        let now = Instant::now();
+        // One trivial run of a step called "test" is the whole setup.
+        q.observe_cost("attacker", "test", Duration::from_millis(1));
+        flood(&mut q, "attacker", 100);
+        flood(&mut q, "honest", 100);
+
+        let order = serve(&mut q, 40, now);
+        let honest = order.iter().filter(|t| *t == "honest").count();
+        assert!(honest >= 15, "the neighbour got {honest} of 40 turns at equal weight");
+    }
+
+    #[test]
+    fn the_cost_history_one_tenant_can_accumulate_is_bounded() {
+        // The estimator's key is `(tenant, step_name)` and a step name is written by the tenant's own
+        // pipeline, so an unbounded map is an unbounded allocation one tenant can drive inside the
+        // process every other tenant's scheduling shares (D§1, noisy neighbour). Losing an old
+        // estimate costs one step the default cost; keeping every name forever costs everyone.
+        let mut q = queue(config());
+        for i in 0..(COST_KEYS_PER_TENANT * 4) {
+            q.observe_cost("attacker", &format!("step-{i}"), Duration::from_secs(1));
+        }
+        assert!(
+            q.costs.len() <= COST_KEYS_PER_TENANT,
+            "one tenant held {} cost keys",
+            q.costs.len()
+        );
+        // Eviction is oldest-name-first, and it costs an estimate, never a wrong one: an evicted
+        // name simply falls back to the configured default.
+        assert_eq!(q.estimate("attacker", "step-0"), 60.0, "the oldest name went first");
+        let newest = format!("step-{}", COST_KEYS_PER_TENANT * 4 - 1);
+        assert_eq!(q.estimate("attacker", &newest), 1.0, "and the most recent survived");
+    }
+
+    #[test]
+    fn a_bounded_cost_history_is_still_per_tenant() {
+        // The bound must not become a way to reach across the boundary: evicting one tenant's names
+        // may never touch another's, or a flood would be a way to reset a neighbour's estimates.
+        let mut q = queue(config());
+        q.observe_cost("victim", "test", Duration::from_secs(7));
+        for i in 0..(COST_KEYS_PER_TENANT * 2) {
+            q.observe_cost("attacker", &format!("step-{i}"), Duration::from_secs(1));
+        }
+        assert_eq!(q.estimate("victim", "test"), 7.0, "a neighbour's flood cost this tenant nothing");
     }
 
     #[test]

@@ -97,6 +97,12 @@ pub struct Limits {
     pub max_statement_weight: usize,
     /// Maximum leading indentation, in columns. Bounds block nesting, the third route.
     pub max_indent_columns: usize,
+    /// Maximum `elif` branches in one chain ([`shape`]'s block-chain measure).
+    ///
+    /// The fourth route to a deep AST, and invisible to the other three bounds. 256 keeps the same
+    /// ~4× margin against the stack that the bracket and unary bounds are sized for, and is far past
+    /// any pipeline a human writes.
+    pub max_block_chain: usize,
     /// Stack for the evaluation thread. The worst input the other bounds admit needs under 32 MiB
     /// in a debug build (see [`shape`]), so the default is a 4× margin. Address space, not memory:
     /// a real pipeline touches a few pages of it.
@@ -125,6 +131,7 @@ impl Default for Limits {
             max_raw_nesting: 512,
             max_statement_weight: 1_024,
             max_indent_columns: 256,
+            max_block_chain: 256,
             stack_bytes: 128 * 1024 * 1024,
             max_callstack: 64,
             max_ticks: 10_000_000,
@@ -148,9 +155,20 @@ impl Limits {
             max_raw_nesting: self.max_raw_nesting.max(self.max_nesting.max(1)),
             max_statement_weight: self.max_statement_weight.max(1),
             max_indent_columns: self.max_indent_columns.max(1),
-            // Below a megabyte a thread cannot do useful work; a caller who passes something tiny
-            // meant "small", not "let the parser run out of stack".
-            stack_bytes: self.stack_bytes.max(1024 * 1024),
+            max_block_chain: self.max_block_chain.max(1),
+            // The floor must be large enough that the shape bounds above actually protect the parser,
+            // because those bounds are ratios against a stack rather than absolutes.
+            //
+            // It was 1 MiB, with a comment saying a caller passing something tiny "meant small, not
+            // let the parser run out of stack". The comment stated the opposite of what happened: at
+            // 1 MiB, **fifty `elif` branches in 559 bytes abort the process**. `elif` chains nest the
+            // AST without brackets, without indentation, and without one large statement, so every
+            // shape measure reads flat while the parser recurses (see `shape`'s block-chain bound).
+            //
+            // 16 MiB restores the ~4× margin the measured shapes are sized against. A caller who
+            // genuinely needs a smaller thread needs a different design, not a smaller number here —
+            // a stack overflow is not an error this process can catch, it is an abort.
+            stack_bytes: self.stack_bytes.max(16 * 1024 * 1024),
             max_callstack: self.max_callstack.max(1),
             max_ticks: self.max_ticks.max(1),
             max_heap_bytes: self.max_heap_bytes.max(1),

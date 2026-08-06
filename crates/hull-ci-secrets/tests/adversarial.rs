@@ -251,6 +251,97 @@ fn a_rotation_mid_flight_does_not_break_a_live_job() {
     assert_eq!(s.broker.redeem(&token, "node-a", &[]).unwrap().len(), 3);
 }
 
+/// **This test documents a gap. It is not a bug to be fixed in `keys.rs`.**
+///
+/// D§7.4 puts rotation under the heading "Rotation & revocation", which reads as though rotating is
+/// a *recovery* from a compromised KEK. It is not, here or in the pattern it cites: rotation adds a
+/// version and re-wraps, and [`KeyManager`] has no operation that retires the old one. So after a
+/// full sweep, KEK v1 is still in the key manager and still unwraps every DEK it ever wrapped — and
+/// an attacker holding v1 plus a pre-rotation backup row reads the secret.
+///
+/// This is the correct behaviour for the *operational* rotation the design describes (an interrupted
+/// sweep must leave a mix of versions that all still open — see
+/// `a_rotation_mid_flight_does_not_break_a_live_job`), and it is why crypto-shredding, not rotation,
+/// is the answer to a compromise. Written down because the two readings are one word apart.
+#[test]
+fn rotating_a_kek_does_not_retire_the_old_version() {
+    let s = stack();
+    let pre_rotation_backup = s.store.get("acme", "NPM_TOKEN").unwrap().unwrap();
+    assert_eq!(pre_rotation_backup.kek_version.0, 1);
+
+    assert_eq!(s.broker.rotate_tenant("acme").unwrap(), 2);
+    assert_eq!(s.store.get("acme", "NPM_TOKEN").unwrap().unwrap().kek_version.0, 2);
+
+    // The row that was rotated away from still opens, because the key it names still exists.
+    let vault = Vault::new(s.keys.clone());
+    assert_eq!(
+        vault.open("acme", "NPM_TOKEN", &pre_rotation_backup).unwrap().expose(),
+        b"npm_live_s3cr3t_value"
+    );
+    assert_eq!(s.keys.current_version("acme").unwrap().0, 2);
+}
+
+/// **This test documents a gap.**
+///
+/// The AAD binds `(tenant, name)` and the wrap binds `(tenant, name, kek_version)`. Neither binds a
+/// *generation*, so two ciphertexts for one `(tenant, name)` are interchangeable and the broker
+/// serves whichever row it finds. A tenant that rotates a leaked value therefore has that rotation
+/// undone, silently, by any restore of an older snapshot — a lagging replica, a point-in-time
+/// recovery, a botched migration — and the next job gets the compromised value with no signal.
+///
+/// The AEAD cannot fix this on its own (a rollback restores a row that *was* authentic), but a
+/// monotonic generation in the AAD plus a high-water mark outside the row would make the stale row
+/// fail to open rather than open cleanly. Stated here because "the AAD stops a substituted row" is
+/// true for a *foreign* row and false for a *previous* one, and the difference is not obvious.
+#[test]
+fn a_restored_backup_row_reinstates_a_rotated_out_secret_value() {
+    let s = stack();
+    let before_rotation = s.store.get("acme", "NPM_TOKEN").unwrap().unwrap();
+
+    // The tenant rotates the value itself after a leak.
+    s.broker.put_secret("acme", "NPM_TOKEN", b"fresh-value-after-the-leak").unwrap();
+    let (token, _) = s.broker.mint(&request(AuthorClass::Member, "job-1", "node-a")).unwrap();
+    assert_eq!(
+        s.broker.redeem(&token, "node-a", &[]).unwrap().get("NPM_TOKEN").unwrap().expose(),
+        b"fresh-value-after-the-leak"
+    );
+
+    // A restore puts the old row back. It authenticates, because it always did.
+    s.store.put(before_rotation).unwrap();
+    let (token, _) = s.broker.mint(&request(AuthorClass::Member, "job-2", "node-a")).unwrap();
+    assert_eq!(
+        s.broker.redeem(&token, "node-a", &[]).unwrap().get("NPM_TOKEN").unwrap().expose(),
+        b"npm_live_s3cr3t_value",
+        "the compromised value is served again, with nothing to distinguish it"
+    );
+}
+
+/// **This test documents a gap.**
+///
+/// [`Masker::register`] returns `false` for a value below `MIN_MASKABLE_LEN`, and its doc says why
+/// that is a refusal rather than a silent no-op: "a caller who registers a short value and sees no
+/// error would reasonably assume it was covered." Every caller in this workspace discards the
+/// answer, so a short tenant secret is delivered and then never masked, with no warning anywhere.
+///
+/// Masking is a backstop and not a control (see `mask`'s module doc), so this is not a hole in the
+/// gate — but it is the *stated* contract of `register` being dropped by its own callers, and the
+/// honest `echo` it exists to catch goes uncaught.
+#[test]
+fn a_secret_too_short_to_mask_is_delivered_anyway_and_never_masked() {
+    let s = stack();
+    s.broker.put_secret("acme", "PIN", b"a1b2c").unwrap(); // 5 bytes, below MIN_MASKABLE_LEN
+    let mut req = request(AuthorClass::Member, "job-1", "node-a");
+    req.declared = vec!["PIN".into()];
+
+    let (token, _) = s.broker.mint(&req).unwrap();
+    let delivered = s.broker.redeem(&token, "node-a", &[]).unwrap();
+    assert_eq!(delivered.get("PIN").unwrap().expose(), b"a1b2c");
+
+    let masker = delivered.masker();
+    assert!(masker.is_empty(), "the registration was refused and the refusal discarded");
+    assert_eq!(masker.mask("PIN=a1b2c"), "PIN=a1b2c");
+}
+
 /// Crypto-shredding is total for its tenant and inert for everyone else. This is the property that
 /// makes "delete my data" a one-call operation rather than a hunt through backups.
 #[test]

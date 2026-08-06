@@ -612,6 +612,45 @@ mod tests {
         assert_eq!(f.creds.credential(&req("globex", "job-2")).unwrap().expose(), b"globex-npm-token");
     }
 
+    /// **This test documents a gap. It is not a bug to be fixed in this file.**
+    ///
+    /// The module doc rejects a TTL cache because it would make "revocation stops proxy access" into
+    /// "…eventually", "which is not the property D§7.4 claims". The held plaintext has exactly that
+    /// property, bounded by the job rather than by a clock: once a capability is spent, neither
+    /// [`SecretBroker::revoke_tenant`] nor [`SecretBroker::shred_tenant`] reaches the values, because
+    /// they live in this process's memory and the broker has no way to reach into it.
+    ///
+    /// `crypto_shredding_a_tenant_stops_its_proxy_access_and_leaves_others_alone` above shreds while
+    /// the capability is still `Pending`, which is the case that *does* shut. This is the other one.
+    /// Closing it needs a push from the broker to every proxy holding a job for that tenant — a
+    /// notification path this composition does not have — so what an operator has today is
+    /// [`crate::server::PackageProxy::release_job`] on the job, and the bound is the job's lifetime.
+    #[test]
+    fn revocation_does_not_reach_a_credential_the_proxy_already_holds() {
+        let f = fixture();
+        f.authorise("acme", "job-1");
+        // The job resolves one package: the capability is spent and the plaintext is now held here.
+        assert_eq!(f.creds.credential(&req("acme", "job-1")).unwrap().expose(), b"acme-npm-token");
+
+        // Break glass, both paths D§7.4 names. The already-spent record is marked revoked, which
+        // changes nothing about it — it was already spent — and the KEK is destroyed, which makes
+        // the *ciphertext* unrecoverable but says nothing about a copy already decrypted.
+        assert_eq!(f.service.broker().revoke_tenant("acme"), 1);
+        f.service.broker().shred_tenant("acme").unwrap();
+
+        assert_eq!(
+            f.creds.credential(&req("acme", "job-1")).unwrap().expose(),
+            b"acme-npm-token",
+            "the proxy keeps spending it until the job is released"
+        );
+        // And the one thing that does stop it.
+        f.creds.release_job("job-1");
+        assert!(matches!(
+            f.creds.credential(&req("acme", "job-1")),
+            Err(CredentialError::Unregistered { .. })
+        ));
+    }
+
     #[test]
     fn releasing_a_job_drops_its_credentials() {
         // §14.1 applied to a credential. After release the job is not merely unauthorised, it is
