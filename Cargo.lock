@@ -1144,10 +1144,13 @@ name = "hull-ci-control"
 version = "0.0.1"
 dependencies = [
  "axum",
+ "blake3",
+ "hull-ci-fetch",
  "hull-ci-proto",
  "reqwest",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror",
  "tokio",
  "tracing",

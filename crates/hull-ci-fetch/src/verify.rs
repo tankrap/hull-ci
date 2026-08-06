@@ -34,6 +34,8 @@ use std::path::Path;
 use keel_store::object::{Object, ObjectId, Tree, TreeEntry, KIND_BLOB};
 use keel_store::snapshot::{MODE_DIR, MODE_EXEC, MODE_FILE, MODE_SYMLINK};
 
+use crate::digest::{IndexDir, IndexEntry};
+
 #[derive(Debug, thiserror::Error)]
 pub enum VerifyError {
     /// The tree hashed cleanly and did not match. The only honest response is to abandon the fetch:
@@ -112,11 +114,37 @@ impl Default for KeelTreeVerifier {
 
 impl TreeVerifier for KeelTreeVerifier {
     fn tree_id(&self, root: &Path) -> Result<String, VerifyError> {
-        Ok(hash_dir(root, 0, self.max_depth)?.to_hex())
+        Ok(walk(root, 0, self.max_depth, Retain::No)?.id.to_hex())
     }
 }
 
-fn hash_dir(dir: &Path, depth: u32, max_depth: u32) -> Result<ObjectId, VerifyError> {
+impl KeelTreeVerifier {
+    /// The same walk as [`TreeVerifier::tree_id`], **keeping** the subtree addresses it computes on
+    /// the way instead of dropping them (design D§6.1).
+    ///
+    /// This is what makes step memoization affordable: `subtree_digest` needs "the id of the node at
+    /// this path", and this walk has already computed every one of them. Retaining the structure is
+    /// the whole cost — no second pass, and above all no second implementation of keel's mode and
+    /// encoding rules, which would be a fork of the address format that a memo would then report
+    /// hits against.
+    ///
+    /// Memory is the reason this is a separate entry point rather than the default: the retained
+    /// index is O(entries) for the whole tree, while plain verification stays O(depth × directory
+    /// width). Verification runs on every fetch; indexing runs when a pipeline actually declares
+    /// `inputs`.
+    pub fn index_dir(&self, root: &Path) -> Result<crate::digest::IndexDir, VerifyError> {
+        walk(root, 0, self.max_depth, Retain::Yes)
+    }
+}
+
+/// Whether the walk keeps the child structure or only its addresses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Retain {
+    Yes,
+    No,
+}
+
+fn walk(dir: &Path, depth: u32, max_depth: u32, retain: Retain) -> Result<IndexDir, VerifyError> {
     if depth > max_depth {
         return Err(VerifyError::TooDeep { limit: max_depth });
     }
@@ -130,19 +158,33 @@ fn hash_dir(dir: &Path, depth: u32, max_depth: u32) -> Result<ObjectId, VerifyEr
         let entry = if ft.is_symlink() {
             let target = fs::read_link(de.path()).map_err(io_err)?;
             let id = Object::Blob(target.as_os_str().as_encoded_bytes().to_vec()).id();
-            TreeEntry { name, mode: MODE_SYMLINK, id }
+            IndexEntry { name, mode: MODE_SYMLINK, id, dir: None }
         } else if ft.is_dir() {
-            TreeEntry { name, mode: MODE_DIR, id: hash_dir(&de.path(), depth + 1, max_depth)? }
+            let sub = walk(&de.path(), depth + 1, max_depth, retain)?;
+            let id = sub.id;
+            // Dropped here when the caller only wanted the address, which is what keeps plain
+            // verification's memory bounded by depth rather than by tree size.
+            IndexEntry { name, mode: MODE_DIR, id, dir: (retain == Retain::Yes).then_some(sub) }
         } else if ft.is_file() {
             let md = de.metadata().map_err(io_err)?;
-            TreeEntry { name, mode: file_mode(&md), id: blob_id(&de.path())? }
+            IndexEntry { name, mode: file_mode(&md), id: blob_id(&de.path())?, dir: None }
         } else {
             return Err(VerifyError::UnexpectedFileType);
         };
         entries.push(entry);
     }
-    // `Object::encode` sorts entries by name, so enumeration order cannot affect the address.
-    Ok(Object::Tree(Tree { entries }).id())
+    // `Object::encode` sorts entries by name, so enumeration order cannot affect the address. The
+    // index is sorted here too, so a lookup is a binary search over the same order the address was
+    // computed in.
+    entries.sort_by(|a, b| a.name.cmp(&b.name));
+    let id = Object::Tree(Tree {
+        entries: entries
+            .iter()
+            .map(|e| TreeEntry { name: e.name.clone(), mode: e.mode, id: e.id })
+            .collect(),
+    })
+    .id();
+    Ok(IndexDir { id, entries })
 }
 
 /// A blob's address, streamed.

@@ -36,6 +36,7 @@
 //! the producer had been emitting unverifiable archives with nothing in the world able to notice
 //! until a verifying consumer existed. See design G5, which proposes promoting §6 to a MUST.
 
+pub mod digest;
 pub mod extract;
 pub mod store;
 pub mod verify;
@@ -50,6 +51,7 @@ use std::time::Duration;
 
 use hull_ci_proto::{sanitize_summary, Dispatch, Reason, Verdict, SUMMARY_MAX_CHARS};
 
+pub use digest::{DigestError, DigestLimits, GlobDigest, GlobError, TreeDigester, TreeIndex};
 pub use extract::{ExtractError, Extracted, Rejection};
 pub use store::{ContentStore, StoreError, StoredTree};
 pub use verify::{KeelTreeVerifier, TreeVerifier, VerifyError};

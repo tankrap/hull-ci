@@ -18,3 +18,14 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 axum.workspace = true
 reqwest.workspace = true
+# The step-key hash (design D§6.1). Pure computation over strings already in memory — the control
+# plane still opens no file and runs no code. Resolving the globs those keys are built from happens
+# behind the `memo::SubtreeDigest` seam, in another crate.
+blake3.workspace = true
+
+[dev-dependencies]
+# The **real** digester, for the end-to-end memo tests. A dev-only edge, so the shipped dependency
+# graph is unchanged and the composition root still owns the wiring — but the cache tests then run
+# against keel's actual tree walk rather than against a fake that could agree with a broken key.
+hull-ci-fetch = { path = "../hull-ci-fetch" }
+tempfile.workspace = true

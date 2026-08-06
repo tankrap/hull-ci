@@ -12,6 +12,7 @@ use hull_ci_proto::{Assignment, AuthorClass, Dispatch, StepOutcome, StepReport};
 use crate::callback::{BoxFuture, CallbackRequest, CallbackResponse, CallbackTransport, TransportError};
 use crate::control::{Control, ControlConfig, Deps};
 use crate::fairshare::{Prioritizer, Priority};
+use crate::memo::{DigestError, InputDigest, MemoConfig, SubtreeDigest};
 use crate::model::StepSpec;
 use crate::seams::{
     FetchError, FetchRequest, Fetcher, Membership, NodeError, NodeSink, PlanError, Planner,
@@ -198,6 +199,80 @@ impl Planner for PerTreePlanner {
                 .map(|i| StepSpec::new(format!("step{i}"), vec!["cargo".into(), "test".into()], "rust:1.83"))
                 .collect())
         })
+    }
+}
+
+// ── Step memoization (design D§6.1) ──────────────────────────────────────────────────────────────
+
+/// A fetcher backed by **real directories on disk**, keyed by `tree_id`.
+///
+/// The other fetchers here answer with a path nothing opens, which is the right fixture for a
+/// control plane that touches no filesystem. Layer 2 is the one place that legitimately needs a real
+/// tree behind the seam — the digest is a claim about actual bytes, and a fake that agreed with a
+/// broken key derivation would prove nothing.
+pub struct DirFetcher(HashMap<String, std::path::PathBuf>);
+
+impl DirFetcher {
+    pub fn new(trees: &[(&str, &std::path::Path)]) -> Self {
+        DirFetcher(trees.iter().map(|(id, p)| ((*id).to_string(), p.to_path_buf())).collect())
+    }
+}
+
+impl Fetcher for DirFetcher {
+    fn fetch<'a>(&'a self, req: &'a FetchRequest) -> BoxFuture<'a, Result<VerifiedTree, FetchError>> {
+        Box::pin(async move {
+            let path = self
+                .0
+                .get(&req.tree_id)
+                .ok_or_else(|| FetchError::Failed(format!("no such tree {}", req.tree_id)))?;
+            Ok(VerifiedTree { tree_id: req.tree_id.clone(), path: path.clone(), cached: false })
+        })
+    }
+}
+
+/// The [`SubtreeDigest`] seam, backed by the real `hull-ci-fetch` digester.
+///
+/// Ten lines, and deliberately so: this is the whole adapter a composition root needs to turn layer
+/// 2 on, and it is the same shape as `hull-ci-server`'s `BrokerFetcher`. Everything that makes the
+/// digest sound — keel's encoding, the O(depth) prefix descent, the `(tenant, tree, glob)` memo —
+/// lives in the broker crate.
+#[derive(Default)]
+pub struct FetchDigester(hull_ci_fetch::TreeDigester);
+
+impl SubtreeDigest for FetchDigester {
+    fn digest(&self, tenant: &str, tree: &VerifiedTree, glob: &str) -> Result<InputDigest, DigestError> {
+        self.0
+            .digest(tenant, &tree.tree_id, &tree.path, glob)
+            .map(|d| InputDigest { digest: d.digest, selected: d.selected })
+            .map_err(|e| DigestError::Failed { glob: glob.into(), detail: e.to_string() })
+    }
+}
+
+/// A planner whose steps declare `inputs`, so they are actually cacheable.
+pub struct MemoPlanner(pub Vec<StepSpec>);
+
+impl Planner for MemoPlanner {
+    fn plan<'a>(&'a self, _tree: &'a VerifiedTree) -> BoxFuture<'a, Result<Vec<StepSpec>, PlanError>> {
+        Box::pin(async move { Ok(self.0.clone()) })
+    }
+}
+
+/// One step declaring what it reads (design D§6.1).
+pub fn memo_spec(name: &str, inputs: &[&str], needs: &[&str]) -> StepSpec {
+    StepSpec::new(name, vec!["cargo".into(), "test".into()], "rust:1.83")
+        .inputs(inputs.iter().map(|g| (*g).to_string()).collect())
+        .needs(needs.iter().map(|n| (*n).to_string()).collect())
+}
+
+/// [`fast_config`] with layer 2 wired to the real digester and a shared memo store.
+pub fn memo_config(store: std::sync::Arc<dyn crate::memo::StepMemo>) -> ControlConfig {
+    ControlConfig {
+        memo: MemoConfig {
+            digest: std::sync::Arc::new(FetchDigester::default()),
+            store,
+            pipeline_version: "test/1".into(),
+        },
+        ..fast_config()
     }
 }
 

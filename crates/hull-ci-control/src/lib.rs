@@ -50,6 +50,7 @@ pub mod fairshare;
 pub mod graph;
 pub mod ids;
 pub mod ingest;
+pub mod memo;
 pub mod model;
 pub mod seams;
 pub mod snapshot;
@@ -65,6 +66,10 @@ use std::time::Duration;
 
 pub use control::{Accepted, Control, ControlConfig, Deps, ReportRejected};
 pub use fairshare::{Admission, Depth, FairShare, Prioritizer, Priority, TenantPlan};
+pub use memo::{
+    InMemoryStepMemo, InputDigest, JobKeyContext, MemoConfig, MemoOutcome, MemoPolicy, StepKey,
+    StepMemo, SubtreeDigest,
+};
 pub use snapshot::{JobSnapshot, StepSnapshot, TenantSnapshot, VerdictSnapshot};
 pub use timeouts::Timeouts;
 

@@ -156,6 +156,11 @@ impl StepState {
             (Leased | Running, Ready) => true,
             // A memo hit resolves a step before it is ever scheduled (design D§6.1).
             (Pending | Ready, Cached) => true,
+            // The other half of a memo hit. A recorded `failed` is real signal about the code on
+            // exactly these inputs (D§6.1), and it is served as `failed` rather than as `cached`,
+            // because `cached` folds green (see `aggregate::fold`) — marking a remembered failure
+            // `cached` would turn a red job green, which is the worst bug this layer could have.
+            (Pending | Ready, Failed) => true,
             // Fail-fast cancels anything not yet terminal (design D§6.6).
             (Pending | Ready | Leased | Running, Skipped) => true,
             // Queue-wait / step wall clock expiry (design D§10.2).
@@ -200,6 +205,22 @@ pub struct StepSpec {
     /// turn one of these into a value. It is a request the secret broker adjudicates against the
     /// job's author class, which is a fact about the actor and not something this list can raise.
     pub secrets: Vec<String>,
+    /// Path globs deciding this step's memo key (design D§6.1) — the pipeline's `inputs`.
+    ///
+    /// Resolved against the *verified tree* by [`SubtreeDigest`](crate::memo::SubtreeDigest), never
+    /// here: the control plane touches no filesystem (spec §14.1), so a glob is a string until the
+    /// digest seam expands it.
+    ///
+    /// **Empty means "never cacheable"**, not "no restriction". An empty input set would key every
+    /// run of this step identically and serve the first `passed` forever — see
+    /// [`NotCacheable::NoInputs`](crate::memo::NotCacheable::NoInputs).
+    pub inputs: Vec<String>,
+    /// Environment the step is permitted to see, as `(name, value)` — D§6.1's `env_allowlist_values`.
+    ///
+    /// **Values, not just names.** The same step run with `PROFILE=release` did different work from
+    /// the same step run with `PROFILE=debug`, so a key over names alone would serve one build's
+    /// verdict for the other's.
+    pub env_allowlist: Vec<(String, String)>,
 }
 
 impl StepSpec {
@@ -212,6 +233,11 @@ impl StepSpec {
             continue_on_error: false,
             needs: Vec::new(),
             secrets: Vec::new(),
+            // Empty by default, which means **not cacheable** by default (design D§6.1). A planner
+            // that has not been taught to carry `inputs` through therefore gets the old behaviour —
+            // every step runs — rather than a memo keyed on nothing.
+            inputs: Vec::new(),
+            env_allowlist: Vec::new(),
         }
     }
 
@@ -224,6 +250,19 @@ impl StepSpec {
     /// Declare the tenant secret names this step asks for (design D§7.4). A request, not a grant.
     pub fn secrets(mut self, secrets: Vec<String>) -> Self {
         self.secrets = secrets;
+        self
+    }
+
+    /// Declare the path globs this step's memo key is computed over (design D§6.1). Declaring none
+    /// is what makes a step uncacheable.
+    pub fn inputs(mut self, inputs: Vec<String>) -> Self {
+        self.inputs = inputs;
+        self
+    }
+
+    /// Declare the environment the step is allowed to see, values included (design D§6.1).
+    pub fn env_allowlist(mut self, env: Vec<(String, String)>) -> Self {
+        self.env_allowlist = env;
         self
     }
 
@@ -254,6 +293,14 @@ pub struct Step {
     pub detail: String,
     /// Set only when `state == Errored`, so the aggregator can name a [`Reason`] instead of guessing.
     pub error_reason: Option<Reason>,
+    /// This step's memo key (design D§6.1), or `None` when the step is not cacheable at all.
+    ///
+    /// `None` is the common and safe case — a step with no declared `inputs`, a glob that resolved
+    /// to nothing, an uncacheable dependency, or a control plane with no digester wired. It is
+    /// deliberately the *only* thing that gates a memo write: a step with no key is never looked up
+    /// and never recorded, so every refusal in [`crate::memo`] holds in both directions with no
+    /// second check to keep in sync.
+    pub memo_key: Option<crate::memo::StepKey>,
 }
 
 impl Step {
@@ -272,6 +319,7 @@ impl Step {
             log_key: None,
             detail: String::new(),
             error_reason: None,
+            memo_key: None,
         }
     }
 

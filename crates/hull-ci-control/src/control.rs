@@ -43,6 +43,7 @@ use crate::callback::{
 use crate::fairshare::{Admission, Depth, FairQueue, FairShare, Grant, JobView, StepView};
 use crate::graph;
 use crate::ids::new_step_id;
+use crate::memo::{plan_step_keys, JobKeyContext, MemoConfig, MemoOutcome, StepKey};
 use crate::model::{Job, JobId, JobState, Step, StepId, StepSpec, StepState};
 use crate::seams::{
     Fetcher, FetchRequest, Membership, NodeError, NodeSink, Planner, VerifiedTree,
@@ -78,6 +79,11 @@ pub struct ControlConfig {
     /// How the fleet is divided between tenants: weights, plan quotas, and priority classes
     /// (design D§4.5). See [`crate::fairshare`].
     pub fair_share: FairShare,
+    /// Step-level memoization — design D§6.1, layer 2. See [`crate::memo`].
+    ///
+    /// **Disabled by default**, because its default digester refuses every glob. A deployment that
+    /// has not wired one behaves exactly as it did before layer 2 existed: every step runs.
+    pub memo: MemoConfig,
 }
 
 impl Default for ControlConfig {
@@ -94,6 +100,7 @@ impl Default for ControlConfig {
             job_retention: Duration::from_secs(60 * 60),
             max_jobs: 10_000,
             fair_share: FairShare::default(),
+            memo: MemoConfig::default(),
         }
     }
 }
@@ -131,6 +138,16 @@ pub enum ReportRejected {
     NotInFlight,
     #[error("lease expired before the report arrived")]
     LeaseExpired,
+}
+
+/// What layer 2 decided about one step before it was ever scheduled (design D§6.1).
+///
+/// The default — no key, no hit — is the safe one: a step with no key is never looked up *and* never
+/// recorded, so a refusal to cache holds in both directions without a second check to keep in sync.
+#[derive(Debug, Clone, Default)]
+struct MemoDecision {
+    key: Option<StepKey>,
+    hit: Option<MemoOutcome>,
 }
 
 pub struct Control {
@@ -237,9 +254,11 @@ impl Control {
         from_node: &str,
     ) -> Result<(), ReportRejected> {
         let now = Instant::now();
+        let mut to_memoize: Option<(String, StepKey, MemoOutcome)> = None;
         {
             let mut jobs = self.lock_jobs();
             let job = jobs.get_mut(&report.job_id).ok_or(ReportRejected::UnknownJob)?;
+            let tenant = job.dispatch.tenant().to_string();
             let step = job.step_mut(&report.step_id).ok_or(ReportRejected::UnknownStep)?;
 
             if !matches!(step.state, StepState::Leased | StepState::Running) {
@@ -267,6 +286,21 @@ impl Control {
             if next == StepState::Errored {
                 step.error_reason = Some(Reason::Infra);
             }
+
+            // Layer 2's write side (design D§6.1). Two gates, and both are structural rather than
+            // remembered: the step must have a key at all (so every refusal in `memo` covers writes
+            // as well as reads), and the outcome must be representable as a [`MemoOutcome`] — which
+            // has no `errored` variant, so an outage cannot be written down. Mirrors spec §7 one
+            // level below Hull's own memo.
+            if let (Some(key), Some(outcome)) = (step.memo_key.clone(), MemoOutcome::from_state(next)) {
+                to_memoize = Some((tenant, key, outcome));
+            }
+        }
+        // Outside the store lock: the memo is somebody else's mutex, and the lock order in this file
+        // is only ever `jobs` → `queue`.
+        if let Some((tenant, key, outcome)) = to_memoize {
+            tracing::debug!(job_id = %report.job_id, step_id = %report.step_id, outcome = outcome.as_str(), "recording step memo");
+            self.config.memo.store.record(&tenant, &key, outcome, now);
         }
         self.wake(&report.job_id);
         Ok(())
@@ -399,6 +433,76 @@ impl Control {
         }
     }
 
+    /// Layer 2, applied — design D§6.1.
+    ///
+    /// Every step's key is computed before a single one is scheduled, because a key depends only on
+    /// *definitions* (its own, its inputs' content, and its dependencies' keys) and never on an
+    /// outcome. That is what makes the fully-cached case sub-second: the whole plan is resolved
+    /// against the memo in one pass, and if every step hits, the job folds to a verdict without the
+    /// fleet ever being asked for capacity.
+    ///
+    /// Returns one decision per spec, in order.
+    async fn phase_memo(
+        &self,
+        job_id: &str,
+        ctx: JobKeyContext,
+        tree: &VerifiedTree,
+        specs: &[StepSpec],
+    ) -> Vec<MemoDecision> {
+        if !self.config.memo.enabled() {
+            return vec![MemoDecision::default(); specs.len()];
+        }
+
+        // Resolving a glob reads the extracted tree, which is filesystem work — off the executor,
+        // because a first-time index of a large repo is milliseconds-to-seconds and every other
+        // job's driver shares this thread pool.
+        let memo = self.config.memo.clone();
+        let tree_owned = tree.clone();
+        let specs_owned = specs.to_vec();
+        let ctx_owned = ctx.clone();
+        let keys = tokio::task::spawn_blocking(move || {
+            plan_step_keys(&memo, &ctx_owned, &tree_owned, &specs_owned)
+        })
+        .await
+        .unwrap_or_else(|e| {
+            // A panic in key derivation must cost cache hits, never correctness: with no keys,
+            // every step runs.
+            tracing::error!(%job_id, error = %e, "step key derivation failed; running every step");
+            Vec::new()
+        });
+
+        let now = Instant::now();
+        let mut decisions = Vec::with_capacity(specs.len());
+        let (mut hits, mut uncacheable) = (0usize, 0usize);
+        for (spec, key) in specs.iter().zip(keys.into_iter().chain(std::iter::repeat_with(|| {
+            Err(crate::memo::NotCacheable::NoInputs)
+        }))) {
+            let decision = match key {
+                Ok(key) => {
+                    let hit = self.config.memo.store.lookup(&ctx.tenant, &key, now);
+                    if let Some(outcome) = hit {
+                        hits += 1;
+                        tracing::debug!(
+                            %job_id, step = %spec.name, outcome = outcome.as_str(), key = %key,
+                            "step memo hit — not dispatching"
+                        );
+                    }
+                    MemoDecision { key: Some(key), hit }
+                }
+                Err(why) => {
+                    uncacheable += 1;
+                    tracing::debug!(%job_id, step = %spec.name, why = %why, "step is not cacheable");
+                    MemoDecision::default()
+                }
+            };
+            decisions.push(decision);
+        }
+        if hits > 0 || uncacheable > 0 {
+            tracing::info!(%job_id, hits, uncacheable, total = specs.len(), "step memo resolved");
+        }
+        decisions
+    }
+
     async fn phase_run(&self, job_id: &str, tree: &VerifiedTree, specs: Vec<StepSpec>) {
         // Published before the first step is even `pending`, because the scheduler may hand this
         // job's work to a node from *another* job's driver, and that driver needs to know where the
@@ -408,14 +512,44 @@ impl Control {
             .unwrap_or_else(|e| e.into_inner())
             .insert(job_id.to_string(), tree.clone());
 
+        let Some(ctx) = self.with_job(job_id, |job| JobKeyContext {
+            tenant: job.dispatch.tenant().to_string(),
+            tier: self.config.tier,
+            author_class: job.author_class,
+        }) else {
+            return;
+        };
+        let decisions = self.phase_memo(job_id, ctx, tree, &specs).await;
+
+        let now = Instant::now();
         self.with_job_mut(job_id, |job| {
             let _ = job.transition(JobState::Running);
-            for (i, spec) in specs.into_iter().enumerate() {
+            for (i, (spec, decision)) in specs.into_iter().zip(decisions).enumerate() {
                 // Every step enters `pending`. Which of them are schedulable *now* and which are
                 // waiting on an edge is the graph's answer, not this loop's (design D§4.3), and the
                 // driver below asks it on every pass — including the first, so a plan with no `needs`
                 // at all is promoted wholesale before anything else happens.
-                job.steps.push(Step::new(new_step_id(i), spec));
+                let mut step = Step::new(new_step_id(i), spec);
+                step.memo_key = decision.key;
+                match decision.hit {
+                    // Design D§6.1: "a step whose `step_key` has a recorded `passed` result is
+                    // marked `cached` and never dispatched." It never becomes `ready`, so the
+                    // scheduler never sees it and the fleet is never asked.
+                    Some(MemoOutcome::Passed) => {
+                        let _ = step.transition(StepState::Cached);
+                        step.finished_at = Some(now);
+                    }
+                    // A remembered failure is served as `failed`, not `cached` — `cached` folds
+                    // green. The detail says where it came from, because a red verdict nobody can
+                    // trace to a run is worse than a slow one.
+                    Some(MemoOutcome::Failed) => {
+                        let _ = step.transition(StepState::Failed);
+                        step.detail = "identical inputs failed recently (step memo)".into();
+                        step.finished_at = Some(now);
+                    }
+                    None => {}
+                }
+                job.steps.push(step);
             }
         });
 
@@ -885,10 +1019,11 @@ mod tests {
     use super::*;
     use crate::fairshare::TenantPlan;
     use crate::testing::{
-        dispatch, fast_config, harness, spec, stays_false, step_report, wait_until, BackgroundRepo,
-        FailingFetcher, HangingFetcher, NodeMode, OkFetcher, PerTreePlanner, StaticPlanner,
-        WrongTreeFetcher,
+        dispatch, fast_config, harness, memo_config, memo_spec, spec, stays_false, step_report,
+        wait_until, BackgroundRepo, DirFetcher, FailingFetcher, HangingFetcher, MemoPlanner,
+        NodeMode, OkFetcher, PerTreePlanner, StaticPlanner, WrongTreeFetcher,
     };
+    use crate::memo::{InMemoryStepMemo, MemoPolicy, StepMemo};
     use hull_ci_proto::{Status, StepOutcome};
 
     struct Live {
@@ -1631,5 +1766,456 @@ mod tests {
             h.node.assigned()[1].repo, "acme/api",
             "someone is watching a spinner; the nightly's remaining steps wait"
         );
+    }
+
+    // ── Step memoization, end to end (design D§6.1, layer 2) ─────────────────────────────────────
+    //
+    // These run against the **real** digester (`hull-ci-fetch`, keel's own tree walk) over real
+    // directories, not a fake. A fake digest would agree with a broken key derivation, which is
+    // exactly the bug class this layer can have: a cache that is confidently wrong.
+
+    /// A small repo whose code, docs and tests can be varied independently.
+    fn write_tree(root: &std::path::Path, code: &str, docs: &str, tests: &str) {
+        std::fs::create_dir_all(root.join("crates/a/src")).unwrap();
+        std::fs::create_dir_all(root.join("docs")).unwrap();
+        std::fs::create_dir_all(root.join("tests")).unwrap();
+        std::fs::write(root.join("crates/a/src/lib.rs"), code).unwrap();
+        std::fs::write(root.join("docs/guide.md"), docs).unwrap();
+        std::fs::write(root.join("tests/it.rs"), tests).unwrap();
+    }
+
+    /// Three trees that differ in exactly one place each: `base`, a **doc-only** edit of it, and a
+    /// **code** edit of it. The doc-only tree is the D§8 shape — a new `tree_id` Hull has never seen
+    /// whose declared `inputs` are byte-identical.
+    struct Trees {
+        _dir: tempfile::TempDir,
+        base: std::path::PathBuf,
+        doc_only: std::path::PathBuf,
+        code_changed: std::path::PathBuf,
+        test_changed: std::path::PathBuf,
+    }
+
+    fn trees() -> Trees {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (base, doc_only, code_changed, test_changed) = (
+            dir.path().join("base"),
+            dir.path().join("doc"),
+            dir.path().join("code"),
+            dir.path().join("test"),
+        );
+        write_tree(&base, "pub fn a() {}\n", "guide v1\n", "#[test] fn t() {}\n");
+        write_tree(&doc_only, "pub fn a() {}\n", "guide v2\n", "#[test] fn t() {}\n");
+        write_tree(&code_changed, "pub fn a() { todo!() }\n", "guide v1\n", "#[test] fn t() {}\n");
+        write_tree(&test_changed, "pub fn a() {}\n", "guide v1\n", "#[test] fn t2() {}\n");
+        Trees { _dir: dir, base, doc_only, code_changed, test_changed }
+    }
+
+    fn memo_fetcher(t: &Trees) -> Arc<DirFetcher> {
+        Arc::new(DirFetcher::new(&[
+            ("base", &t.base),
+            ("doc", &t.doc_only),
+            ("code", &t.code_changed),
+            ("test", &t.test_changed),
+        ]))
+    }
+
+    fn state_of_step(ctrl: &Control, job_id: &str, name: &str) -> Option<StepState> {
+        ctrl.with_job(job_id, |j| j.steps.iter().find(|s| s.spec.name == name).map(|s| s.state))
+            .flatten()
+    }
+
+    /// Report `outcome` for every step of `job_id` the fleet currently holds. Returns how many.
+    fn report_leased(ctrl: &Control, job_id: &str, outcome: StepOutcome) -> usize {
+        let leased: Vec<StepId> = ctrl
+            .with_job(job_id, |j| {
+                j.steps
+                    .iter()
+                    .filter(|s| matches!(s.state, StepState::Leased | StepState::Running))
+                    .map(|s| s.id.clone())
+                    .collect()
+            })
+            .unwrap_or_default();
+        for id in &leased {
+            ctrl.record_step_report(&step_report(job_id, id, outcome, "ok"), "node-test").unwrap();
+        }
+        leased.len()
+    }
+
+    async fn settled_verdict(ctrl: &Arc<Control>, job_id: &str) -> Verdict {
+        let c = Arc::clone(ctrl);
+        let id = job_id.to_string();
+        let ok = wait_until(move || {
+            matches!(c.job_state(&id), Some(JobState::Reported) | Some(JobState::ReportFailed))
+        })
+        .await;
+        assert!(ok, "job {job_id} never reported: {:?}", ctrl.job_state(job_id));
+        ctrl.verdict(job_id).expect("a reported job has a verdict")
+    }
+
+    /// Run one job to green, passing every step the fleet is handed — however deep the DAG.
+    async fn run_to_green(h: &crate::testing::Harness, repo: &str, tree: &str) -> JobId {
+        let job = h.control.accept(dispatch(repo, tree)).job_id;
+        let ctrl = Arc::clone(&h.control);
+        let id = job.clone();
+        let done = wait_until(move || {
+            // Report whatever is in flight on every poll, so a chain drains one edge at a time.
+            report_leased(&ctrl, &id, StepOutcome::Passed);
+            matches!(ctrl.job_state(&id), Some(JobState::Reported) | Some(JobState::ReportFailed))
+        })
+        .await;
+        assert!(done, "job {job} never reported: {:?}", h.control.job_state(&job));
+        assert_eq!(h.control.verdict(&job).expect("a verdict").status, Status::Green);
+        job
+    }
+
+    #[tokio::test]
+    async fn a_doc_only_edit_hits_the_memo_and_a_code_edit_misses() {
+        // Layer 2's whole claim, in one test. Three *different* trees — so Hull's own `tree_id` memo
+        // (layer 1) offers nothing — and the middle one skips the step entirely because its declared
+        // `inputs` are byte-identical (design D§6.1, D§8).
+        let t = trees();
+        let store = Arc::new(InMemoryStepMemo::default());
+        let h = harness(
+            memo_config(store.clone()),
+            memo_fetcher(&t),
+            Arc::new(MemoPlanner(vec![memo_spec("test", &["crates/**"], &[])])),
+            NodeMode::Accept,
+        );
+
+        run_to_green(&h, "acme/api", "base").await;
+        assert_eq!(h.node.assigned().len(), 1, "the first tree runs");
+
+        // Doc-only: a new tree Hull has never seen, whose `crates/**` is unchanged.
+        let doc = h.control.accept(dispatch("acme/api", "doc")).job_id;
+        assert_eq!(settled_verdict(&h.control, &doc).await.status, Status::Green);
+        assert_eq!(state_of_step(&h.control, &doc, "test"), Some(StepState::Cached));
+        assert_eq!(h.node.assigned().len(), 1, "a memo hit is never dispatched");
+
+        // Code change inside the glob: a miss, and the step runs.
+        let code = h.control.accept(dispatch("acme/api", "code")).job_id;
+        let ctrl = Arc::clone(&h.control);
+        let id = code.clone();
+        assert!(wait_until(move || state_of_step(&ctrl, &id, "test") == Some(StepState::Leased)).await);
+        assert_eq!(h.node.assigned().len(), 2, "a change inside the declared inputs must miss");
+    }
+
+    #[tokio::test]
+    async fn a_fully_cached_job_reaches_a_verdict_without_any_node_assignment() {
+        // The sub-second verdict D§6.1 exists for: "if every step is cached, the job resolves
+        // without touching a node and the callback goes out in milliseconds."
+        let t = trees();
+        let store = Arc::new(InMemoryStepMemo::default());
+        let plan = vec![
+            memo_spec("build", &["crates/**"], &[]),
+            memo_spec("test", &["tests/**"], &["build"]),
+            // `crates/**` again, not `docs/**`: the second tree edits the docs, so a step that
+            // declared them would rightly miss. Which is the point — every step here declares
+            // inputs the doc-only edit does not touch.
+            memo_spec("lint", &["crates/**"], &[]),
+        ];
+        let h = harness(
+            memo_config(store.clone()),
+            memo_fetcher(&t),
+            Arc::new(MemoPlanner(plan)),
+            NodeMode::Accept,
+        );
+
+        run_to_green(&h, "acme/api", "base").await;
+        let ran = h.node.assigned().len();
+        assert_eq!(ran, 3);
+
+        // A tree that differs only where nothing declares an input… every step is a hit.
+        let mut second = dispatch("acme/api", "doc");
+        second.callback_url = "https://hull.example/api/repos/acme/api/change/doc/ci-result".into();
+        let job = h.control.accept(second).job_id;
+        let verdict = settled_verdict(&h.control, &job).await;
+
+        assert_eq!(verdict.status, Status::Green);
+        assert_eq!(h.node.assigned().len(), ran, "not one step reached the fleet");
+        for name in ["build", "test", "lint"] {
+            assert_eq!(state_of_step(&h.control, &job, name), Some(StepState::Cached), "{name}");
+        }
+        assert!(
+            verdict.summary.as_deref().unwrap_or_default().contains("3 cached"),
+            "the summary must say what was actually checked; got {:?}",
+            verdict.summary
+        );
+        assert_eq!(h.control.queue_depth("acme"), Depth { queued: 0, running: 0 });
+    }
+
+    #[tokio::test]
+    async fn a_changed_dependency_invalidates_its_dependents() {
+        // `test` reads only `tests/**`, which is identical across these two trees — so on its own
+        // inputs it is a hit. Its *dependency* `build` changed, and D§6.1 folds a dependency's key
+        // into its dependents', so `test` must run anyway. Without that fold, a rebuilt library
+        // would be paired with a test result from the old one.
+        let t = trees();
+        let store = Arc::new(InMemoryStepMemo::default());
+        let plan = vec![
+            memo_spec("build", &["crates/**"], &[]),
+            memo_spec("test", &["tests/**"], &["build"]),
+        ];
+        let h = harness(
+            memo_config(store.clone()),
+            memo_fetcher(&t),
+            Arc::new(MemoPlanner(plan)),
+            NodeMode::Accept,
+        );
+
+        run_to_green(&h, "acme/api", "base").await;
+        assert_eq!(h.node.assigned().len(), 2);
+
+        let job = h.control.accept(dispatch("acme/api", "code")).job_id;
+        let ctrl = Arc::clone(&h.control);
+        let id = job.clone();
+        assert!(wait_until(move || state_of_step(&ctrl, &id, "build") == Some(StepState::Leased)).await);
+        assert_eq!(state_of_step(&h.control, &job, "test"), Some(StepState::Pending), "not cached, waiting");
+        report_leased(&h.control, &job, StepOutcome::Passed);
+
+        let ctrl = Arc::clone(&h.control);
+        let id = job.clone();
+        assert!(
+            wait_until(move || state_of_step(&ctrl, &id, "test") == Some(StepState::Leased)).await,
+            "the dependent must run: its dependency's key moved"
+        );
+        assert_eq!(h.node.assigned().len(), 4);
+    }
+
+    #[tokio::test]
+    async fn a_dependents_own_inputs_still_matter() {
+        // The mirror image, so the previous test is not passing for the wrong reason: `build` is a
+        // hit and `test`'s own inputs moved, so exactly one step runs.
+        let t = trees();
+        let store = Arc::new(InMemoryStepMemo::default());
+        let plan = vec![
+            memo_spec("build", &["crates/**"], &[]),
+            memo_spec("test", &["tests/**"], &["build"]),
+        ];
+        let h = harness(memo_config(store), memo_fetcher(&t), Arc::new(MemoPlanner(plan)), NodeMode::Accept);
+
+        run_to_green(&h, "acme/api", "base").await;
+        let job = h.control.accept(dispatch("acme/api", "test")).job_id;
+
+        let ctrl = Arc::clone(&h.control);
+        let id = job.clone();
+        assert!(wait_until(move || state_of_step(&ctrl, &id, "test") == Some(StepState::Leased)).await);
+        assert_eq!(state_of_step(&h.control, &job, "build"), Some(StepState::Cached));
+        assert_eq!(h.node.assigned().len(), 3, "only the test step re-ran");
+    }
+
+    #[tokio::test]
+    async fn two_tenants_with_identical_trees_never_see_each_others_results() {
+        // Design D§1's timing/existence-oracle row: "every cache/memo/affinity key is tenant-scoped,
+        // so a cross-tenant hit is structurally impossible — there is nothing to time." Byte-identical
+        // trees, byte-identical steps, and `other` still runs its own build.
+        let t = trees();
+        let store = Arc::new(InMemoryStepMemo::default());
+        let h = harness(
+            memo_config(store.clone()),
+            memo_fetcher(&t),
+            Arc::new(MemoPlanner(vec![memo_spec("test", &["crates/**"], &[])])),
+            NodeMode::Accept,
+        );
+
+        run_to_green(&h, "acme/api", "base").await;
+        assert_eq!(h.node.assigned().len(), 1);
+
+        // A different tenant, the same tree id, the same content, the same step definition.
+        let other = h.control.accept(dispatch("other/api", "base")).job_id;
+        let ctrl = Arc::clone(&h.control);
+        let id = other.clone();
+        assert!(
+            wait_until(move || state_of_step(&ctrl, &id, "test") == Some(StepState::Leased)).await,
+            "the second tenant must run the work itself"
+        );
+        assert_eq!(h.node.assigned().len(), 2);
+        assert_eq!(h.node.assigned()[1].tenant, "other");
+
+        // And `acme`'s own repeat is still a hit, so the miss above is tenancy and nothing else.
+        let again = h.control.accept(dispatch("acme/api", "doc")).job_id;
+        assert_eq!(settled_verdict(&h.control, &again).await.status, Status::Green);
+        assert_eq!(state_of_step(&h.control, &again, "test"), Some(StepState::Cached));
+        assert_eq!(h.node.assigned().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn two_repos_of_the_same_tenant_do_share_the_memo() {
+        // The deliberate *other* side of the boundary, pinned so it stays a decision rather than an
+        // accident. D§1: "the tenant is the hard boundary"; D§6.1 keys the memo by tenant, not by
+        // repo. Two repos of one org with an identical step definition over identical input content
+        // are the same work, and the tenant already vouches for both — so the hit is correct, and it
+        // is what makes a shared library's steps cheap across an org.
+        let t = trees();
+        let store = Arc::new(InMemoryStepMemo::default());
+        let h = harness(
+            memo_config(store),
+            memo_fetcher(&t),
+            Arc::new(MemoPlanner(vec![memo_spec("test", &["crates/**"], &[])])),
+            NodeMode::Accept,
+        );
+
+        run_to_green(&h, "acme/api", "base").await;
+        let sibling = h.control.accept(dispatch("acme/web", "doc")).job_id;
+        assert_eq!(settled_verdict(&h.control, &sibling).await.status, Status::Green);
+        assert_eq!(state_of_step(&h.control, &sibling, "test"), Some(StepState::Cached));
+        assert_eq!(h.node.assigned().len(), 1, "a sibling repo of the same tenant is a hit");
+    }
+
+    #[tokio::test]
+    async fn an_errored_step_is_never_written_to_the_memo() {
+        // Spec §7's discipline one level down (D§6.1): an outage must not poison anything. A cached
+        // `errored` would attach our own five-minute outage to a tree for as long as the entry lived.
+        let t = trees();
+        let store = Arc::new(InMemoryStepMemo::default());
+        let h = harness(
+            memo_config(store.clone()),
+            memo_fetcher(&t),
+            Arc::new(MemoPlanner(vec![memo_spec("test", &["crates/**"], &[])])),
+            NodeMode::Accept,
+        );
+
+        let job = h.control.accept(dispatch("acme/api", "base")).job_id;
+        let ctrl = Arc::clone(&h.control);
+        let id = job.clone();
+        assert!(wait_until(move || state_of_step(&ctrl, &id, "test") == Some(StepState::Leased)).await);
+        report_leased(&h.control, &job, StepOutcome::Errored);
+        assert_eq!(settled_verdict(&h.control, &job).await.status, Status::Errored);
+        assert!(store.is_empty(), "nothing may be recorded for an errored step");
+
+        // The next tree with identical inputs must therefore run, not be served the outage.
+        let next = h.control.accept(dispatch("acme/api", "doc")).job_id;
+        let ctrl = Arc::clone(&h.control);
+        let id = next.clone();
+        assert!(wait_until(move || state_of_step(&ctrl, &id, "test") == Some(StepState::Leased)).await);
+        assert_eq!(h.node.assigned().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_remembered_failure_decides_red_without_a_node_and_then_expires() {
+        // D§6.1 caches `failed` **briefly**: it is real signal about the code on exactly these
+        // inputs, so a repeat should not rerun the world — but it is also the thing an author is
+        // actively trying to change, so it must expire.
+        let t = trees();
+        let store = Arc::new(InMemoryStepMemo::default());
+        let h = harness(
+            memo_config(store.clone()),
+            memo_fetcher(&t),
+            Arc::new(MemoPlanner(vec![memo_spec("test", &["crates/**"], &[])])),
+            NodeMode::Accept,
+        );
+
+        let job = h.control.accept(dispatch("acme/api", "base")).job_id;
+        let ctrl = Arc::clone(&h.control);
+        let id = job.clone();
+        assert!(wait_until(move || state_of_step(&ctrl, &id, "test") == Some(StepState::Leased)).await);
+        report_leased(&h.control, &job, StepOutcome::Failed);
+        assert_eq!(settled_verdict(&h.control, &job).await.status, Status::Red);
+
+        // Served — as `failed`, never as `cached`, because `cached` folds green.
+        let repeat = h.control.accept(dispatch("acme/api", "doc")).job_id;
+        let verdict = settled_verdict(&h.control, &repeat).await;
+        assert_eq!(verdict.status, Status::Red, "a remembered failure is still red");
+        assert_eq!(state_of_step(&h.control, &repeat, "test"), Some(StepState::Failed));
+        assert_eq!(h.node.assigned().len(), 1, "and it cost no node time");
+    }
+
+    #[tokio::test]
+    async fn a_failure_that_has_expired_is_re_run() {
+        // The other half: `failed_ttl` elapsed, so the step goes back to the fleet rather than
+        // reporting a stale red forever.
+        let t = trees();
+        let store: Arc<dyn StepMemo> = Arc::new(InMemoryStepMemo::new(MemoPolicy {
+            failed_ttl: Duration::ZERO,
+            ..MemoPolicy::default()
+        }));
+        let h = harness(
+            memo_config(store),
+            memo_fetcher(&t),
+            Arc::new(MemoPlanner(vec![memo_spec("test", &["crates/**"], &[])])),
+            NodeMode::Accept,
+        );
+
+        let job = h.control.accept(dispatch("acme/api", "base")).job_id;
+        let ctrl = Arc::clone(&h.control);
+        let id = job.clone();
+        assert!(wait_until(move || state_of_step(&ctrl, &id, "test") == Some(StepState::Leased)).await);
+        report_leased(&h.control, &job, StepOutcome::Failed);
+        settled_verdict(&h.control, &job).await;
+
+        let repeat = h.control.accept(dispatch("acme/api", "doc")).job_id;
+        let ctrl = Arc::clone(&h.control);
+        let id = repeat.clone();
+        assert!(
+            wait_until(move || state_of_step(&ctrl, &id, "test") == Some(StepState::Leased)).await,
+            "an expired failure must be re-run, not re-reported"
+        );
+        assert_eq!(h.node.assigned().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_step_with_no_declared_inputs_is_never_cached() {
+        // The refusal of D§6.1 that keeps a stale green out of the system: with no inputs the key
+        // would not mention the tree at all, so the first `passed` would answer every future run of
+        // this step — forever, for any code.
+        let t = trees();
+        let store = Arc::new(InMemoryStepMemo::default());
+        let h = harness(
+            memo_config(store.clone()),
+            memo_fetcher(&t),
+            // Same shape as the cacheable plans above, minus `inputs`.
+            Arc::new(MemoPlanner(vec![StepSpec::new("test", vec!["cargo".into()], "rust:1.83")])),
+            NodeMode::Accept,
+        );
+
+        run_to_green(&h, "acme/api", "base").await;
+        assert!(store.is_empty(), "an uncacheable step is never recorded either");
+
+        let repeat = h.control.accept(dispatch("acme/api", "doc")).job_id;
+        let ctrl = Arc::clone(&h.control);
+        let id = repeat.clone();
+        assert!(wait_until(move || state_of_step(&ctrl, &id, "test") == Some(StepState::Leased)).await);
+        assert_eq!(h.node.assigned().len(), 2, "every run of an input-less step must run");
+    }
+
+    #[tokio::test]
+    async fn inputs_that_name_nothing_are_the_same_refusal() {
+        // A plausible-looking declaration that selects nothing folds an empty set — the same digest
+        // on every tree in existence — so it must be refused exactly like no inputs at all.
+        let t = trees();
+        let store = Arc::new(InMemoryStepMemo::default());
+        let h = harness(
+            memo_config(store.clone()),
+            memo_fetcher(&t),
+            Arc::new(MemoPlanner(vec![memo_spec("test", &["no-such-dir/**"], &[])])),
+            NodeMode::Accept,
+        );
+
+        run_to_green(&h, "acme/api", "base").await;
+        assert!(store.is_empty());
+
+        let repeat = h.control.accept(dispatch("acme/api", "doc")).job_id;
+        let ctrl = Arc::clone(&h.control);
+        let id = repeat.clone();
+        assert!(wait_until(move || state_of_step(&ctrl, &id, "test") == Some(StepState::Leased)).await);
+        assert_eq!(h.node.assigned().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_control_plane_with_no_digester_behaves_exactly_as_it_did_before_layer_2() {
+        // Unwired means off, not open. The default `MemoConfig` refuses every glob, so a deployment
+        // that has not wired a digester runs every step — the M2 behaviour, unchanged.
+        let t = trees();
+        let h = harness(
+            fast_config(),
+            memo_fetcher(&t),
+            Arc::new(MemoPlanner(vec![memo_spec("test", &["crates/**"], &[])])),
+            NodeMode::Accept,
+        );
+        run_to_green(&h, "acme/api", "base").await;
+        let repeat = h.control.accept(dispatch("acme/api", "doc")).job_id;
+        let ctrl = Arc::clone(&h.control);
+        let id = repeat.clone();
+        assert!(wait_until(move || state_of_step(&ctrl, &id, "test") == Some(StepState::Leased)).await);
+        assert_eq!(h.node.assigned().len(), 2);
     }
 }
