@@ -1,0 +1,41 @@
+[package]
+name = "hull-ci-proxy"
+description = "The package proxy: the one destination a sandbox may reach. Allowlisted upstreams, per-job grants, upstream credentials that terminate here and never enter a job."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+hull-ci-proto = { path = "../hull-ci-proto" }
+# D§7.4: "the pull/proxy credential is just a tenant secret". The proxy resolves upstream credentials
+# through the broker's types — `SecretBytes` (zeroizing, `Debug`-redacted) and `Masker` — so a
+# registry token has the same custody properties here as it does everywhere else in the system. The
+# proxy holds no key material and implements neither `SealedStore` nor `KeyManager`.
+hull-ci-secrets = { path = "../hull-ci-secrets" }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["net"] }
+tracing.workspace = true
+axum.workspace = true
+reqwest.workspace = true
+# Grant tokens: the same construction the secret broker's capability uses (random id + random
+# authenticator, digest stored, constant-time compare), for the same reason.
+rand = "0.8"
+subtle = "2"
+blake3.workspace = true
+hex.workspace = true
+zeroize = { version = "1", features = ["derive"] }
+# Absolute-URL parsing. The allowlist is a decision about a *host*, and hand-rolling host extraction
+# from a string is how `https://registry.npmjs.org@evil.example/` gets proxied to `evil.example`.
+url = "2"
+# Streaming an upstream response body back to the job without buffering a 200 MB tarball in memory.
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+bytes = "1"
+
+[dev-dependencies]
+tempfile.workspace = true
+# The integration suite stands a real upstream up on loopback and drives the proxy over a socket, so
+# it needs a server, a client, and a runtime that can hold both at once.
+tokio = { workspace = true, features = ["net", "rt-multi-thread", "macros"] }

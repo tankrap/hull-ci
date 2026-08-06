@@ -51,6 +51,7 @@ pub mod fetch;
 pub mod membership;
 pub mod node;
 pub mod pipeline;
+pub mod proxy;
 pub mod plan;
 pub mod secrets;
 pub mod workspace;
@@ -111,11 +112,26 @@ pub struct Runner {
     /// is an operator action against the control-plane DB (D§7.4), and inventing an endpoint for it
     /// would be a new attack surface this milestone does not need.
     pub secrets: Option<Arc<hull_ci_secrets::SecretService>>,
+    /// The package proxy, or `None` in `HULL_CI_PROXY=off` (§14.3's default).
+    ///
+    /// Handed back rather than served inside [`assemble`] for the same reason `router` is: it needs
+    /// its **own listener** on its **own address**, because the two are reached from different places
+    /// — `HULL_CI_BIND` is where the control plane accepts dispatches, and `HULL_CI_PROXY_BIND` is
+    /// what a sandbox network's gateway can route to. Binding them together would either expose the
+    /// dispatch endpoint to every job on the fleet or make the proxy unreachable.
+    pub packages: Option<proxy::PackagePlane>,
 }
 
 /// Build the runner: choose a backend, check it, and wire the seams.
 pub async fn assemble(config: &Config) -> Result<Runner, StartupError> {
-    let backend = choose_backend(config).await?;
+    // §14.3. Built before the backend, because it is what decides whether the backend is asked for a
+    // network at all — and `None` here means every job keeps `--network none`, which is the default
+    // and the safe answer.
+    let packages = proxy::assemble(&config.proxy, proxy::dev_credentials(config.dev_secrets.as_deref()));
+    proxy::announce(packages.as_ref(), &config.proxy);
+    let network = packages.as_ref().map(|p| p.network_mode()).unwrap_or(hull_ci_node::NetworkMode::None);
+
+    let backend = choose_backend(config, network).await?;
     announce_isolation(config, backend.as_ref());
     // Taken before the backend is handed to the agent: which §14 clauses this deployment enforces
     // cannot change while the process runs (`choose_backend` refuses rather than degrades), so the
@@ -128,10 +144,13 @@ pub async fn assemble(config: &Config) -> Result<Runner, StartupError> {
     prepare_dir("workspace root", &config.work_root)?;
 
     let broker = FetchBroker::new(ContentStore::new(&config.store_root))?;
-    let agent = NodeAgent::new(
+    let mut agent = NodeAgent::new(
         NodeConfig { node_id: config.node_id.clone(), ..NodeConfig::default() },
         backend,
     );
+    if let Some(access) = packages.as_ref().and_then(|p| p.access()) {
+        agent = agent.with_package_access(access);
+    }
 
     // D§7.4. The plane is built before the fleet because enrolling the node's key is a precondition
     // for it redeeming anything: a node wired to a broker it is not enrolled with would fail every
@@ -220,12 +239,30 @@ pub async fn assemble(config: &Config) -> Result<Runner, StartupError> {
         )));
     }
 
-    Ok(Runner { router, control, fleet, secrets: secrets.map(|p| p.service) })
+    Ok(Runner { router, control, fleet, secrets: secrets.map(|p| p.service), packages })
 }
 
 /// Assemble, bind, and serve until the process ends.
 pub async fn run(config: Config) -> Result<(), StartupError> {
     let runner = assemble(&config).await?;
+
+    // §14.3's package proxy, on its own listener. Bound *before* the dispatch endpoint so a runner
+    // that cannot serve packages never accepts a job that will need them: with the sandbox network
+    // already configured, jobs would otherwise start on a network whose only destination is a socket
+    // nobody is listening on, and fail as broken builds rather than as a broken deployment.
+    if let Some(packages) = runner.packages {
+        let addr = config.proxy.bind;
+        let listener = tokio::net::TcpListener::bind(addr)
+            .await
+            .map_err(|source| StartupError::Bind { addr, source })?;
+        tracing::info!(%addr, upstreams = ?packages.upstreams(), "package proxy listening (§14.3)");
+        tokio::spawn(async move {
+            if let Err(e) = packages.serve(listener).await {
+                tracing::error!(error = %e, "the package proxy stopped serving; jobs can no longer resolve");
+            }
+        });
+    }
+
     let listener = tokio::net::TcpListener::bind(config.bind)
         .await
         .map_err(|source| StartupError::Bind { addr: config.bind, source })?;
@@ -238,9 +275,17 @@ pub async fn run(config: Config) -> Result<(), StartupError> {
 /// `HULL_CI_SANDBOX=container` goes through `hull_ci_node::detect_backend`, which errors when no
 /// container runtime answers instead of falling back — the fallback is the hole, so it is opt-in and
 /// has its own name.
-async fn choose_backend(config: &Config) -> Result<Arc<dyn SandboxBackend>, StartupError> {
+async fn choose_backend(
+    config: &Config,
+    network: hull_ci_node::NetworkMode,
+) -> Result<Arc<dyn SandboxBackend>, StartupError> {
     match config.sandbox {
-        SandboxChoice::Container => Ok(hull_ci_node::detect_backend(ContainerConfig::default()).await?),
+        SandboxChoice::Container => {
+            // The one place the sandbox's network posture is chosen. `detect_backend` runs the live
+            // posture probe for a proxy network and derives `egress_deny` from what it found, so a
+            // misconfigured network costs a capability rather than a job's isolation (§14.3).
+            Ok(hull_ci_node::detect_backend(ContainerConfig { network, ..ContainerConfig::default() }).await?)
+        }
         SandboxChoice::LocalProcess if !config.allow_unsandboxed => {
             Err(StartupError::UnsandboxedNotPermitted)
         }

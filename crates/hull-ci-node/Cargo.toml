@@ -28,3 +28,10 @@ tempfile.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+# **Dev-only, and deliberately so.** The node does not talk to the package proxy — it puts a sandbox
+# on a network where the proxy is reachable, and that is the whole of its involvement. But the live
+# §14.3 probes are only worth anything if the thing answering on that network is the *real* proxy
+# rather than a stub that accepts TCP, so the test build takes a dependency the production build must
+# not have.
+hull-ci-proxy = { path = "../hull-ci-proxy" }
+tokio = { workspace = true, features = ["net", "rt-multi-thread", "macros"] }

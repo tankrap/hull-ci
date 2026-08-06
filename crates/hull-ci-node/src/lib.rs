@@ -24,6 +24,9 @@
 //! - [`agent`] — [`NodeAgent`]: state, heartbeats, one assignment → one [`StepReport`].
 //! - [`env`] — the allowlist-built job environment (§14.2).
 //! - [`secrets`] — this node's Ed25519 identity and its route to the secret broker (D§7.4).
+//! - [`packages`] — the thin seam to the package proxy (§14.3): mint a per-job grant, hand back some
+//!   environment variables, revoke when the step ends. The proxy itself lives in another crate and
+//!   another process, because it holds tenant registry credentials and D§7.1 says a node holds none.
 //!
 //! # What this node cannot do, by construction
 //!
@@ -62,17 +65,40 @@
 //! ([`container::probe_docker`]) rather than from a constant, and it can be `false` for reasons that
 //! have nothing to do with this code being finished:
 //!
-//! | §14 control | Container backend, daemon up | Container backend, no daemon | Local process |
-//! |---|---|---|---|
-//! | 14.1 single-use | yes | n/a (refuses to construct) | **no** — no rootfs is destroyed |
-//! | 14.1 kernel isolation → `cross_tenant_safe` | **no** — shared kernel, always | n/a | **no** |
-//! | 14.2 env allowlist | yes | n/a | yes |
-//! | 14.2 metadata blackhole | yes, via `--network none` | n/a | **no** |
-//! | 14.3 egress-deny / no inbound | yes, via `--network none` | n/a | **no** |
-//! | 14.4 non-root, ro-rootfs, tmpfs, caps, NNP, seccomp | yes | n/a | **no** |
-//! | 14.4 cpu/mem/pid limits | as the daemon reports them | n/a | **no** |
-//! | 14.4 disk limit | **no** — not attempted, so not claimed | n/a | **no** |
-//! | 14.4 wall clock + output cap | yes | n/a | yes |
+//! | §14 control | Container, `--network none` | Container, proxy network | Container, no daemon | Local process |
+//! |---|---|---|---|---|
+//! | 14.1 single-use | yes | yes | n/a (refuses to construct) | **no** — no rootfs is destroyed |
+//! | 14.1 kernel isolation → `cross_tenant_safe` | **no** — shared kernel, always | **no** | n/a | **no** |
+//! | 14.2 env allowlist | yes | yes | n/a | yes |
+//! | 14.2 metadata blackhole | yes, via `--network none` | **only if probed** | n/a | **no** |
+//! | 14.3 egress-deny / no inbound | yes, via `--network none` | **only if probed** | n/a | **no** |
+//! | 14.4 non-root, ro-rootfs, tmpfs, caps, NNP, seccomp | yes | yes | n/a | **no** |
+//! | 14.4 cpu/mem/pid limits | as the daemon reports them | same | n/a | **no** |
+//! | 14.4 disk limit | **no** — not attempted, so not claimed | **no** | n/a | **no** |
+//! | 14.4 wall clock + output cap | yes | yes | n/a | yes |
+//!
+//! # The one place a job gets a network (§14.3)
+//!
+//! `--network none` is the default and stays the default. [`NetworkMode::ProxyOnly`] is the opt-in
+//! exception §14.3 allows — "Where dependency resolution needs it, restrict egress to an allowlisted,
+//! authenticated package proxy" — and it is the only configuration in this crate that gives untrusted
+//! code a socket to the outside of its netns. That makes it the one place where a wrong `true` in
+//! [`EnforcedControls`] would be actively dangerous rather than merely conservative, so it carries a
+//! different standard of evidence from everything else here:
+//!
+//! * A [`ProxyNetwork`] built from configuration has **no posture** and therefore claims **nothing**.
+//!   The honest default is a property of the type, not a rule to remember.
+//! * [`probe_network_posture`] fills one in by putting a container on the network and *trying* — a
+//!   raw public IP, a public hostname, the metadata endpoint, a peer container, a port scan of the
+//!   node itself, and an attempt to add a default route.
+//! * Every one of those probes is paired with a **control** in the live tests, run on an ordinary
+//!   bridge, where it must come out the other way. A probe that cannot fail is not evidence.
+//!
+//! One result of holding that line: the metadata-endpoint claim does **not** rest on the connect
+//! probe, because a control test showed the connect fails identically on a wide-open network (this
+//! host runs no metadata service, so nothing answers `169.254.169.254` either way). It rests on there
+//! being no route off-subnet and no `CAP_NET_ADMIN` to make one. See
+//! [`NetworkPosture::metadata_blackholed`].
 //!
 //! `cross_tenant_safe` is `false` on every backend in this crate, so `admits_untrusted()` is `false`
 //! on every backend in this crate. That is not an oversight — it is design D§13's M1 statement
@@ -86,16 +112,21 @@ pub mod controls;
 pub mod detect;
 pub mod env;
 pub mod local;
+pub mod packages;
 pub mod process;
 pub mod sandbox;
 pub mod secrets;
 
 pub use agent::{ControlLink, LinkError, NodeAgent, NodeConfig, NodeErrorKind};
 pub use capture::{CapturedOutput, OutputCapture, OutputCaps, DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES};
-pub use container::{ContainerBackend, ContainerConfig, DockerProbe, NetworkMode};
+pub use container::{
+    probe_network_posture, ContainerBackend, ContainerConfig, DockerProbe, NetworkMode,
+    NetworkPosture, ProxyNetwork,
+};
 pub use controls::EnforcedControls;
 pub use detect::{detect_test_command, DetectedCommand, Detection};
 pub use local::LocalProcessBackend;
+pub use packages::PackageAccess;
 pub use sandbox::{
     ExecOutcome, ExecRequest, ExecStatus, Lifecycle, ResourceLimits, SandboxBackend, SandboxError,
     SandboxInstance, SandboxSpec,

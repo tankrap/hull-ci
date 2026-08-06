@@ -47,13 +47,209 @@ use crate::sandbox::{
 pub enum NetworkMode {
     /// `--network none`: the container gets loopback and nothing else. This is a real default-deny
     /// egress **and** a real metadata blackhole (169.254.169.254 has no route to reach), which is why
-    /// it is the only mode that lets those two capabilities be reported `true`.
+    /// it is a mode that lets those two capabilities be reported `true` with no evidence beyond the
+    /// flag itself.
+    ///
+    /// **The default, and it stays the default.** §14.3: "A job **SHOULD** run with no outbound
+    /// network."
     None,
     /// A named docker network. We cannot see its nftables rules from here, so both `egress_deny` and
     /// `metadata_blackhole` drop to `false` — the operator may well have locked it down, but this code
     /// has no evidence of it, and reporting an unverified control is exactly the failure mode that
     /// turns this design into a security hole.
     Named(String),
+    /// A network on which the only reachable destination is meant to be the package proxy (§14.3's
+    /// "restrict egress to an allowlisted, authenticated package proxy", D§7.3).
+    ///
+    /// **This is the mode that weakens the strongest guarantee in this crate**, so it carries its own
+    /// evidence: a [`ProxyNetwork`] whose `posture` is `None` claims nothing at all, and the posture
+    /// can only be filled in by [`probe_network_posture`], which finds out by *trying*. Naming a
+    /// docker network `internal` is not evidence; being unable to reach 1.1.1.1 from inside it is.
+    ProxyOnly(ProxyNetwork),
+}
+
+/// A sandbox network with a package proxy on it, and what was actually observed about it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProxyNetwork {
+    /// The docker network jobs are attached to.
+    pub network: String,
+    /// `host:port` of the proxy **as a sandbox on this network sees it** — normally the network's own
+    /// gateway address, because the recommended deployment runs the proxy in the node's network
+    /// namespace rather than as a peer container. See [`probe_network_posture`].
+    pub endpoint: String,
+    /// What a live probe container observed from inside this network. `None` means nobody has
+    /// looked, and [`controls_for`] therefore claims nothing — the honest default is a property of
+    /// the type rather than a rule someone has to remember.
+    pub posture: Option<NetworkPosture>,
+}
+
+impl ProxyNetwork {
+    /// Declare the configuration. The posture is deliberately absent: only [`probe_network_posture`]
+    /// can supply one, so there is no way to write a `ProxyNetwork` that asserts a posture nobody
+    /// measured.
+    pub fn new(network: impl Into<String>, endpoint: impl Into<String>) -> Self {
+        ProxyNetwork { network: network.into(), endpoint: endpoint.into(), posture: None }
+    }
+
+    fn proxy_host_port(&self) -> (String, String) {
+        match self.endpoint.rsplit_once(':') {
+            Some((h, p)) => (h.to_string(), p.to_string()),
+            None => (self.endpoint.clone(), "80".to_string()),
+        }
+    }
+}
+
+/// Ports scanned on the sandbox network's gateway — which **is the node itself**.
+///
+/// D§7.3 says the proxy must be the only reachable destination: "never the open internet, never Hull,
+/// never the internal content store, never other nodes." A bridge network's gateway is the node's own
+/// address on that bridge, and traffic to it takes the kernel's `INPUT` path rather than `FORWARD` —
+/// so `--internal`, which installs `FORWARD` drops, does **not** stop a sandbox reaching a service the
+/// node has bound on `0.0.0.0`. That is the one real hole in this posture, and it is the reason this
+/// list exists.
+///
+/// `2375`/`2376` are the ones that matter most: an unauthenticated Docker API reachable from inside a
+/// sandbox is a complete host takeover, and it is a port people leave open.
+///
+/// **This is a sample, not a proof.** Finding a port open disproves the posture; finding none does
+/// not prove there is nothing else listening. [`NetworkPosture::caveats`] says so out loud, and an
+/// operator who wants the strong version binds the node's services to a specific interface rather
+/// than to `0.0.0.0`.
+pub const GATEWAY_SCAN_PORTS: &[u16] = &[
+    22, 80, 443, 2375, 2376, 2379, 3000, 3306, 5000, 5432, 6379, 6443, 8000, 8080, 8443, 9090, 9100,
+    10250,
+];
+
+/// What a probe container observed from inside a sandbox network.
+///
+/// Every field is the result of *doing the thing*, not of reading configuration. The one exception is
+/// [`declared_internal`](Self::declared_internal), which is the daemon's own statement — kept because
+/// it is a useful cross-check, and deliberately not sufficient on its own.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct NetworkPosture {
+    /// The daemon reports `Internal: true` for this network.
+    pub declared_internal: bool,
+    /// The sandbox's routing table has **no default route**. The strongest single fact here: without
+    /// one, and without `CAP_NET_ADMIN` to add one, the sandbox can only address its own subnet.
+    pub no_default_route: bool,
+    /// A raw public IP (`1.1.1.1:80`) could not be reached.
+    pub public_ip_unreachable: bool,
+    /// A public hostname could not be resolved.
+    pub public_dns_unresolvable: bool,
+    /// `169.254.169.254:80` could not be reached (§14.2 names this one directly).
+    ///
+    /// **Not sufficient on its own** — see [`NetworkPosture::metadata_blackholed`]. On a host with no
+    /// metadata service at all (a laptop, a bare-metal node, Docker Desktop's VM) this is `true` on
+    /// every network including a wide-open one, because nothing is listening there to refuse the
+    /// connection either way.
+    pub metadata_unreachable: bool,
+    /// The configured proxy endpoint accepted a connection. Not a *safety* fact — it is the
+    /// usability one, and a proxy posture with no proxy on it is a broken deployment rather than an
+    /// unsafe one.
+    pub proxy_reachable: bool,
+    /// A peer container on the same network could not be reached — i.e. inter-container
+    /// communication is off, so one job cannot open a connection to another's.
+    pub peer_unreachable: bool,
+    /// A sandbox could not add its own default route (i.e. `CAP_NET_ADMIN` really is dropped, so the
+    /// "no default route" fact above is not something a job can undo).
+    pub cannot_add_route: bool,
+    /// Ports found listening on the network gateway — the node — other than the proxy's. **Any**
+    /// entry here disproves "the proxy is the only reachable destination".
+    pub gateway_ports_open: Vec<u16>,
+    /// Set when the probe could not be run at all. A posture that failed to run claims nothing.
+    pub failure: Option<String>,
+}
+
+impl NetworkPosture {
+    /// Whether this posture proves §14.3's egress-deny **for this deployment's network**.
+    ///
+    /// Every conjunct is required, and each one covers a way the others can be true while the
+    /// posture is still open:
+    ///
+    /// * `declared_internal` — the daemon agrees with us about what this network is.
+    /// * `no_default_route` + `cannot_add_route` — the structural fact and the fact that a job cannot
+    ///   undo it. Without the second, the first is a default a hostile job edits.
+    /// * `public_ip_unreachable` + `public_dns_unresolvable` — behaviour, tested separately because
+    ///   a resolver failure and a routing failure look identical from inside and only one of them is
+    ///   the control being asserted.
+    /// * `gateway_ports_open.is_empty()` — nothing of the node's own is reachable. See
+    ///   [`GATEWAY_SCAN_PORTS`] for why this is a sample rather than a proof.
+    pub fn egress_denied(&self) -> bool {
+        self.failure.is_none()
+            && self.declared_internal
+            && self.no_default_route
+            && self.cannot_add_route
+            && self.public_ip_unreachable
+            && self.public_dns_unresolvable
+            && self.gateway_ports_open.is_empty()
+    }
+
+    /// Whether the cloud metadata endpoint is genuinely unreachable (§14.2).
+    ///
+    /// **Deliberately not just [`metadata_unreachable`](Self::metadata_unreachable).** That field is
+    /// a connect probe, and a connect probe cannot tell "this address is blackholed" from "nothing
+    /// happens to be listening on it". On any host without a metadata service — a developer laptop,
+    /// a bare-metal node, the Docker Desktop VM this crate is built on — the connect fails on a
+    /// *wide-open bridge network* exactly as it does under `--network none`. A live test caught this
+    /// by asserting the open-bridge control and finding `metadata_blackhole: true` on a network with
+    /// full internet access.
+    ///
+    /// So the claim rests on the structural fact instead: `169.254.169.254` is off-subnet, so with no
+    /// default route there is nowhere to send it, and with `CAP_NET_ADMIN` dropped a job cannot make
+    /// one. The connect probe stays as corroboration — if it *did* answer, something is very wrong —
+    /// but it is not what carries the claim.
+    pub fn metadata_blackholed(&self) -> bool {
+        self.failure.is_none()
+            && self.metadata_unreachable
+            && self.no_default_route
+            && self.cannot_add_route
+    }
+
+    /// What this posture did **not** establish, in the operator's words.
+    ///
+    /// Logged at node start alongside [`EnforcedControls::unmet_clauses`]. The difference between the
+    /// two matters: `unmet_clauses` lists controls that are off, and this lists controls that are on
+    /// but whose evidence has an edge. A reader deserves both.
+    pub fn caveats(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        if self.failure.is_some() {
+            out.push("the network posture probe did not run, so nothing about this network is known".into());
+            return out;
+        }
+        out.push(format!(
+            "the gateway port scan covers {} well-known ports, so an unusual port bound on the \
+             node's `0.0.0.0` would not have been found; bind node services to a specific interface \
+             for the strong version",
+            GATEWAY_SCAN_PORTS.len()
+        ));
+        out.push(
+            "the metadata-endpoint claim rests on there being no route off-subnet, not on the \
+             connect probe: on a host with no metadata service the probe fails identically on an \
+             open network"
+                .into(),
+        );
+        if !self.peer_unreachable {
+            out.push(
+                "inter-container communication is ON for this network, so one job can open a \
+                 connection to another job's sandbox (create the network with \
+                 `--opt com.docker.network.bridge.enable_icc=false`)"
+                    .into(),
+            );
+        }
+        out.push(
+            "the node itself can always open a connection into a sandbox on a bridge network; \
+             §14.3's `no inbound` is reported here as `no inbound from another sandbox`"
+                .into(),
+        );
+        if !self.proxy_reachable {
+            out.push(
+                "the configured proxy endpoint did not answer, so jobs on this network can reach \
+                 nothing at all"
+                    .into(),
+            );
+        }
+        out
+    }
 }
 
 /// Configuration for the container backend.
@@ -193,6 +389,317 @@ pub async fn probe_docker(runtime: &str) -> DockerProbe {
     probe
 }
 
+/// Image used for the network-posture probe. Small, and has `ip`, `nc`, `nslookup` and `timeout`.
+pub const PROBE_IMAGE: &str = "alpine:3";
+
+/// The probe script. A constant, and **no configuration is interpolated into it** — every operator
+/// value arrives through `--env`, so a network name or endpoint from a config file can never become
+/// shell syntax. (D§7.2's "no raw shell on any host, ever" is a rule about *job* code; this script is
+/// ours and contains nothing anybody outside this file wrote. The `--env` discipline is what keeps
+/// that true.)
+///
+/// `timeout N nc HOST PORT </dev/null` is the reachability primitive: `0` for an accepted connection,
+/// `1` for a refused one, `124`/`143` for a timeout. BusyBox's `nc` has no `-z` or `-w`, and using
+/// them anyway makes `nc` exit non-zero on the unrecognised option — which reads exactly like
+/// "unreachable" and would make every one of these probes silently vacuous.
+const POSTURE_SCRIPT: &str = r#"
+echo "default_route=$(ip route 2>/dev/null | grep -c '^default')"
+timeout 3 nc 1.1.1.1 80 </dev/null >/dev/null 2>&1; echo "raw_ip=$?"
+timeout 3 nc 169.254.169.254 80 </dev/null >/dev/null 2>&1; echo "metadata=$?"
+nslookup example.com >/dev/null 2>&1; echo "public_dns=$?"
+timeout 5 nc "$PROXY_HOST" "$PROXY_PORT" </dev/null >/dev/null 2>&1; echo "proxy=$?"
+if [ -n "$PEER_IP" ]; then
+  timeout 3 nc "$PEER_IP" 8080 </dev/null >/dev/null 2>&1; echo "peer=$?"
+else
+  echo "peer=skip"
+fi
+for p in $SCAN_PORTS; do
+  timeout 2 nc "$GW" "$p" </dev/null >/dev/null 2>&1 && echo "gwopen=$p"
+done
+ip route add default via "$GW" >/dev/null 2>&1; echo "route_add=$?"
+echo "probe_done=1"
+"#;
+
+/// Find out what a sandbox on `network` can actually reach, by putting a container there and trying.
+///
+/// This is the function that makes [`NetworkMode::ProxyOnly`] safe to offer at all. Moving off
+/// `--network none` weakens the strongest guarantee this crate has, and the failure mode — a backend
+/// that reports `egress_deny: true` while a job can reach the internet — is worse than having no
+/// proxy at all, because the scheduler believes the struct. So the posture is **measured**:
+///
+/// 1. Ask the daemon whether the network is `Internal` and what its gateway is.
+/// 2. Start a peer container on the network, so "can one job reach another" is a question with a
+///    real answer rather than an assumption about `enable_icc`.
+/// 3. Run a probe container **with the same hardening a job gets** (`--cap-drop ALL`, non-root) and
+///    have it try: a raw public IP, a public hostname, the cloud metadata endpoint, the proxy, the
+///    peer, a list of ports on the node, and adding its own default route.
+/// 4. Tear the peer down.
+///
+/// Anything that goes wrong sets [`NetworkPosture::failure`], and a posture with a failure proves
+/// nothing — [`NetworkPosture::egress_denied`] returns `false` and the capabilities follow.
+pub async fn probe_network_posture(
+    config: &ContainerConfig,
+    proxy: &ProxyNetwork,
+) -> NetworkPosture {
+    let mut posture = NetworkPosture::default();
+    let fail = |mut p: NetworkPosture, why: String| {
+        p.failure = Some(why);
+        p
+    };
+
+    // 1. The daemon's own statement, and the gateway address we will scan.
+    let inspect = vec![
+        config.runtime.clone(),
+        "network".into(),
+        "inspect".into(),
+        proxy.network.clone(),
+        "--format".into(),
+        "{{json .}}".into(),
+    ];
+    let (status, out) = match control_command(config, inspect, &[]).await {
+        Ok(v) => v,
+        Err(e) => return fail(posture, format!("could not inspect network `{}`: {e}", proxy.network)),
+    };
+    if status != ExecStatus::Exited(0) {
+        return fail(posture, format!("network `{}` does not exist ({status:?})", proxy.network));
+    }
+    let json: serde_json::Value = match serde_json::from_str(out.trim()) {
+        Ok(v) => v,
+        Err(e) => return fail(posture, format!("could not parse `network inspect`: {e}")),
+    };
+    posture.declared_internal = json["Internal"].as_bool().unwrap_or(false);
+    let gateway = json["IPAM"]["Config"]
+        .as_array()
+        .and_then(|c| c.first())
+        .and_then(|c| c["Gateway"].as_str())
+        .map(str::to_string);
+    let Some(gateway) = gateway else {
+        // No gateway address means the scan cannot run, and a posture with an unscanned gateway is
+        // one we must not certify.
+        return fail(posture, format!("network `{}` reports no gateway address", proxy.network));
+    };
+
+    // 2. A peer on the network, so the inter-container question is answered by observation.
+    let peer_name = format!("hull-ci-probe-peer-{}", short_id());
+    let peer_argv = vec![
+        config.runtime.clone(),
+        "run".into(),
+        "--detach".into(),
+        "--name".into(),
+        peer_name.clone(),
+        "--network".into(),
+        proxy.network.clone(),
+        "--label".into(),
+        "hull-ci.probe=peer".into(),
+        PROBE_IMAGE.to_string(),
+        "nc".into(),
+        "-l".into(),
+        "-p".into(),
+        "8080".into(),
+    ];
+    let peer_ip = match control_command(config, peer_argv, &[]).await {
+        Ok((ExecStatus::Exited(0), _)) => peer_ip_of(config, &peer_name).await,
+        // A peer we could not start is not a reason to abandon the whole probe; it is a reason not to
+        // claim the one fact it was there to establish.
+        _ => None,
+    };
+
+    // 3. The probe proper, hardened like a job so that `cannot_add_route` is a fact about the
+    //    configuration jobs actually run under.
+    let scan: Vec<String> = GATEWAY_SCAN_PORTS.iter().map(|p| p.to_string()).collect();
+    let (proxy_host, proxy_port) = proxy.proxy_host_port();
+    let env = [
+        ("GW", gateway.as_str()),
+        ("PEER_IP", peer_ip.as_deref().unwrap_or("")),
+        ("PROXY_HOST", proxy_host.as_str()),
+        ("PROXY_PORT", proxy_port.as_str()),
+        ("SCAN_PORTS", scan.join(" ").as_str()),
+    ]
+    .map(|(k, v)| (k.to_string(), v.to_string()));
+
+    let mut probe_argv = vec![
+        config.runtime.clone(),
+        "run".into(),
+        "--rm".into(),
+        "--network".into(),
+        proxy.network.clone(),
+        "--cap-drop".into(),
+        "ALL".into(),
+        "--security-opt".into(),
+        "no-new-privileges".into(),
+        "--user".into(),
+        config.user.clone(),
+        "--label".into(),
+        "hull-ci.probe=posture".into(),
+    ];
+    for (k, v) in &env {
+        probe_argv.push("--env".into());
+        probe_argv.push(format!("{k}={v}"));
+    }
+    probe_argv.extend([
+        "--entrypoint".to_string(),
+        "/bin/sh".to_string(),
+        PROBE_IMAGE.to_string(),
+        "-c".to_string(),
+        POSTURE_SCRIPT.to_string(),
+    ]);
+
+    let probe_result = control_command(config, probe_argv, &[]).await;
+
+    // 4. Tear the peer down whatever happened. A probe container left running *is* a peer on the
+    //    sandbox network, which is the exact thing the peer check exists to detect — so leaking one
+    //    would quietly change the posture of every job placed afterwards.
+    let rm = vec![config.runtime.clone(), "rm".into(), "--force".into(), peer_name.clone()];
+    if let Err(e) = control_command(config, rm, &[]).await {
+        tracing::error!(peer = %peer_name, error = %e, "could not remove a posture-probe peer");
+    }
+
+    let (status, output) = match probe_result {
+        Ok(v) => v,
+        Err(e) => return fail(posture, format!("posture probe could not run: {e}")),
+    };
+    if status != ExecStatus::Exited(0) {
+        return fail(posture, format!("posture probe exited {status:?}: {output}"));
+    }
+    let mut posture = parse_posture(&output, posture, peer_ip.is_some());
+
+    exclude_proxy_port(&mut posture, &gateway, &proxy_host, &proxy_port);
+    posture
+}
+
+/// Drop the proxy's own port from the gateway findings.
+///
+/// The proxy is the one destination that is *supposed* to answer, so finding it is the expected
+/// result rather than a violation. The `proxy_host == gateway` guard is the part that matters: if the
+/// proxy is a peer container rather than a node process, then an open port of that same number **on
+/// the node** is a different service entirely and a genuine finding, so it stays.
+fn exclude_proxy_port(posture: &mut NetworkPosture, gateway: &str, proxy_host: &str, proxy_port: &str) {
+    if proxy_host != gateway {
+        return;
+    }
+    if let Ok(port) = proxy_port.parse::<u16>() {
+        posture.gateway_ports_open.retain(|p| *p != port);
+    }
+}
+
+/// Read the probe's `key=value` output into a posture.
+///
+/// A pure function, so the parse — which is where a misread line turns into a false capability — is
+/// testable without a daemon.
+pub fn parse_posture(output: &str, mut posture: NetworkPosture, had_peer: bool) -> NetworkPosture {
+    let mut done = false;
+    let mut saw: std::collections::BTreeSet<&str> = Default::default();
+    for line in output.lines().map(str::trim) {
+        let Some((key, value)) = line.split_once('=') else { continue };
+        saw.insert(key);
+        match key {
+            "default_route" => posture.no_default_route = value == "0",
+            // `0` means the connection was accepted. Anything else — refused (`1`), timed out
+            // (`124`/`143`) — means it was not, which is what "unreachable" means here.
+            "raw_ip" => posture.public_ip_unreachable = value != "0",
+            "metadata" => posture.metadata_unreachable = value != "0",
+            "public_dns" => posture.public_dns_unresolvable = value != "0",
+            "proxy" => posture.proxy_reachable = value == "0",
+            "peer" => posture.peer_unreachable = had_peer && value != "0",
+            // `ip route add` failing is the *good* outcome: it means `CAP_NET_ADMIN` is gone and a
+            // job cannot restore the route the whole posture rests on.
+            "route_add" => posture.cannot_add_route = value != "0",
+            "gwopen" => {
+                if let Ok(port) = value.parse::<u16>() {
+                    posture.gateway_ports_open.push(port);
+                }
+            }
+            "probe_done" => done = true,
+            _ => {}
+        }
+    }
+    if !done {
+        // A truncated probe is a probe that did not answer the questions after the truncation point,
+        // and the fields it never set are `false`-by-default in a way that reads as a *good* posture
+        // (`no_default_route: false` is safe, but `public_ip_unreachable: false` is too). Refusing
+        // the whole thing is the only reading that cannot flatter.
+        posture.failure = Some(format!("posture probe output was truncated: {output}"));
+    }
+    posture
+}
+
+/// The peer's address on the sandbox network.
+async fn peer_ip_of(config: &ContainerConfig, name: &str) -> Option<String> {
+    let argv = vec![
+        config.runtime.clone(),
+        "inspect".into(),
+        name.into(),
+        "--format".into(),
+        "{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}".into(),
+    ];
+    match control_command(config, argv, &[]).await {
+        Ok((ExecStatus::Exited(0), out)) => {
+            let ip = out.trim().to_string();
+            (!ip.is_empty()).then_some(ip)
+        }
+        _ => None,
+    }
+}
+
+/// The three §14.3-adjacent capabilities, and where each one's evidence comes from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct NetworkFacts {
+    egress_deny: bool,
+    metadata_blackhole: bool,
+    no_inbound: bool,
+}
+
+impl NetworkFacts {
+    /// Claims nothing. Every path that lacks evidence returns this.
+    const UNKNOWN: NetworkFacts =
+        NetworkFacts { egress_deny: false, metadata_blackhole: false, no_inbound: false };
+}
+
+/// Decide what the network posture lets this backend *claim*.
+///
+/// A named function with an exhaustive `match` rather than a chain of booleans, because this is the
+/// single most dangerous derivation in the crate: a wrong `true` here means the scheduler is told a
+/// job cannot reach the internet when it can. An exhaustive match means adding a
+/// [`NetworkMode`] variant is a compile error here rather than a silent inheritance of whatever the
+/// previous arm happened to compute.
+fn network_facts(namespaced: bool, mode: &NetworkMode) -> NetworkFacts {
+    if !namespaced {
+        // No Linux namespaces means no netns, so there is no network posture to speak of whatever
+        // the configuration says.
+        return NetworkFacts::UNKNOWN;
+    }
+    match mode {
+        // The strong case, and the only one that needs no evidence beyond the flag: `--network none`
+        // gives the container a netns with loopback and nothing else. There is no interface to send
+        // on, so there is nothing to verify.
+        NetworkMode::None => {
+            NetworkFacts { egress_deny: true, metadata_blackhole: true, no_inbound: true }
+        }
+        // Someone else's bridge. We have no evidence about its rules, and an unverified claim is the
+        // failure mode this whole module exists to avoid.
+        NetworkMode::Named(_) => NetworkFacts::UNKNOWN,
+        NetworkMode::ProxyOnly(proxy) => match &proxy.posture {
+            // Never probed → nothing observed → nothing claimed.
+            None => NetworkFacts::UNKNOWN,
+            Some(posture) => NetworkFacts {
+                egress_deny: posture.egress_denied(),
+                // Its own predicate rather than a raw field: a connect probe against an address
+                // nothing listens on proves nothing at all. See `NetworkPosture::metadata_blackholed`
+                // — a live control test on an open bridge is what turned that from an opinion into a
+                // requirement.
+                metadata_blackhole: posture.metadata_blackholed(),
+                // **Narrower than §14.3's literal words**, and deliberately so. On a bridge network
+                // the gateway is the node, and the node can always open a connection to a container
+                // it created — that is true of every container backend and is not a property a
+                // probe could change. What this reports is the part that is a real boundary: no
+                // *other sandbox* can reach this one. `NetworkPosture::caveats` says this out loud
+                // so the narrowing is visible to an operator rather than buried here.
+                no_inbound: posture.failure.is_none() && posture.peer_unreachable,
+            },
+        },
+    }
+}
+
 /// Turn a probe plus a configuration into per-clause enforcement facts.
 ///
 /// A pure function so the mapping is testable without a daemon — which matters, because the mapping
@@ -204,7 +711,7 @@ pub fn controls_for(probe: &DockerProbe, config: &ContainerConfig) -> EnforcedCo
         return EnforcedControls::NONE;
     }
     let namespaced = probe.server_os.as_deref() == Some("linux");
-    let isolated_network = namespaced && config.network == NetworkMode::None;
+    let net = network_facts(namespaced, &config.network);
     let seccomp_on = config.seccomp_profile.is_some()
         || matches!(probe.seccomp_profile.as_deref(), Some(p) if p != "unconfined");
 
@@ -215,11 +722,11 @@ pub fn controls_for(probe: &DockerProbe, config: &ContainerConfig) -> EnforcedCo
 
         // §14.2
         env_allowlist: true,       // ours, host-side: the env is built from an allowlist
-        metadata_blackhole: isolated_network,
+        metadata_blackhole: net.metadata_blackhole,
 
         // §14.3
-        egress_deny: isolated_network,
-        no_inbound: isolated_network,
+        egress_deny: net.egress_deny,
+        no_inbound: net.no_inbound,
 
         // §14.4 — flags we pass and the daemon applies
         non_root: namespaced,
@@ -254,12 +761,44 @@ impl ContainerBackend {
     /// Refusal is the point: on a host with no reachable container runtime there is no §14.1 boundary,
     /// and the alternative — constructing a backend that quietly runs jobs on the host — is the exact
     /// thing §14.1 calls "a full remote-code-execution and credential-exfiltration hole".
+    /// Probe the host and build a backend, or refuse.
+    ///
+    /// In [`NetworkMode::ProxyOnly`] this also runs [`probe_network_posture`] and folds the result
+    /// into the configuration, so the capabilities the backend reports are derived from what a
+    /// container on that network was actually able to reach. That probe costs a few seconds of
+    /// container churn at startup, once — which is the correct price for not guessing about the one
+    /// control that decides whether a job can talk to the internet.
     pub async fn detect(config: ContainerConfig) -> Result<Self, SandboxError> {
         let probe = probe_docker(&config.runtime).await;
         if !probe.daemon_reachable {
             return Err(SandboxError::Unavailable(
                 probe.failure.unwrap_or_else(|| format!("`{}` daemon is not reachable", config.runtime)),
             ));
+        }
+        let mut config = config;
+        if let NetworkMode::ProxyOnly(proxy) = &config.network {
+            let mut proxy = proxy.clone();
+            let posture = probe_network_posture(&config, &proxy).await;
+            if let Some(failure) = &posture.failure {
+                tracing::error!(network = %proxy.network, %failure, "sandbox network posture could not be established");
+            }
+            for caveat in posture.caveats() {
+                tracing::warn!(network = %proxy.network, %caveat, "sandbox network posture caveat");
+            }
+            if !posture.egress_denied() {
+                // Loud, because this is a deployment that asked for a proxy posture and did not get
+                // one. The backend still constructs — a job that can reach more than it should is
+                // still a job that runs — but `egress_deny` is now `false`, so the scheduler will not
+                // place anything on it that needed the guarantee.
+                tracing::error!(
+                    network = %proxy.network,
+                    posture = ?posture,
+                    "the sandbox network did NOT prove egress-deny; this backend now reports \
+                     egress_deny=false (§14.3)"
+                );
+            }
+            proxy.posture = Some(posture);
+            config.network = NetworkMode::ProxyOnly(proxy);
         }
         Ok(Self::from_probe(config, probe))
     }
@@ -273,6 +812,18 @@ impl ContainerBackend {
 
     pub fn probe(&self) -> &DockerProbe {
         &self.probe
+    }
+
+    pub fn config(&self) -> &ContainerConfig {
+        &self.config
+    }
+
+    /// What was observed about the sandbox network, when there is one to observe.
+    pub fn network_posture(&self) -> Option<&NetworkPosture> {
+        match &self.config.network {
+            NetworkMode::ProxyOnly(proxy) => proxy.posture.as_ref(),
+            NetworkMode::None | NetworkMode::Named(_) => None,
+        }
     }
 
     /// The `create` argv for this backend's configuration.
@@ -323,7 +874,9 @@ pub fn create_argv(
             a.push(format!("seccomp={}", p.display()));
         }
 
-        // §14.3 network posture.
+        // §14.3 network posture. Note there is no arm that omits `--network`: a container created
+        // without one joins the default bridge, which has full egress. The absence of a flag must
+        // never be a way to reach this state, so every variant names its network explicitly.
         match &config.network {
             NetworkMode::None => {
                 a.push("--network".into());
@@ -332,6 +885,10 @@ pub fn create_argv(
             NetworkMode::Named(n) => {
                 a.push("--network".into());
                 a.push(n.clone());
+            }
+            NetworkMode::ProxyOnly(proxy) => {
+                a.push("--network".into());
+                a.push(proxy.network.clone());
             }
         }
 
@@ -456,13 +1013,24 @@ fn sanitize_name(job_id: &str) -> String {
 }
 
 fn short_id() -> String {
-    // Not cryptographic — only needs to make a name unique within a node. Monotonic clock nanos do it
-    // without pulling in a rng dependency.
+    // Not cryptographic — it only has to make a name unique on one node. But "unique" has to actually
+    // hold: the clock alone does not.
+    //
+    // `SystemTime::now()` is *named* in nanoseconds and delivered at whatever resolution the platform
+    // keeps, which on macOS is coarser than a nanosecond. Two calls close enough together therefore
+    // return the same value, and the caller gets `network with name … already exists` or a container
+    // name clash. That was observed, not theorised: the live probes collided roughly one run in three
+    // once they started creating networks in parallel.
+    //
+    // The clock still supplies cross-process uniqueness; a process-local counter supplies the part the
+    // clock cannot, so no two calls in this process can ever agree however fast they arrive.
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.subsec_nanos() as u64 + d.as_secs().wrapping_mul(1_000_000_000))
         .unwrap_or(0);
-    format!("{nanos:x}")
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    format!("{nanos:x}{seq:x}")
 }
 
 /// A live container. Owns its configuration rather than borrowing the backend so that teardown is a
@@ -572,6 +1140,7 @@ mod tests {
     use super::*;
     use hull_ci_proto::AuthorClass;
     use std::path::Path;
+    use std::sync::{Arc, Mutex};
 
     fn linux_probe() -> DockerProbe {
         DockerProbe {
@@ -641,6 +1210,294 @@ mod tests {
         assert!(!c.metadata_blackhole);
         assert!(!c.no_inbound);
         assert!(c.non_root, "the privilege controls are unaffected by the network choice");
+    }
+
+    /// A posture in which everything the probe could establish was established.
+    fn proven_posture() -> NetworkPosture {
+        NetworkPosture {
+            declared_internal: true,
+            no_default_route: true,
+            public_ip_unreachable: true,
+            public_dns_unresolvable: true,
+            metadata_unreachable: true,
+            proxy_reachable: true,
+            peer_unreachable: true,
+            cannot_add_route: true,
+            gateway_ports_open: Vec::new(),
+            failure: None,
+        }
+    }
+
+    fn proxy_config(posture: Option<NetworkPosture>) -> ContainerConfig {
+        let mut proxy = ProxyNetwork::new("hull-ci-sandbox", "172.18.0.1:3128");
+        proxy.posture = posture;
+        ContainerConfig { network: NetworkMode::ProxyOnly(proxy), ..Default::default() }
+    }
+
+    #[test]
+    fn an_unprobed_proxy_network_claims_nothing_at_all() {
+        // The most important test in this file. A `ProxyNetwork` built from configuration alone has
+        // no posture, and a backend that has not looked must not report that a job cannot reach the
+        // internet — because the scheduler believes it.
+        let c = controls_for(&linux_probe(), &proxy_config(None));
+        assert!(!c.egress_deny, "an unmeasured network proves nothing (§14.3)");
+        assert!(!c.metadata_blackhole);
+        assert!(!c.no_inbound);
+        assert!(c.non_root, "the privilege controls are unaffected by the network choice");
+        assert!(c.unmet_clauses().iter().any(|s| s.contains("§14.3 default egress-deny")));
+    }
+
+    #[test]
+    fn a_proven_proxy_posture_reports_egress_deny_truthfully() {
+        let c = controls_for(&linux_probe(), &proxy_config(Some(proven_posture())));
+        assert!(c.egress_deny, "every conjunct held, so the claim is earned");
+        assert!(c.metadata_blackhole);
+        assert!(c.no_inbound);
+        // …and it is still not cross-tenant safe, because that was never a network question.
+        assert!(!c.to_capabilities().admits_untrusted());
+    }
+
+    #[test]
+    fn any_single_missing_fact_takes_egress_deny_down_with_it() {
+        // Each of these is a way for a network to look locked down and not be. None of them may be
+        // survivable, because `egress_deny: true` with any one of them false is a lie.
+        let cases: Vec<(&str, NetworkPosture)> = vec![
+            ("the daemon does not call it internal", NetworkPosture { declared_internal: false, ..proven_posture() }),
+            ("a default route exists", NetworkPosture { no_default_route: false, ..proven_posture() }),
+            ("a job can add its own route", NetworkPosture { cannot_add_route: false, ..proven_posture() }),
+            ("a raw public IP answered", NetworkPosture { public_ip_unreachable: false, ..proven_posture() }),
+            ("a public name resolved", NetworkPosture { public_dns_unresolvable: false, ..proven_posture() }),
+            (
+                "the node has a port open on the gateway",
+                NetworkPosture { gateway_ports_open: vec![2375], ..proven_posture() },
+            ),
+            (
+                "the probe did not run",
+                NetworkPosture { failure: Some("no daemon".into()), ..proven_posture() },
+            ),
+        ];
+        for (why, posture) in cases {
+            assert!(!posture.egress_denied(), "{why}: posture must not certify itself");
+            let c = controls_for(&linux_probe(), &proxy_config(Some(posture)));
+            assert!(!c.egress_deny, "{why}: the capability must follow the posture");
+        }
+    }
+
+    #[test]
+    fn a_reachable_docker_api_on_the_node_is_what_the_gateway_scan_is_for() {
+        // The scan's whole reason to exist: `--internal` installs FORWARD drops, which do nothing
+        // about the node's own listening sockets, and an unauthenticated Docker API reachable from
+        // inside a sandbox is a complete host takeover.
+        assert!(GATEWAY_SCAN_PORTS.contains(&2375) && GATEWAY_SCAN_PORTS.contains(&2376));
+        let posture = NetworkPosture { gateway_ports_open: vec![2375], ..proven_posture() };
+        assert!(!posture.egress_denied());
+    }
+
+    #[test]
+    fn a_metadata_endpoint_that_answers_sinks_the_blackhole_claim() {
+        let leaky = NetworkPosture { metadata_unreachable: false, ..proven_posture() };
+        let c = controls_for(&linux_probe(), &proxy_config(Some(leaky)));
+        assert!(c.egress_deny, "the other facts still hold");
+        assert!(!c.metadata_blackhole, "but this one does not");
+        assert!(c.unmet_clauses().iter().any(|s| s.contains("metadata")));
+    }
+
+    #[test]
+    fn an_unreachable_metadata_endpoint_is_not_by_itself_a_blackhole() {
+        // The regression guard for a bug a live control test caught. `169.254.169.254` refuses a
+        // connection on any host that simply has no metadata service — a laptop, bare metal, the
+        // Docker Desktop VM — so on a **wide-open bridge with full internet access** the connect
+        // probe came back "unreachable" and the backend reported `metadata_blackhole: true`.
+        //
+        // The claim has to rest on the routing fact: link-local is off-subnet, so no default route
+        // means nowhere to send it, and dropped `CAP_NET_ADMIN` means a job cannot make one.
+        let open_network_no_metadata_service = NetworkPosture {
+            metadata_unreachable: true, // nothing was listening
+            no_default_route: false,    // …but the network is wide open
+            cannot_add_route: true,
+            ..NetworkPosture::default()
+        };
+        assert!(
+            !open_network_no_metadata_service.metadata_blackholed(),
+            "an absent service must not be mistaken for a blackhole"
+        );
+        let c = controls_for(&linux_probe(), &proxy_config(Some(open_network_no_metadata_service)));
+        assert!(!c.metadata_blackhole);
+
+        // And a job that could add its own route could route to it, so that sinks it too.
+        let escapable = NetworkPosture { cannot_add_route: false, ..proven_posture() };
+        assert!(!escapable.metadata_blackholed());
+
+        // The proven posture still earns the claim, on the routing fact.
+        assert!(proven_posture().metadata_blackholed());
+    }
+
+    #[test]
+    fn a_reachable_peer_costs_only_the_inbound_claim() {
+        // ICC left on: jobs can reach each other, which is a real §14.3 failure, but it does not make
+        // the internet reachable and must not be reported as though it did.
+        let chatty = NetworkPosture { peer_unreachable: false, ..proven_posture() };
+        let c = controls_for(&linux_probe(), &proxy_config(Some(chatty.clone())));
+        assert!(c.egress_deny);
+        assert!(!c.no_inbound);
+        assert!(
+            chatty.caveats().iter().any(|c| c.contains("enable_icc=false")),
+            "and the operator is told how to fix it: {:?}",
+            chatty.caveats()
+        );
+    }
+
+    #[test]
+    fn a_posture_always_declares_what_it_did_not_establish() {
+        // Two different things a reader deserves: `unmet_clauses` lists controls that are off, and
+        // `caveats` lists controls that are on but whose evidence has an edge.
+        let caveats = proven_posture().caveats();
+        assert!(
+            caveats.iter().any(|c| c.contains("well-known ports")),
+            "the port scan is a sample and must say so: {caveats:?}"
+        );
+        assert!(
+            caveats.iter().any(|c| c.contains("node itself can always open a connection")),
+            "the narrowed meaning of `no inbound` must be visible: {caveats:?}"
+        );
+        let unprobed = NetworkPosture { failure: Some("boom".into()), ..Default::default() };
+        assert_eq!(unprobed.caveats().len(), 1);
+        assert!(unprobed.caveats()[0].contains("did not run"));
+    }
+
+    #[test]
+    fn a_proxy_network_cannot_be_constructed_with_a_posture_nobody_measured() {
+        // The honest default is a property of the type: `new` has no posture parameter, so a config
+        // file cannot assert one.
+        let p = ProxyNetwork::new("net", "10.0.0.1:3128");
+        assert!(p.posture.is_none());
+        assert_eq!(p.proxy_host_port(), ("10.0.0.1".to_string(), "3128".to_string()));
+        // An endpoint with no port is read as :80 rather than silently scanning port 0.
+        assert_eq!(
+            ProxyNetwork::new("net", "proxy.internal").proxy_host_port(),
+            ("proxy.internal".to_string(), "80".to_string())
+        );
+    }
+
+    #[test]
+    fn probe_output_is_parsed_into_exactly_what_it_says() {
+        let output = "\
+default_route=0
+raw_ip=1
+metadata=124
+public_dns=1
+proxy=0
+peer=143
+gwopen=2375
+gwopen=22
+route_add=1
+probe_done=1
+";
+        let p = parse_posture(output, NetworkPosture { declared_internal: true, ..Default::default() }, true);
+        assert!(p.no_default_route);
+        assert!(p.public_ip_unreachable, "rc=1 is a refused connection, which is unreachable");
+        assert!(p.metadata_unreachable, "rc=124 is a timeout, which is also unreachable");
+        assert!(p.public_dns_unresolvable);
+        assert!(p.proxy_reachable, "rc=0 is the one that means `answered`");
+        assert!(p.peer_unreachable);
+        assert!(p.cannot_add_route, "`ip route add` failing is the good outcome");
+        assert_eq!(p.gateway_ports_open, vec![2375, 22]);
+        assert!(p.failure.is_none());
+        assert!(!p.egress_denied(), "…but the open gateway ports still sink it");
+    }
+
+    #[test]
+    fn an_open_network_parses_as_an_open_network() {
+        // The control case: the same script run on an ordinary bridge. If this ever parsed as a
+        // locked-down posture, every probe in this file would be decorative.
+        let output = "\
+default_route=1
+raw_ip=0
+metadata=0
+public_dns=0
+proxy=0
+peer=0
+route_add=0
+probe_done=1
+";
+        let p = parse_posture(output, NetworkPosture { declared_internal: false, ..Default::default() }, true);
+        assert!(!p.no_default_route);
+        assert!(!p.public_ip_unreachable);
+        assert!(!p.metadata_unreachable);
+        assert!(!p.public_dns_unresolvable);
+        assert!(!p.peer_unreachable);
+        assert!(!p.cannot_add_route);
+        assert!(!p.egress_denied());
+    }
+
+    #[test]
+    fn a_truncated_probe_is_a_failed_probe_rather_than_a_flattering_one() {
+        // The subtle one. Fields the probe never reached default to `false`, and for
+        // `public_ip_unreachable` that reads as "the internet was reachable" — but for
+        // `no_default_route` it reads as "there was a default route". Half the defaults flatter and
+        // half do not, so a probe that did not finish must be refused wholesale.
+        let p = parse_posture("default_route=0\nraw_ip=1\n", NetworkPosture::default(), true);
+        assert!(p.failure.is_some(), "no `probe_done` sentinel means no answer");
+        assert!(!p.egress_denied());
+    }
+
+    #[test]
+    fn a_peer_that_never_started_does_not_become_evidence_of_isolation() {
+        // If the peer container failed to start there is no peer, and "could not connect to nothing"
+        // is not a demonstration that ICC is off.
+        let output = "default_route=0\nraw_ip=1\nmetadata=1\npublic_dns=1\nproxy=0\npeer=skip\nroute_add=1\nprobe_done=1\n";
+        let p = parse_posture(output, NetworkPosture { declared_internal: true, ..Default::default() }, false);
+        assert!(!p.peer_unreachable, "no peer means no result, not a passing result");
+        assert!(p.egress_denied(), "the egress facts are independent and still hold");
+    }
+
+    #[test]
+    fn the_proxys_own_port_is_expected_on_the_gateway_but_only_on_the_gateway() {
+        let mut on_gateway =
+            NetworkPosture { gateway_ports_open: vec![8443, 2375], ..proven_posture() };
+        exclude_proxy_port(&mut on_gateway, "172.18.0.1", "172.18.0.1", "8443");
+        assert_eq!(on_gateway.gateway_ports_open, vec![2375], "the proxy is meant to answer; 2375 is not");
+
+        // A proxy that is a peer container instead: port 8443 open *on the node* is some other
+        // service, and excluding it because the numbers match would hide a real finding.
+        let mut peer_proxy = NetworkPosture { gateway_ports_open: vec![8443], ..proven_posture() };
+        exclude_proxy_port(&mut peer_proxy, "172.18.0.1", "172.18.0.5", "8443");
+        assert_eq!(peer_proxy.gateway_ports_open, vec![8443]);
+        assert!(!peer_proxy.egress_denied());
+    }
+
+    #[test]
+    fn create_argv_attaches_the_sandbox_to_the_proxy_network() {
+        let t = tempfile::tempdir().unwrap();
+        let config = proxy_config(Some(proven_posture()));
+        let argv = create_argv(&config, &spec(t.path()), "sbx", &["cargo".into(), "test".into()]);
+        assert!(argv.windows(2).any(|w| w[0] == "--network" && w[1] == "hull-ci-sandbox"));
+        assert!(!argv.iter().any(|a| a == "none"));
+        // Every §14.4 flag is unchanged: the network mode is orthogonal to the privilege posture.
+        let joined = argv.join(" ");
+        for expected in ["--read-only", "--cap-drop ALL", "--security-opt no-new-privileges"] {
+            assert!(joined.contains(expected), "missing {expected}");
+        }
+    }
+
+    #[test]
+    fn every_network_mode_names_a_network_explicitly() {
+        // A container created with no `--network` joins the default bridge, which has full egress.
+        // The absence of a flag must never be a path to that state.
+        let t = tempfile::tempdir().unwrap();
+        for network in [
+            NetworkMode::None,
+            NetworkMode::Named("ci".into()),
+            NetworkMode::ProxyOnly(ProxyNetwork::new("sandbox", "10.0.0.1:3128")),
+        ] {
+            let config = ContainerConfig { network, ..Default::default() };
+            let argv = create_argv(&config, &spec(t.path()), "sbx", &["true".into()]);
+            assert_eq!(
+                argv.iter().filter(|a| *a == "--network").count(),
+                1,
+                "exactly one --network, always: {argv:?}"
+            );
+        }
     }
 
     #[test]
@@ -823,8 +1680,13 @@ mod tests {
 
     /// Run one argv in a single-use live container and return its captured output.
     async fn run_live(argv: &[&str]) -> String {
+        run_live_on(&ContainerConfig::default(), argv).await
+    }
+
+    /// [`run_live`], on a given network posture.
+    async fn run_live_on(config: &ContainerConfig, argv: &[&str]) -> String {
         let t = tempfile::tempdir().unwrap();
-        let backend = ContainerBackend::detect(ContainerConfig::default()).await.expect("daemon");
+        let backend = ContainerBackend::detect(config.clone()).await.expect("daemon");
         let mut s = spec(t.path());
         s.image = "alpine:3".into();
         let mut sbx = backend.spawn(&s).await.expect("spawn");
@@ -838,6 +1700,525 @@ mod tests {
         let out = sbx.collect().await.unwrap().text().to_string();
         sbx.destroy().await.expect("destroy");
         out
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // §14.3 with the package proxy on: the live probes for the mode that gives a job a network.
+    //
+    // These matter more than any other test in this crate. Moving off `--network none` weakens the
+    // strongest guarantee here, and the way that goes wrong is silent: a backend reports
+    // `egress_deny: true`, the scheduler believes it, and a job has the internet. So each probe below
+    // is paired with a **control** — the same assertion run on an ordinary bridge network, where it
+    // must come out the other way. A probe that cannot fail is not evidence.
+    // ---------------------------------------------------------------------------------------
+
+    /// A docker network created for one test, plus a stand-in proxy on the node's own netns.
+    ///
+    /// The topology is the one D§7.3 recommends and [`GATEWAY_SCAN_PORTS`] explains: an `--internal`
+    /// bridge with inter-container communication **off**, so the only address a sandbox can reach is
+    /// the gateway — which is the node — and the only thing listening there is meant to be the proxy.
+    struct LiveNetwork {
+        name: String,
+        proxy_container: Option<String>,
+        gateway: String,
+        proxy_port: u16,
+    }
+
+    impl LiveNetwork {
+        /// The locked-down topology: internal, ICC off.
+        async fn internal(proxy_port: u16) -> LiveNetwork {
+            LiveNetwork::create(
+                &[
+                    "--internal".to_string(),
+                    "--opt".to_string(),
+                    "com.docker.network.bridge.enable_icc=false".to_string(),
+                ],
+                proxy_port,
+            )
+            .await
+        }
+
+        /// The control: an ordinary user-defined bridge, with everything an operator would get by
+        /// forgetting the flags. Every probe must come out the opposite way here.
+        async fn open_bridge(proxy_port: u16) -> LiveNetwork {
+            LiveNetwork::create(&[], proxy_port).await
+        }
+
+        async fn create(opts: &[String], proxy_port: u16) -> LiveNetwork {
+            let cfg = ContainerConfig::default();
+            let name = format!("hull-ci-test-{}", short_id());
+            let mut argv = vec![cfg.runtime.clone(), "network".into(), "create".into()];
+            argv.extend(opts.iter().cloned());
+            argv.push(name.clone());
+            let (status, out) = control_command(&cfg, argv, &[]).await.expect("network create");
+            assert_eq!(status, ExecStatus::Exited(0), "could not create network: {out}");
+
+            let inspect = vec![
+                cfg.runtime.clone(),
+                "network".into(),
+                "inspect".into(),
+                name.clone(),
+                "--format".into(),
+                "{{(index .IPAM.Config 0).Gateway}}".into(),
+            ];
+            let (_, gateway) = control_command(&cfg, inspect, &[]).await.expect("inspect");
+            LiveNetwork {
+                name,
+                proxy_container: None,
+                gateway: gateway.trim().to_string(),
+                proxy_port,
+            }
+        }
+
+        /// Put something on the node's own network namespace that accepts TCP on the proxy port.
+        ///
+        /// `--network host` is how the *node's* netns is reached from a test; in a real deployment
+        /// the proxy is simply a process on the node and needs no container at all. This is the hop
+        /// D§7.3 is describing when it says the proxy is the only reachable destination: it is
+        /// reachable because the gateway address belongs to the node, and traffic to it takes the
+        /// kernel's `INPUT` path rather than the `FORWARD` path `--internal` blocks.
+        async fn with_proxy_stub(mut self) -> LiveNetwork {
+            let cfg = ContainerConfig::default();
+            let name = format!("hull-ci-test-proxy-{}", short_id());
+            let argv = vec![
+                cfg.runtime.clone(),
+                "run".into(),
+                "--detach".into(),
+                "--name".into(),
+                name.clone(),
+                "--network".into(),
+                "host".into(),
+                "node:20-alpine".into(),
+                "node".into(),
+                "-e".into(),
+                format!(
+                    "require('http').createServer((q,s)=>s.end('PROXY-STUB-OK')).listen({},'0.0.0.0')",
+                    self.proxy_port
+                ),
+            ];
+            let (status, out) = control_command(&cfg, argv, &[]).await.expect("proxy stub");
+            assert_eq!(status, ExecStatus::Exited(0), "could not start the proxy stub: {out}");
+            self.proxy_container = Some(name);
+            // The listener needs a moment before the posture probe asks it anything.
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            self
+        }
+
+        fn proxy_network(&self) -> ProxyNetwork {
+            ProxyNetwork::new(&self.name, format!("{}:{}", self.gateway, self.proxy_port))
+        }
+
+        fn config(&self) -> ContainerConfig {
+            ContainerConfig {
+                network: NetworkMode::ProxyOnly(self.proxy_network()),
+                ..Default::default()
+            }
+        }
+
+        async fn destroy(self) {
+            let cfg = ContainerConfig::default();
+            if let Some(c) = &self.proxy_container {
+                let _ = control_command(
+                    &cfg,
+                    vec![cfg.runtime.clone(), "rm".into(), "--force".into(), c.clone()],
+                    &[],
+                )
+                .await;
+            }
+            let _ = control_command(
+                &cfg,
+                vec![cfg.runtime.clone(), "network".into(), "rm".into(), self.name.clone()],
+                &[],
+            )
+            .await;
+        }
+    }
+
+    /// A free port for this test's stub, outside [`GATEWAY_SCAN_PORTS`] so the gateway scan result is
+    /// about the *node* rather than about our own stub.
+    ///
+    /// **Allocated per call, not fixed.** A constant here made every live test bind the same port, so
+    /// running two of them together — which `cargo test` does by default — had one job reaching the
+    /// *other* test's server and failing on its reply. The probes passed individually and failed as a
+    /// suite, which for a security probe is the worst of both: it looks verified and is not. The
+    /// binding is dropped before the caller starts its stub, so there is a small race with the rest
+    /// of the machine; that is a far smaller risk than a guaranteed collision with ourselves.
+    fn stub_port() -> u16 {
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .expect("a free ephemeral port")
+            .local_addr()
+            .expect("bound address")
+            .port();
+        assert!(
+            !GATEWAY_SCAN_PORTS.contains(&port),
+            "ephemeral port {port} collides with the gateway scan list; retry the test"
+        );
+        port
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a running container daemon, the alpine and node images, and network creation rights"]
+    async fn live_the_locked_down_sandbox_network_proves_egress_deny() {
+        // The posture, measured rather than assumed. Every field is a thing a container on this
+        // network actually tried.
+        let net = LiveNetwork::internal(stub_port()).await.with_proxy_stub().await;
+        let posture = probe_network_posture(&ContainerConfig::default(), &net.proxy_network()).await;
+        net.destroy().await;
+
+        assert!(posture.failure.is_none(), "the probe must have run: {posture:?}");
+        assert!(posture.declared_internal, "the daemon agrees this network is internal");
+        assert!(posture.no_default_route, "a sandbox here has no default route at all");
+        assert!(posture.cannot_add_route, "…and cannot add one, because CAP_NET_ADMIN is dropped");
+        assert!(posture.public_ip_unreachable, "a raw public IP is unreachable");
+        assert!(posture.public_dns_unresolvable, "a public hostname does not resolve");
+        assert!(posture.metadata_unreachable, "the cloud metadata endpoint is unreachable (§14.2)");
+        assert!(posture.peer_unreachable, "one job cannot reach another's sandbox");
+        assert!(posture.proxy_reachable, "…but the proxy answers, which is the entire point");
+        assert!(
+            posture.gateway_ports_open.is_empty(),
+            "nothing else of the node's is reachable: {:?}",
+            posture.gateway_ports_open
+        );
+        assert!(posture.egress_denied(), "so the posture certifies itself: {posture:?}");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a running container daemon, the alpine and node images, and network creation rights"]
+    async fn live_the_posture_probe_is_not_vacuous() {
+        // The control, and the reason to believe the test above. The identical probe on an ordinary
+        // bridge must come out the other way on every field — otherwise the probes are measuring
+        // nothing and the "locked down" result is an artefact.
+        //
+        // This is the same standard the pre-existing §14 probes were held to: `wget` returns rc=0
+        // with a network and rc=1 without, so rc=1 means something.
+        let net = LiveNetwork::open_bridge(stub_port()).await.with_proxy_stub().await;
+        let posture = probe_network_posture(&ContainerConfig::default(), &net.proxy_network()).await;
+        net.destroy().await;
+
+        assert!(posture.failure.is_none(), "the probe must have run: {posture:?}");
+        assert!(!posture.declared_internal, "an ordinary bridge is not internal");
+        assert!(!posture.no_default_route, "it has a default route");
+        assert!(!posture.public_ip_unreachable, "and therefore reaches a raw public IP");
+        assert!(!posture.public_dns_unresolvable, "and resolves public names");
+        assert!(!posture.peer_unreachable, "and its containers can reach each other");
+        assert!(
+            !posture.egress_denied(),
+            "so it must not certify itself, and a deployment that pointed at it would be told so"
+        );
+        // The one probe that does *not* flip, and the reason `metadata_blackholed` exists: this host
+        // runs no metadata service, so `169.254.169.254` refuses a connection here exactly as it does
+        // on the locked-down network. The connect probe cannot carry the claim; the routing fact can.
+        assert!(
+            !posture.metadata_blackholed(),
+            "an open network must never report a metadata blackhole, whatever the connect probe said \
+             (metadata_unreachable was {})",
+            posture.metadata_unreachable
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a running container daemon, the alpine and node images, and network creation rights"]
+    async fn live_the_capability_struct_reports_the_truth_in_both_postures() {
+        // The property the whole design rests on: what the backend *claims* tracks what a container
+        // on its network can *do*, in both directions.
+
+        // 1. The default. `--network none`, and every network capability true.
+        let none = ContainerBackend::detect(ContainerConfig::default()).await.expect("daemon");
+        assert!(none.controls().egress_deny, "`--network none` is still the default and still holds");
+        assert!(none.controls().metadata_blackhole && none.controls().no_inbound);
+        assert!(none.network_posture().is_none(), "there is no network to have a posture");
+
+        // 2. The proxy posture, proven.
+        let good = LiveNetwork::internal(stub_port()).await.with_proxy_stub().await;
+        let backend = ContainerBackend::detect(good.config()).await.expect("daemon");
+        let claims_on_good = backend.controls();
+        let posture = backend.network_posture().cloned();
+        good.destroy().await;
+        assert!(claims_on_good.egress_deny, "a proven posture earns the claim: {posture:?}");
+        assert!(claims_on_good.metadata_blackhole);
+        assert!(claims_on_good.no_inbound);
+
+        // 3. The same code, an open network. The claim must collapse.
+        let open = LiveNetwork::open_bridge(stub_port()).await.with_proxy_stub().await;
+        let backend = ContainerBackend::detect(open.config()).await.expect("daemon");
+        let claims_on_open = backend.controls();
+        open.destroy().await;
+        assert!(
+            !claims_on_open.egress_deny,
+            "a network a job can escape from must not report egress-deny"
+        );
+        assert!(!claims_on_open.metadata_blackhole);
+        assert!(!claims_on_open.no_inbound);
+        assert!(claims_on_open
+            .unmet_clauses()
+            .iter()
+            .any(|s| s.contains("§14.3 default egress-deny")));
+
+        // 4. And in neither case does a container become cross-tenant safe.
+        assert!(!claims_on_good.to_capabilities().admits_untrusted());
+        assert!(!claims_on_open.to_capabilities().admits_untrusted());
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a running container daemon, the alpine and node images, and network creation rights"]
+    async fn live_a_job_on_the_proxy_network_reaches_the_proxy_and_nothing_else() {
+        // The §14.3 probes at the bottom of this file, re-run under the posture that *gives the job a
+        // network*. Same standard, same shape: rc=0 means reachable, and every one of these must be
+        // rc≠0 except the proxy.
+        let net = LiveNetwork::internal(stub_port()).await.with_proxy_stub().await;
+        let config = net.config();
+        let gateway = net.gateway.clone();
+        let port = net.proxy_port;
+
+        let out = run_live_on(
+            &config,
+            &[
+                "/bin/sh",
+                "-c",
+                &format!(
+                    "wget -q -T 5 -O- http://{gateway}:{port}/ 2>&1; echo \" proxy_rc=$?\"; \
+                     wget -q -T 3 -O- http://1.1.1.1 >/dev/null 2>&1; echo raw_rc=$?; \
+                     wget -q -T 3 -O- http://example.com >/dev/null 2>&1; echo dns_rc=$?; \
+                     wget -q -T 3 -O- http://169.254.169.254/latest/meta-data/ >/dev/null 2>&1; echo meta_rc=$?"
+                ),
+            ],
+        )
+        .await;
+        net.destroy().await;
+
+        assert!(out.contains("PROXY-STUB-OK"), "the job must be able to reach the proxy: {out}");
+        assert!(out.contains("proxy_rc=0"), "…and get a clean fetch from it: {out}");
+        assert!(out.contains("raw_rc=1"), "a raw IP must still be unreachable: {out}");
+        assert!(out.contains("dns_rc=1"), "a public hostname must still be unreachable: {out}");
+        assert!(out.contains("meta_rc=1"), "the metadata endpoint must still be unreachable: {out}");
+        assert!(!out.contains("ami-"), "and nothing resembling instance metadata came back: {out}");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a running container daemon, the alpine and node images, and network creation rights"]
+    async fn live_the_egress_probes_would_notice_if_the_network_were_open() {
+        // The control for the test above: on an ordinary bridge, the same three probes come back
+        // rc=0. Without this, `raw_rc=1` might mean "the network is locked down" or might mean "this
+        // machine has no internet", and the two are indistinguishable from inside.
+        let net = LiveNetwork::open_bridge(stub_port()).await;
+        let config = net.config();
+        let out = run_live_on(
+            &config,
+            &[
+                "/bin/sh",
+                "-c",
+                "wget -q -T 5 -O- http://1.1.1.1 >/dev/null 2>&1; echo raw_rc=$?; \
+                 wget -q -T 5 -O- http://example.com >/dev/null 2>&1; echo dns_rc=$?",
+            ],
+        )
+        .await;
+        net.destroy().await;
+
+        assert!(
+            out.contains("raw_rc=0") && out.contains("dns_rc=0"),
+            "these probes must be able to succeed, or their failure elsewhere proves nothing \
+             (is this host offline?): {out}"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a running container daemon, the alpine and node images, and network creation rights"]
+    async fn live_a_job_cannot_restore_the_route_the_posture_rests_on() {
+        // `no_default_route` is only worth anything if a job cannot undo it. §14.4's `--cap-drop ALL`
+        // takes CAP_NET_ADMIN with it, and this is that being true rather than being assumed.
+        let net = LiveNetwork::internal(stub_port()).await.with_proxy_stub().await;
+        let config = net.config();
+        let gateway = net.gateway.clone();
+        let out = run_live_on(
+            &config,
+            &[
+                "/bin/sh",
+                "-c",
+                &format!(
+                    "ip route add default via {gateway} >/dev/null 2>&1; echo add_rc=$?; \
+                     wget -q -T 3 -O- http://1.1.1.1 >/dev/null 2>&1; echo raw_rc=$?"
+                ),
+            ],
+        )
+        .await;
+        net.destroy().await;
+
+        assert!(out.contains("add_rc=1") || out.contains("add_rc=2"), "adding a route must fail: {out}");
+        assert!(out.contains("raw_rc=1"), "and the internet must still be unreachable: {out}");
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // End to end: a real job, on a real locked-down network, fetching through the *real* proxy.
+    //
+    // Everything above proves the two halves separately — the network posture is provable, and the
+    // proxy enforces its rules over a socket. This proves the composition, which is the only thing a
+    // deployment actually has: a job with no route to anywhere resolves a package, the upstream
+    // credential is spent by the proxy and never enters the sandbox, and the same job still cannot
+    // reach a raw IP.
+    // ---------------------------------------------------------------------------------------
+
+    /// The tenant's upstream credential. The job must never see this string.
+    const E2E_UPSTREAM_SECRET: &str = "npm_e2e_s3cr3t_never_in_a_job";
+
+    /// A minimal HTTP upstream on loopback, recording the `Authorization` it was sent.
+    ///
+    /// Hand-rolled rather than pulled from a framework so this crate's *test* build does not acquire
+    /// an HTTP server dependency for one fixture. It answers exactly one shape of request, which is
+    /// all the proxy will send it.
+    async fn e2e_upstream() -> (u16, Arc<Mutex<Vec<String>>>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("upstream bind");
+        let port = listener.local_addr().unwrap().port();
+        let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let recorder = seen.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else { continue };
+                let recorder = recorder.clone();
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut buf = vec![0u8; 8192];
+                    let n = socket.read(&mut buf).await.unwrap_or(0);
+                    let request = String::from_utf8_lossy(&buf[..n]).to_string();
+                    for line in request.lines() {
+                        if let Some(v) = line.to_ascii_lowercase().strip_prefix("authorization:") {
+                            recorder.lock().unwrap().push(v.trim().to_string());
+                        }
+                    }
+                    let body = "PACKAGE-FROM-UPSTREAM";
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = socket.write_all(response.as_bytes()).await;
+                });
+            }
+        });
+        (port, seen)
+    }
+
+    /// A TCP relay in the node's own network namespace, forwarding the sandbox-facing port to a
+    /// process on the developer's machine.
+    ///
+    /// **This exists only because of where this crate is built.** In a real deployment the proxy is a
+    /// process on the node and binds the gateway address directly, with no relay in the picture. On
+    /// macOS the container runtime lives inside a Linux VM, and a Rust process on the host cannot bind
+    /// an address on that VM's bridge — so the relay stands in for exactly one thing: the kernel hop
+    /// that would otherwise deliver a packet from the sandbox to a socket on the node. It performs no
+    /// HTTP logic and makes no policy decision; everything the test asserts is still decided by the
+    /// real proxy on the other side of it.
+    async fn e2e_relay(listen_port: u16, host_port: u16) -> String {
+        let cfg = ContainerConfig::default();
+        let name = format!("hull-ci-test-relay-{}", short_id());
+        let script = format!(
+            "const net=require('net');net.createServer(c=>{{\
+               const u=net.connect({host_port},'host.docker.internal');\
+               c.on('error',()=>u.destroy());u.on('error',()=>c.destroy());\
+               c.pipe(u);u.pipe(c);}}).listen({listen_port},'0.0.0.0')"
+        );
+        let argv = vec![
+            cfg.runtime.clone(),
+            "run".into(),
+            "--detach".into(),
+            "--name".into(),
+            name.clone(),
+            "--network".into(),
+            "host".into(),
+            "node:20-alpine".into(),
+            "node".into(),
+            "-e".into(),
+            script,
+        ];
+        let (status, out) = control_command(&cfg, argv, &[]).await.expect("relay");
+        assert_eq!(status, ExecStatus::Exited(0), "could not start the relay: {out}");
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        name
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a running container daemon, the alpine and node images, and network creation rights"]
+    async fn live_a_job_with_no_egress_resolves_a_package_through_the_real_proxy() {
+        use hull_ci_proxy::allowlist::{Allowlist, AuthScheme, Upstream};
+        use hull_ci_proxy::credentials::StaticCredentials;
+        use hull_ci_proxy::ratelimit::RateLimit;
+        use hull_ci_proxy::server::PackageProxy;
+
+        // 1. An upstream registry that requires a credential.
+        let (upstream_port, seen_auth) = e2e_upstream().await;
+        let allowlist = Allowlist::from_upstreams(vec![Upstream::authenticated(
+            "npm",
+            &format!("http://127.0.0.1:{upstream_port}"),
+            "NPM_TOKEN",
+            AuthScheme::Bearer,
+        )
+        .unwrap()])
+        .unwrap();
+
+        // 2. The real proxy, holding the tenant's credential, with a grant for exactly this job.
+        let creds = Arc::new(StaticCredentials::new().with("acme", "NPM_TOKEN", E2E_UPSTREAM_SECRET));
+        let proxy = PackageProxy::new(allowlist, creds);
+        let (grant, _) = proxy.grants().mint(
+            "acme",
+            "job-1",
+            ["npm".to_string()].into_iter().collect(),
+            u64::MAX / 2,
+            RateLimit::default(),
+        );
+        let grant = grant.expose().to_string();
+        let listener = tokio::net::TcpListener::bind("0.0.0.0:0").await.expect("proxy bind");
+        let proxy_port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move { proxy.serve(listener).await });
+
+        // 3. The locked-down sandbox network, with the proxy reachable on its gateway.
+        let sandbox_port = stub_port();
+        let net = LiveNetwork::internal(sandbox_port).await;
+        let relay = e2e_relay(sandbox_port, proxy_port).await;
+        let gateway = net.gateway.clone();
+        let config = net.config();
+
+        // The posture is still measured, and must still hold with the proxy in place.
+        let posture = probe_network_posture(&ContainerConfig::default(), &net.proxy_network()).await;
+        assert!(posture.egress_denied(), "the network must still deny egress: {posture:?}");
+        assert!(posture.proxy_reachable, "…and the real proxy must be the thing answering");
+
+        // 4. The job. No route anywhere, one URL that works.
+        let out = run_live_on(
+            &config,
+            &[
+                "/bin/sh",
+                "-c",
+                &format!(
+                    "wget -q -T 10 -O- http://{gateway}:{sandbox_port}/j/{grant}/u/npm/express 2>&1; \
+                     echo \" fetch_rc=$?\"; \
+                     wget -q -T 5 -O- http://{gateway}:{sandbox_port}/j/{grant}/u/pypi/x >/dev/null 2>&1; \
+                     echo denied_rc=$?; \
+                     wget -q -T 3 -O- http://1.1.1.1 >/dev/null 2>&1; echo raw_rc=$?"
+                ),
+            ],
+        )
+        .await;
+
+        let cfg = ContainerConfig::default();
+        let _ = control_command(&cfg, vec![cfg.runtime.clone(), "rm".into(), "--force".into(), relay], &[]).await;
+        net.destroy().await;
+
+        // The job resolved a package…
+        assert!(out.contains("PACKAGE-FROM-UPSTREAM"), "the job must get its package: {out}");
+        assert!(out.contains("fetch_rc=0"), "…cleanly: {out}");
+        // …an upstream outside its grant was refused…
+        assert!(out.contains("denied_rc=1"), "an unallowlisted upstream must be refused: {out}");
+        // …the internet is still unreachable…
+        assert!(out.contains("raw_rc=1"), "egress-deny still holds during a fetch: {out}");
+        // …the credential was spent by the proxy…
+        assert_eq!(
+            seen_auth.lock().unwrap().first().map(String::as_str),
+            Some(&*format!("bearer {E2E_UPSTREAM_SECRET}")),
+            "the upstream must have received the tenant's credential"
+        );
+        // …and it never entered the sandbox.
+        assert!(
+            !out.contains(E2E_UPSTREAM_SECRET),
+            "the upstream credential must never appear in a job's output (D§7.4): {out}"
+        );
     }
 
     #[tokio::test]

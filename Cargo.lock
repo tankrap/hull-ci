@@ -1178,6 +1178,7 @@ name = "hull-ci-node"
 version = "0.0.1"
 dependencies = [
  "hull-ci-proto",
+ "hull-ci-proxy",
  "hull-ci-secrets",
  "serde",
  "serde_json",
@@ -1209,6 +1210,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "hull-ci-proxy"
+version = "0.0.1"
+dependencies = [
+ "axum",
+ "blake3",
+ "bytes",
+ "futures-util",
+ "hex",
+ "hull-ci-proto",
+ "hull-ci-secrets",
+ "rand 0.8.7",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "subtle",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "url",
+ "zeroize",
+]
+
+[[package]]
 name = "hull-ci-secrets"
 version = "0.0.1"
 dependencies = [
@@ -1237,6 +1262,7 @@ dependencies = [
  "hull-ci-node",
  "hull-ci-plan",
  "hull-ci-proto",
+ "hull-ci-proxy",
  "hull-ci-secrets",
  "keel-store",
  "reqwest",

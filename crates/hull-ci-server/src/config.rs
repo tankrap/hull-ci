@@ -20,6 +20,7 @@
 //! | `HULL_CI_ADMIN_TOKEN` | *none* | bearer token for the read-only operator panel; **unset disables it entirely** |
 //! | `HULL_CI_SECRETS` | `off` | `off` \| `dev` — the tenant secret broker (design D§7.4) |
 //! | `HULL_CI_DEV_SECRETS` | *none* | `tenant/NAME=value,…` seed for `HULL_CI_SECRETS=dev`; **dev only** |
+//! | `HULL_CI_PROXY` | `off` | `off` \| `on` — the package proxy (spec §14.3); see [`hull_ci_proxy::config`] for the rest of the `HULL_CI_PROXY_*` family |
 //!
 //! `HULL_CI_SECRET` deserves its own note: spec §8 makes configuring one a SHOULD, and this process
 //! treats a missing one as a loud warning rather than a refusal, because a loopback bring-up run
@@ -128,6 +129,13 @@ pub struct Config {
     pub admin_token: Option<String>,
     /// Whether tenant secrets can be delivered at all (design D§7.4). See [`SecretsMode`].
     pub secrets: SecretsMode,
+    /// The package proxy (spec §14.3, design D§7.3/7.4), read from `HULL_CI_PROXY*`.
+    ///
+    /// Its own type from its own crate rather than fields inlined here, because it configures a
+    /// *separate process concern* — an allowlist, upstream credentials, a listen address — and the
+    /// one setting that touches this runner (the sandbox network) is enforced by the node's live
+    /// probe rather than by anything in this struct. Keeping it whole makes that separation visible.
+    pub proxy: hull_ci_proxy::ProxyConfig,
     /// `tenant/NAME=value,…` seeded into a [`SecretsMode::Dev`] broker at startup.
     ///
     /// Ignored in [`SecretsMode::Off`], and documented dev-only where it is read
@@ -161,6 +169,9 @@ impl Default for Config {
             // Off: a runner nobody asked to hold credentials holds none, so there is nothing for a
             // sandbox escape to reach and nothing for a misconfiguration to hand out.
             secrets: SecretsMode::Off,
+            // Off: §14.3's default is that a job has no outbound network at all, and the switch that
+            // changes that is never implicit.
+            proxy: hull_ci_proxy::ProxyConfig::default(),
             dev_secrets: None,
         }
     }
@@ -200,6 +211,8 @@ impl Config {
                 Some(v) => SecretsMode::parse(&v)?,
                 None => d.secrets,
             },
+            proxy: hull_ci_proxy::ProxyConfig::from_env()
+                .map_err(|e| ConfigError::Value { var: "HULL_CI_PROXY", detail: e.to_string() })?,
             dev_secrets: var("HULL_CI_DEV_SECRETS"),
         })
     }
@@ -230,6 +243,12 @@ mod tests {
             "least privilege: an unconfigured deployment has no trusted tenant, so it runs nothing"
         );
         assert!(d.admin_token.is_none(), "the cross-tenant operator panel is off unless asked for");
+        assert_eq!(
+            d.proxy.mode,
+            hull_ci_proxy::ProxyMode::Off,
+            "§14.3: an unconfigured deployment runs every job with no outbound network"
+        );
+        assert!(d.proxy.network.is_none(), "and therefore on `--network none`");
         assert_eq!(
             d.secrets,
             SecretsMode::Off,

@@ -48,7 +48,28 @@ use crate::detect::{detect_test_command, Detection};
 use crate::sandbox::{
     ExecRequest, ExecStatus, ResourceLimits, SandboxBackend, SandboxError, SandboxSpec,
 };
+use crate::packages::PackageAccess;
 use crate::secrets::SecretsClient;
+
+/// Releases a job's package grant on every exit path out of `run_inner`, including the failing ones.
+///
+/// §14.1's rule is that nothing survives a job. A live bearer token for a sandbox that no longer
+/// exists is the same category of thing as a planted binary — and it is the one piece of a job's
+/// state that does *not* live inside the rootfs the runtime destroys, so it needs its own teardown.
+/// A guard rather than a call at the end of the function, because `run_inner` has a dozen early
+/// returns and the one that gets forgotten is always the one on the error path.
+struct GrantGuard<'a> {
+    access: Option<&'a Arc<dyn PackageAccess>>,
+    job_id: &'a str,
+}
+
+impl Drop for GrantGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(access) = self.access {
+            access.release(self.job_id);
+        }
+    }
+}
 
 /// Why a step errored, in a form the control plane can map to `hull_ci_proto::Reason`.
 ///
@@ -137,6 +158,10 @@ pub struct NodeAgent {
     /// configured — in which case no step ever receives a declared secret and every one of them runs
     /// exactly as it did before M3.
     secrets: Option<Arc<SecretsClient>>,
+    /// This deployment's package proxy, or `None` where there is not one — in which case no job ever
+    /// receives package-proxy environment and every sandbox stays on `--network none` (§14.3's
+    /// default).
+    packages: Option<Arc<dyn PackageAccess>>,
 }
 
 impl NodeAgent {
@@ -155,7 +180,14 @@ impl NodeAgent {
             );
         }
         let slots_free = AtomicU32::new(config.slots_total);
-        NodeAgent { config, backend, slots_free, warm_trees: Mutex::new(Vec::new()), secrets: None }
+        NodeAgent {
+            config,
+            backend,
+            slots_free,
+            warm_trees: Mutex::new(Vec::new()),
+            secrets: None,
+            packages: None,
+        }
     }
 
     /// Give this node an identity and a broker to redeem against (D§7.4).
@@ -165,6 +197,17 @@ impl NodeAgent {
     /// root enrols the key and wires this in the same breath — see `hull_ci_server::secrets`.
     pub fn with_secrets(mut self, client: Arc<SecretsClient>) -> Self {
         self.secrets = Some(client);
+        self
+    }
+
+    /// Give this node a package proxy to mint per-job grants against (§14.3, D§7.4).
+    ///
+    /// Opt-in for the same reason `--network none` is the default: this is the switch that decides
+    /// whether a job has any network at all. A node wired here but placed on a sandbox network whose
+    /// posture did not prove out still reports `egress_deny: false` — the two halves are enforced
+    /// independently, and neither one can talk the other into a claim.
+    pub fn with_package_access(mut self, access: Arc<dyn PackageAccess>) -> Self {
+        self.packages = Some(access);
         self
     }
 
@@ -324,6 +367,26 @@ impl NodeAgent {
         }
 
         let timeout = Duration::from_secs(a.timeout_secs).min(self.config.max_step_timeout);
+
+        // §14.3's exception, minted per job. The grant expires with the step's wall clock, so a node
+        // that dies mid-step leaves a token that is already dying, and `GrantGuard` revokes it on
+        // every ordinary exit path below.
+        let package_env = match &self.packages {
+            Some(access) => access.grant(&a.tenant, &a.job_id, timeout),
+            None => Vec::new(),
+        };
+        let _grant = GrantGuard { access: self.packages.as_ref(), job_id: &a.job_id };
+        if !package_env.is_empty() {
+            tracing::info!(
+                job = %a.job_id,
+                step = %a.step_id,
+                vars = ?package_env.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>(),
+                "package proxy access granted for this step (§14.3)"
+            );
+        }
+        let mut env = crate::env::base_env_with_path("/tmp", &self.backend.job_path());
+        env.extend(package_env);
+
         let spec = SandboxSpec {
             job_id: a.job_id.clone(),
             step_id: a.step_id.clone(),
@@ -331,7 +394,7 @@ impl NodeAgent {
             workspace: workspace.to_path_buf(),
             workdir: self.config.workdir.clone(),
             limits: self.config.limits,
-            env: crate::env::base_env_with_path("/tmp", &self.backend.job_path()),
+            env,
             author_class: a.author_class,
             // The broker's decision, carried — never the node's own. `a.secrets` is what the pipeline
             // *asked* for and is deliberately not consulted here: what goes in this list is what came
