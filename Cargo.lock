@@ -1198,7 +1198,9 @@ version = "0.0.1"
 dependencies = [
  "anyhow",
  "hull-ci-proto",
+ "libc",
  "serde",
+ "serde_json",
  "starlark",
  "thiserror",
 ]

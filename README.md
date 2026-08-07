@@ -55,7 +55,7 @@ untrusted code or parsing attacker-controlled archives next to the secrets.
 | `hull-ci-fetch` | The fetch broker: GET `source_url`, verify the archive re-hashes to `tree_id`, extract with a hardened tar reader, store content-addressed. |
 | `hull-ci-control` | Ingest, job/step state, scheduling, aggregation, idempotent verdict delivery. |
 | `hull-ci-node` | The node agent and its sandbox backends. All job execution happens here. |
-| `hull-ci-plan` | `.hull/ci.star` → a validated, acyclic DAG. Hermetic Starlark, with the *parser* bounded before it ever sees the source. |
+| `hull-ci-plan` | `.hull/ci.star` → a validated, acyclic DAG. Hermetic Starlark, with the *parser* bounded before it ever sees the source and evaluation bounded inside a child process. Ships a second binary, **`hull-ci-plan-eval`**, which must be installed next to `hull-ci-server`: it is where the memory ceiling is enforced, and planning fails closed without it. |
 | `hull-ci-secrets` | The secret broker: tenant secrets under per-tenant KEKs, delivered just-in-time to one job on one enrolled node, never to an outsider. Infisical KMS behind the `KeyManager` seam. |
 | `hull-ci-proxy` | The package proxy — §14.3's one permitted hole in egress-deny. Allowlisted upstreams, per-job grants, upstream credentials that the job never sees. |
 | `hull-ci-server` | The binary: the composition root that wires the other crates into one running service, plus the read-only operator panel. |

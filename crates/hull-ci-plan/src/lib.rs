@@ -32,6 +32,14 @@
 //!   brackets overflows the stack and **aborts the process** while every one of those bounds is
 //!   still unchecked. [`shape`] measures nesting first, and evaluation runs on a dedicated thread
 //!   with a stack sized against [`Limits::max_source_bytes`]. See that module for the numbers.
+//! * **Memory is bounded by a process, because it cannot be bounded by anything smaller.** The heap
+//!   cap in [`Limits`] is starlark-rust's own, checked once every thousand instructions, and an
+//!   audit measured what that misses: a **58-byte** file that allocated **4.4 GB** and *succeeded*.
+//!   A global allocator is the only thing that sees a byte before it is committed, and it may not
+//!   unwind — so the ceiling lives inside the short-lived child [`sandbox`] spawns, where refusing
+//!   an allocation means exiting and exiting is the correct answer. Measured: a **fixed +3.5 ms**
+//!   per plan, against the 23.9 ms design D§6.1 already spends on one pattern glob on the same path.
+//!   See [`alloc`] for the table of what was unbounded and [`sandbox`] for the trade.
 //! * **Errors are safe to show.** They carry a rule and a line, never a host path or a stack —
 //!   they are rendered back to the author, who on a multi-tenant instance is an outsider.
 //!
@@ -54,14 +62,17 @@
 //! assert!(matches!(&pipeline.steps[0].kind, StepKind::Run(r) if r == "cargo build"));
 //! ```
 
+pub mod alloc;
 pub mod error;
 pub mod eval;
 pub mod pipeline;
+pub mod sandbox;
 pub mod shape;
 pub mod validate;
 
 pub use error::{Bound, PlanError, PlanErrorKind};
 pub use pipeline::{PlanStep, Pipeline, Shard, StepKind, Trust};
+pub use sandbox::Cost;
 pub use validate::{BUILTIN_ACTIONS, Invalid};
 
 /// Where the pipeline lives in a tree, and the logical name errors are reported against.
@@ -75,7 +86,11 @@ pub const PIPELINE_PATH: &str = ".hull/ci.star";
 /// Defence in depth, all of it. The dialect terminates by design, so a legitimate pipeline is
 /// nowhere near any of these; they are what stops a pathological-but-valid module from wedging the
 /// planner, and the planner runs on the control plane for *every* job.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// Serialisable because they are handed to the evaluation child ([`sandbox`]) rather than merely
+/// consulted here: the bounds and the process that enforces them are no longer in the same address
+/// space.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Limits {
     /// Emitted nodes. A repo with more than this many steps has a problem the planner cannot fix.
     pub max_steps: usize,
@@ -114,9 +129,23 @@ pub struct Limits {
     /// a triple-nested loop over a computed range does no I/O and never recurses, and would still
     /// hold a planner thread for as long as it liked.
     pub max_ticks: u64,
-    /// Starlark heap ceiling. Bounds huge literals and the string-doubling trick that builds a
-    /// gigabyte from ten lines.
+    /// Starlark heap ceiling — the budget for the *pipeline's own values*.
+    ///
+    /// **This is not, on its own, a memory bound, and the audit proved it.** starlark-rust checks it
+    /// once every thousand bytecode instructions, so a bomb that allocates in few-but-huge steps
+    /// never meets a check: 58 bytes of string doubling reached 4 420 MB resident and *succeeded* at
+    /// this setting. It survives because it is still the check that fires with a **line number**,
+    /// which is the error an author can act on. The bound that cannot be walked past is the
+    /// allocation ceiling in the evaluation child, derived from this number by
+    /// [`Limits::hard_memory_bytes`] — see [`alloc`].
     pub max_heap_bytes: usize,
+    /// Wall clock for one evaluation, in milliseconds ([`Limits::eval_timeout`]).
+    ///
+    /// [`Limits::max_ticks`] bounds *work*, which is the useful bound and the one with a good
+    /// message. This bounds *time*, which is different whenever the thing being consumed is not
+    /// work — and it only became enforceable when evaluation moved into a process that can be
+    /// killed. 15 s is ~100× the slowest evaluation the other bounds admit.
+    pub eval_timeout_ms: u64,
 }
 
 impl Default for Limits {
@@ -136,6 +165,7 @@ impl Default for Limits {
             max_callstack: 64,
             max_ticks: 10_000_000,
             max_heap_bytes: 64 * 1024 * 1024,
+            eval_timeout_ms: 15_000,
         }
     }
 }
@@ -145,7 +175,8 @@ impl Limits {
     ///
     /// starlark-rust rejects a zero limit with an error rather than treating it as "unbounded", and
     /// a caller who passes `0` almost certainly meant "no work at all", not "no bound". Clamping
-    /// makes the setters in [`eval::evaluate_with`] infallible, which is why they may `expect`.
+    /// makes the setters in [`eval::evaluate_in_process`] infallible, which is why they may
+    /// `expect`.
     pub fn clamped(&self) -> Limits {
         Limits {
             max_steps: self.max_steps.max(1),
@@ -172,6 +203,7 @@ impl Limits {
             max_callstack: self.max_callstack.max(1),
             max_ticks: self.max_ticks.max(1),
             max_heap_bytes: self.max_heap_bytes.max(1),
+            eval_timeout_ms: self.eval_timeout_ms.max(1),
         }
     }
 }
@@ -185,10 +217,28 @@ pub fn evaluate(source: &str) -> Result<Pipeline, PlanError> {
 ///
 /// The registry is a parameter rather than a constant because `uses` must name an action the
 /// *node binary* implements, and only the server knows which build of it is deployed.
+///
+/// Runs in a bounded child process ([`sandbox`]), which is where [`Limits::max_heap_bytes`] stops
+/// being advice and becomes a ceiling. If the helper binary cannot be found this **fails** rather
+/// than evaluating here: see [`sandbox::worker_path`].
 pub fn evaluate_with(
     source: &str,
     limits: &Limits,
     actions: &[&str],
 ) -> Result<Pipeline, PlanError> {
-    eval::evaluate_with(source, &limits.clamped(), actions)
+    sandbox::evaluate_with(source, &limits.clamped(), actions)
+}
+
+/// [`evaluate_with`], and what the evaluation cost.
+///
+/// Separate rather than a widened return type because exactly one caller wants the number — the
+/// server, which logs it so that the heap budget is tuned against what real pipelines do before it
+/// ever starts refusing one. starlark-rust's own documentation asks users of a heap limit to do
+/// this; it was not possible to do before, because nothing measured.
+pub fn evaluate_measured(
+    source: &str,
+    limits: &Limits,
+    actions: &[&str],
+) -> (Result<Pipeline, PlanError>, Cost) {
+    sandbox::evaluate_measured(source, &limits.clamped(), actions)
 }

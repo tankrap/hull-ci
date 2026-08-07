@@ -347,14 +347,12 @@ for a in range(1000):
 
 #[test]
 fn huge_literals_are_bounded_by_the_heap_budget() {
-    // Six lines that build a hundred megabytes. The Starlark heap cap catches it before the host's
-    // allocator has an opinion.
+    // Six lines that build a hundred megabytes, spread over many loop iterations — which is the one
+    // shape starlark-rust's own periodic heap check *does* catch, and it catches it with a line
+    // number, which is why the check is still worth having.
     //
-    // Note the shape: the allocation is spread over many loop iterations. starlark-rust checks the
-    // heap *periodically* (once every N instructions), so a bomb that allocates everything in one
-    // call sails past the check entirely — see
-    // `a_panic_inside_starlark_is_contained_rather_than_taken_out_on_the_control_plane`, which is
-    // what actually catches that case.
+    // Every other shape is caught by the child's allocation ceiling instead. `memory.rs` is that
+    // story, including the 58-byte file this check used to let through at 4 420 MB.
     let limits = Limits { max_heap_bytes: 8 * 1024 * 1024, ..Limits::default() };
     let err = evaluate_with(
         r#"
@@ -377,11 +375,16 @@ for i in range(20000):
 
 #[test]
 fn a_panic_inside_starlark_is_contained_rather_than_taken_out_on_the_control_plane() {
-    // Found while writing these tests: doubling a string past starlark-rust's internal length limit
-    // panics (`len overflow` in `str_type.rs`) instead of tripping the heap check, because the heap
-    // check runs periodically and the allocation is one call. A panic on the control plane, from an
-    // untrusted file, would be a denial of service — so evaluation runs on its own thread and a
-    // panic comes back as an ordinary error with no detail in it.
+    // Doubling a string past starlark-rust's internal length limit panics (`len overflow` in
+    // `str_type.rs`) rather than returning an error. A panic on the control plane, from an untrusted
+    // file, is a denial of service.
+    //
+    // This test used to assert that the panic came back as `Internal` — contained by the evaluation
+    // thread's `join`, but only *after* 4 304 MB had been allocated reaching it. It is now the
+    // memory ceiling that answers first, so the assertion is stronger: a **named bound**, not a
+    // caught panic. The containment underneath is still real and still tested — see
+    // `memory.rs::a_starlark_panic_is_reported_as_a_bound_not_an_abort`, which reaches the panic
+    // with the ceiling raised out of the way.
     let err = evaluate(
         r#"
 s = "x" * 1024
@@ -391,13 +394,8 @@ for i in range(40):
     )
     .unwrap_err();
     assert!(
-        matches!(err.kind, PlanErrorKind::Internal | PlanErrorKind::Exhausted(_)),
+        matches!(err.kind, PlanErrorKind::Exhausted(Bound::Memory { .. })),
         "got {err}"
-    );
-    assert_eq!(
-        err.to_string(),
-        ".hull/ci.star: the pipeline evaluator failed unexpectedly",
-        "our bug must not describe itself to the author"
     );
 
     // And the process is still healthy afterwards.

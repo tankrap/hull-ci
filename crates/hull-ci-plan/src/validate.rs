@@ -11,11 +11,23 @@
 //! surprise, a shell metacharacter, a control byte, or a Unicode look-alike is simply not a legal
 //! name — `[A-Za-z0-9_/-]` has no such characters in it at all.
 
+use std::borrow::Cow;
 use std::time::Duration;
+
+use serde::{Deserialize, Serialize};
 
 /// A rule from design D§4.4's table that the pipeline broke. Each variant names the rule, and its
 /// message is written to be shown to the pipeline's author verbatim.
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+///
+/// Serialisable because evaluation happens in a child process now ([`crate::sandbox`]) and this is
+/// the interesting half of what it reports.
+///
+/// The fields naming a *builtin* or a *field of `step`* are [`Cow<'static, str>`](Cow) rather than
+/// `&'static str` for that reason and no other: they are compile-time constants at every
+/// construction site, so borrowing costs nothing, but they arrive owned when the child's reply is
+/// decoded. `Cow` compares by content, so the two spellings of `"inputs"` are the same value — which
+/// is what lets a test written against a local evaluation keep passing against a remote one.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error, Serialize, Deserialize)]
 pub enum Invalid {
     #[error("step name must be 1..={limit} characters, not {got}")]
     NameLength { got: usize, limit: usize },
@@ -28,7 +40,9 @@ pub enum Invalid {
     #[error("step `{name}` needs `{missing}`, which is not a step declared before it")]
     DanglingNeeds { name: String, missing: String },
     #[error("`needs` takes step handles returned by `step`/`action`, not {got}")]
-    NeedsNotAHandle { got: &'static str },
+    NeedsNotAHandle {
+        got: Cow<'static, str>,
+    },
     #[error("trust must be \"trusted\" or \"untrusted\", not `{got}`")]
     Tier { got: String },
     #[error("shard must be \"auto\" or an integer 1..={max}, not `{got}`")]
@@ -46,13 +60,26 @@ pub enum Invalid {
     #[error("timeout `{got}` is longer than the {limit_hours}h ceiling")]
     TimeoutTooLong { got: String, limit_hours: u64 },
     #[error("`{field}` of step `{name}` may hold at most {limit} entries")]
-    ListTooLong { field: &'static str, name: String, limit: usize },
+    ListTooLong {
+        field: Cow<'static, str>,
+        name: String,
+        limit: usize,
+    },
     #[error("`{field}` of step `{name}` may be at most {limit} characters")]
-    StringTooLong { field: &'static str, name: String, limit: usize },
+    StringTooLong {
+        field: Cow<'static, str>,
+        name: String,
+        limit: usize,
+    },
     #[error("`{field}` of step `{name}` may not contain control characters")]
-    ControlCharacters { field: &'static str, name: String },
+    ControlCharacters {
+        field: Cow<'static, str>,
+        name: String,
+    },
     #[error("`{builtin}` may be called at most once")]
-    Redeclared { builtin: &'static str },
+    Redeclared {
+        builtin: Cow<'static, str>,
+    },
 }
 
 /// Step names, `[A-Za-z0-9_/-]`, 1..=64 (design D§4.4).
@@ -171,13 +198,13 @@ pub fn parse_timeout(raw: &str) -> Result<Duration, Invalid> {
 pub fn check_list_item(field: &'static str, step: &str, item: &str) -> Result<(), Invalid> {
     if item.chars().count() > MAX_LIST_ITEM_LEN {
         return Err(Invalid::StringTooLong {
-            field,
+            field: field.into(),
             name: step.to_string(),
             limit: MAX_LIST_ITEM_LEN,
         });
     }
     if item.chars().any(|c| c.is_control()) {
-        return Err(Invalid::ControlCharacters { field, name: step.to_string() });
+        return Err(Invalid::ControlCharacters { field: field.into(), name: step.to_string() });
     }
     Ok(())
 }
@@ -192,7 +219,7 @@ pub fn check_list_item(field: &'static str, step: &str, item: &str) -> Result<()
 pub fn check_run(step: &str, run: &str) -> Result<(), Invalid> {
     if run.chars().count() > MAX_RUN_LEN {
         return Err(Invalid::StringTooLong {
-            field: "run",
+            field: "run".into(),
             name: step.to_string(),
             limit: MAX_RUN_LEN,
         });
@@ -200,7 +227,7 @@ pub fn check_run(step: &str, run: &str) -> Result<(), Invalid> {
     // Tab and newline are ordinary in a multi-line shell command, so they stay; everything else
     // control-class (NUL, ESC, carriage-return overwrite tricks) does not.
     if run.chars().any(|c| c.is_control() && !matches!(c, '\n' | '\t')) {
-        return Err(Invalid::ControlCharacters { field: "run", name: step.to_string() });
+        return Err(Invalid::ControlCharacters { field: "run".into(), name: step.to_string() });
     }
     Ok(())
 }

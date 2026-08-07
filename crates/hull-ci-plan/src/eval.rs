@@ -155,7 +155,7 @@ impl Recorder {
 impl State {
     fn set_image(&mut self, reference: &str) -> Result<(), PlanErrorKind> {
         if self.image.is_some() {
-            return Err(Invalid::Redeclared { builtin: "image" }.into());
+            return Err(Invalid::Redeclared { builtin: "image".into() }.into());
         }
         validate::check_image_ref(reference)?;
         self.image = Some(reference.to_string());
@@ -164,7 +164,7 @@ impl State {
 
     fn set_trust(&mut self, tier: &str) -> Result<(), PlanErrorKind> {
         if self.trust.is_some() {
-            return Err(Invalid::Redeclared { builtin: "trust" }.into());
+            return Err(Invalid::Redeclared { builtin: "trust".into() }.into());
         }
         self.trust = Some(match tier {
             "trusted" => Trust::Trusted,
@@ -176,7 +176,7 @@ impl State {
 
     fn set_cache_scope(&mut self, name: &str) -> Result<(), PlanErrorKind> {
         if self.cache_scope.is_some() {
-            return Err(Invalid::Redeclared { builtin: "cache_scope" }.into());
+            return Err(Invalid::Redeclared { builtin: "cache_scope".into() }.into());
         }
         validate::check_cache_scope(name)?;
         self.cache_scope = Some(name.to_string());
@@ -209,7 +209,7 @@ impl State {
         ] {
             if list.len() > validate::MAX_LIST_LEN {
                 return Err(Invalid::ListTooLong {
-                    field,
+                    field: field.into(),
                     name: step.name.clone(),
                     limit: validate::MAX_LIST_LEN,
                 }
@@ -437,25 +437,31 @@ fn build_step(
 
 // ── The driver ───────────────────────────────────────────────────────────────────────────────────
 
-/// Evaluate a pipeline file into a DAG, or fail with an error an author can act on.
+/// Evaluate a pipeline file into a DAG **in this process**, with no bound on memory.
+///
+/// The name is the warning. The work here is complete and correct, but every resource bound it
+/// installs is one starlark-rust checks *periodically* — so the memory an evaluation actually
+/// consumes is not among them. Measured: a 58-byte file reached **4 420 MB** resident and returned
+/// `Ok` (the table is in [`crate::alloc`]). The only legitimate caller is the `hull-ci-plan-eval`
+/// binary, which runs this inside a process whose allocator has a ceiling and whose death is an
+/// expected outcome. Everything else wants [`crate::evaluate_with`].
 ///
 /// `actions` is the built-in action registry `uses` is checked against — passed in rather than read
 /// from a global so the server owns what its node binary can actually run.
 ///
-/// Runs on a **dedicated thread with an explicit stack size**, for two reasons. The parser and the
-/// bytecode compiler are both recursive over the AST, so their depth is a function of hostile
-/// input; pinning the stack means the margin is a number this crate chose and tested against
-/// [`Limits::max_source_bytes`], not whatever stack the caller's runtime happened to give the task
-/// that called us. And it keeps a large reservation off the caller's threads, since it is address
-/// space that is never touched by a real pipeline.
-pub fn evaluate_with(
+/// Runs on a **dedicated thread with an explicit stack size**, for two reasons that survive the move
+/// into a child. The parser and the bytecode compiler are both recursive over the AST, so their
+/// depth is a function of hostile input; pinning the stack means the margin is a number this crate
+/// chose and tested against [`Limits::max_source_bytes`] rather than whatever the caller's runtime
+/// happened to provide. And a stack overflow is still an *abort*, so keeping [`crate::shape`]'s
+/// bounds honest is worth doing even where an abort is survivable.
+pub fn evaluate_in_process(
     source: &str,
     limits: &Limits,
-    actions: &[&str],
+    actions: Vec<String>,
 ) -> Result<Pipeline, PlanError> {
     let source = source.to_owned();
     let limits = limits.clone();
-    let actions: Vec<String> = actions.iter().map(|a| a.to_string()).collect();
     let stack_bytes = limits.stack_bytes;
 
     std::thread::Builder::new()

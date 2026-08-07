@@ -8,11 +8,24 @@ repository.workspace = true
 
 [dependencies]
 serde.workspace = true
+# The evaluation child and its parent speak JSON over a pipe: the DAG, the bounds, and the typed
+# error all have to survive a process boundary now that evaluation happens in one (see `sandbox`).
+serde_json.workspace = true
 thiserror.workspace = true
 starlark = "0.14"
+# For three things a memory bound cannot be built without: `_exit` from inside a global allocator
+# that may not unwind, `setrlimit` as the kernel-level backstop, and `getrusage` so the bound can be
+# measured rather than asserted. See `alloc`.
+libc = "0.2"
 # Named directly because `starlark`'s builtin ABI returns `anyhow::Result`; we need the type to
 # construct the error that unwinds an evaluation.
 anyhow = "1"
 # For `IsolationTier` only: the tier a pipeline *requests* has to map onto the one the scheduler
 # already speaks, and restating the enum here would be a second opinion about a security boundary.
 hull-ci-proto = { path = "../hull-ci-proto" }
+
+# The bounded evaluation child. Named explicitly so the name the parent searches for
+# (`sandbox::WORKER_NAME`) and the name Cargo produces cannot drift apart.
+[[bin]]
+name = "hull-ci-plan-eval"
+path = "src/bin/hull-ci-plan-eval.rs"

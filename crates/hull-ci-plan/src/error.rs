@@ -16,6 +16,8 @@
 //!
 //! [`without_diagnostic`]: starlark::Error::without_diagnostic
 
+use serde::{Deserialize, Serialize};
+
 use crate::validate::Invalid;
 
 /// An evaluation bound tripped (design D§4.4, "Evaluation bounds").
@@ -24,7 +26,12 @@ use crate::validate::Invalid;
 /// recursion that the stack cap won't stop — so in principle none of them can fire. They exist
 /// because "in principle" is not a property you want the control plane's availability to rest on
 /// when the input is written by an attacker.
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+///
+/// Serialisable because evaluation now happens in a child process ([`crate::sandbox`]), so this is
+/// what one process tells another. A typed error that could not cross the pipe would have to be
+/// re-derived from prose on the parent side, which is precisely the mistake `eval::classify`
+/// already exists to avoid.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error, Serialize, Deserialize)]
 pub enum Bound {
     #[error("pipeline emits more than {limit} steps")]
     Steps { limit: usize },
@@ -46,13 +53,22 @@ pub enum Bound {
     BlockChain { limit: usize },
     #[error("evaluation exceeded its work budget of {limit} operations")]
     Work { limit: u64 },
+    /// The memory ceiling. Since the audit, two different things trip this: starlark-rust's own
+    /// periodic heap check, which is where the *line number* comes from, and the child's allocation
+    /// ceiling ([`crate::alloc`]), which is the one that is actually a bound. The author is told the
+    /// same thing either way, because from their side it is the same rule.
     #[error("evaluation exceeded its memory budget of {limit} bytes")]
     Memory { limit: usize },
     #[error("recursion exceeded the {limit}-frame call stack")]
     CallStack { limit: usize },
+    /// The wall clock. [`Bound::Work`] bounds *work* and produces a better message; this one holds
+    /// when the thing being consumed is not work, and it only became enforceable when evaluation
+    /// moved into a process that can be killed ([`crate::sandbox`]).
+    #[error("evaluation did not finish within {limit_ms} ms")]
+    Time { limit_ms: u64 },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error, Serialize, Deserialize)]
 pub enum PlanErrorKind {
     /// The dialect refused it: a syntax error, an undefined name (`load`, `open`, `time` — none of
     /// which exist here), or a builtin called with the wrong argument shape.
@@ -64,14 +80,18 @@ pub enum PlanErrorKind {
     /// An evaluation bound.
     #[error("{0}")]
     Exhausted(#[from] Bound),
-    /// The evaluator itself failed — a panic on the evaluation thread. Our bug, not the author's,
-    /// and deliberately detail-free: whatever the panic said is about our source, not theirs.
+    /// The evaluator itself failed — a panic, a signal, or a child that never started. Our bug, not
+    /// the author's, and deliberately detail-free: whatever it said is about our source, not theirs.
+    ///
+    /// It is also the fail-closed answer when the evaluation helper cannot be found
+    /// ([`crate::sandbox::worker_path`]). Falling back to evaluating in this process would be worse
+    /// than an error: it would be a memory bound that is not there.
     #[error("the pipeline evaluator failed unexpectedly")]
     Internal,
 }
 
 /// A pipeline that did not produce a DAG.
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error, Serialize, Deserialize)]
 #[error("{}: {kind}", location(*line))]
 pub struct PlanError {
     /// 1-based line in `.hull/ci.star`, when the failure has a location at all. A budget that trips
