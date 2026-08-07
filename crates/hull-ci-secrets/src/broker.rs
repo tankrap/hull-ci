@@ -476,7 +476,75 @@ impl SecretBroker {
         Ok(DeliveredSecrets { tenant: grant.tenant, job_id: grant.job_id, values })
     }
 
+    /// Re-assert a package-proxy capability **without** spending it: may this still be used?
+    ///
+    /// This is the check that makes D§7.4's break-glass paths reach a credential the proxy has
+    /// *already* decrypted. Redemption discloses the value once, near the start of a job; every
+    /// package request after that is the proxy serving from its own memory, where neither
+    /// [`SecretBroker::revoke_tenant`] nor [`SecretBroker::shred_tenant`] could previously reach.
+    /// Revoking marked a record that was already spent, which changes nothing about it; shredding
+    /// destroyed the KEK, which makes the *ciphertext* unrecoverable and says nothing about a copy
+    /// already decrypted. So the proxy asks again before each use, and this answers.
+    ///
+    /// **There is deliberately no new revocation flag and no epoch counter.** The answer is read off
+    /// the same [`ProxyCapRecord`] the break-glass paths already write to, because the failure being
+    /// closed here was precisely one control missing one place, and a second piece of state is a
+    /// second thing for the next break-glass path to forget. Everything that revokes a proxy
+    /// capability today — [`SecretBroker::revoke_proxy_capability`],
+    /// [`SecretBroker::revoke_job_proxy_capabilities`], [`SecretBroker::revoke_tenant`], and
+    /// [`SecretBroker::shred_tenant`] through it — therefore reaches held plaintext for free, and so
+    /// will the next one.
+    ///
+    /// Checks are [`SecretBroker::redeem_proxy_capability`]'s, minus two:
+    ///
+    /// * **`consumed` is not checked.** The proxy consumed it, by design, on the first package
+    ///   request of the job. A re-assertion is not a second redemption: it discloses no value, and
+    ///   refusing a spent capability here would refuse every credential the moment it was fetched.
+    /// * **Nothing is burnt.** This runs on the request path, hundreds of times per `npm install`.
+    ///
+    /// A record that is merely *absent* — swept after expiry by
+    /// [`SecretBroker::mint_proxy_capability`], or never minted at all — is
+    /// [`SecretError::BadCapability`], the same refusal a revoked one gets. That is the fail-closed
+    /// direction and it is the whole point: a missing answer and a negative answer must mean the same
+    /// thing on this path, because an operator who has just shredded a tenant is responding to a
+    /// compromise. It also closes a smaller gap in passing — a capability that expires mid-job used to
+    /// leave the proxy spending its plaintext until the job ended, and now does not.
+    ///
+    /// Returns the grant so the caller can compare it against what the *proxy* believes it is holding.
+    /// `proxy_id` must come from [`crate::package::ProxyCredentialService`], for the reason
+    /// [`SecretBroker::redeem_proxy_capability`] gives.
+    pub fn reassert_proxy_capability(
+        &self,
+        token: &CapabilityToken,
+        proxy_id: &str,
+    ) -> Result<ProxyCredentialGrant, SecretError> {
+        let (id, digest) = parse_token(token)?;
+        let now = self.clock.now_secs();
+
+        let caps = self.proxy_caps.lock().expect("proxy capability registry poisoned");
+        let record = caps.get(&id).ok_or(SecretError::BadCapability)?;
+        if !record.authenticates(&digest) {
+            return Err(SecretError::BadCapability);
+        }
+        if record.revoked {
+            return Err(SecretError::CapabilityRevoked);
+        }
+        if now >= record.grant.expires_at {
+            return Err(SecretError::CapabilityExpired);
+        }
+        if record.grant.proxy_id != proxy_id {
+            return Err(SecretError::WrongProxy);
+        }
+        if !record.grant.author_class.may_receive_secrets() {
+            return Err(SecretError::OutsiderRefused);
+        }
+        Ok(record.grant.clone())
+    }
+
     /// Revoke one outstanding package-proxy capability. Returns whether it existed.
+    ///
+    /// Reaches a credential the proxy is already holding as well as an unredeemed one, because the
+    /// proxy re-reads this flag through [`SecretBroker::reassert_proxy_capability`] before every use.
     pub fn revoke_proxy_capability(&self, cap_id: CapId) -> bool {
         let mut caps = self.proxy_caps.lock().expect("proxy capability registry poisoned");
         match caps.get_mut(&cap_id) {
@@ -526,6 +594,14 @@ impl SecretBroker {
     /// Both, because "revoke this tenant" that left the package proxy able to keep spending the
     /// tenant's registry token would be a revocation in name only. The two registries are separate
     /// maps precisely so this method has to name them both, where a reviewer can see it.
+    ///
+    /// The count it returns is capabilities *marked*, and for a long time that was the whole of what
+    /// this did — which made it a revocation in name only for a different reason: a proxy that had
+    /// already spent a capability held the plaintext, and marking a spent record changed nothing about
+    /// it. That is closed by [`SecretBroker::reassert_proxy_capability`], which the proxy calls before
+    /// every use, so the marks written here now take effect on a *held* credential as well as an
+    /// unredeemed one. The count still does not include those — a marked record is one fact, and how
+    /// many proxy processes were holding a copy of it is not something this side knows.
     pub fn revoke_tenant(&self, tenant: &str) -> usize {
         let mut n = 0;
         {
@@ -549,7 +625,12 @@ impl SecretBroker {
     /// over `DELETE FROM secrets`.
     ///
     /// Outstanding capabilities are revoked first, so the window between "key gone" and "job fails"
-    /// produces a clear refusal rather than a decryption error.
+    /// produces a clear refusal rather than a decryption error. That ordering is now load-bearing for
+    /// a second reason: destroying a KEK makes ciphertext unrecoverable and says **nothing** about a
+    /// copy the package proxy has already decrypted, so the revocation is the only half of this that
+    /// reaches a live proxy at all (see [`SecretBroker::reassert_proxy_capability`]). Shredding
+    /// without revoking would leave a compromised tenant's registry token being spent by the proxy
+    /// until every job holding one ended.
     ///
     /// Ciphertext rows are deliberately **left in place**: they are now inert, and an operator may
     /// want them for an audit. [`SealedStore::delete_tenant`] is the separate hygiene step.
@@ -770,6 +851,51 @@ mod tests {
             f.broker.redeem(&token2, "node-a", &[]).unwrap_err(),
             SecretError::NoKekVersion { .. }
         ));
+    }
+
+    #[test]
+    fn shredding_a_tenant_revokes_before_it_destroys_the_key() {
+        // The ordering inside `shred_tenant` is load-bearing rather than tidy, and this is what says
+        // so. Destroying a KEK makes ciphertext unrecoverable and says nothing about a copy the
+        // package proxy has already decrypted; the revocation is the only half of a shred that
+        // reaches a live proxy, through `reassert_proxy_capability`. A shred that skipped it would
+        // leave a compromised tenant's registry token in use until every job holding one ended.
+        let f = fixture();
+        let (token, _) = f
+            .broker
+            .mint_proxy_capability(&ProxyCapabilityRequest {
+                tenant: "acme".into(),
+                job_id: "job-1".into(),
+                proxy_id: "proxy-a".into(),
+                declared: vec!["NPM_TOKEN".into()],
+                author_class: AuthorClass::Member,
+                expires_at: 2_000,
+            })
+            .unwrap();
+        // Spend it, so what is left is exactly the case the key material cannot speak to.
+        f.broker.redeem_proxy_capability(&token, "proxy-a").unwrap();
+        assert!(f.broker.reassert_proxy_capability(&token, "proxy-a").is_ok());
+
+        f.broker.shred_tenant("acme").unwrap();
+
+        assert_eq!(
+            f.broker.reassert_proxy_capability(&token, "proxy-a").unwrap_err(),
+            SecretError::CapabilityRevoked
+        );
+    }
+
+    #[test]
+    fn a_capability_record_that_no_longer_exists_refuses_the_re_assertion() {
+        // Absent and revoked are one answer on the use path. This is the fail-closed direction, and
+        // it is the direction that matters: an operator who has just shredded a tenant is responding
+        // to a compromise, and "we could not find the record, so carry on" would be worth nothing.
+        let f = fixture();
+        assert_eq!(
+            f.broker
+                .reassert_proxy_capability(&CapabilityToken::from_wire("hcap_garbage"), "proxy-a")
+                .unwrap_err(),
+            SecretError::BadCapability
+        );
     }
 
     #[test]

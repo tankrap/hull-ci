@@ -45,6 +45,16 @@
 //!   "Revocation stops proxy access" would become "revocation stops proxy access eventually", which
 //!   is not the property D§7.4 claims. Rejected.
 //!
+//!   That rejection was for a long time the *only* thing standing behind the unqualified property,
+//!   and it did not stand: the proxy decrypts the credential once and then serves it from memory for
+//!   the life of the job, which has exactly the "…eventually" shape the paragraph above refuses, with
+//!   the job standing in for the TTL. What actually delivers the unqualified property is
+//!   [`ProxyCredentialReassertion`] — the proxy re-asks before every use, and a refusal *or* a
+//!   missing answer destroys the copy it is holding. The residual window is one in-flight upstream
+//!   request rather than a clock interval, and the price is a broker call per package request, which
+//!   is the cost this section was originally unwilling to pay and turns out to be what the property
+//!   costs.
+//!
 //! # The outsider question, decided explicitly
 //!
 //! An `outsider`-authored job (D§1: a fork PR, an unknown contributor) gets **no** capability here,
@@ -246,6 +256,56 @@ pub struct SignedProxyRedemption {
     pub signature: [u8; SIGNATURE_LEN],
 }
 
+/// A proxy asking whether a capability it has **already spent** may still be used.
+///
+/// The counterpart to [`SignedProxyRedemption`] on the use path. The proxy holds one job's upstream
+/// credential in plaintext for the life of that job (see [`crate::broker::SecretBroker`]'s note on
+/// why that is unavoidable), and D§7.4's break-glass paths have to reach that copy, not merely the
+/// ciphertext behind it. So the proxy re-asks before every use, presenting the same token it
+/// redeemed with.
+///
+/// # Why this is not signed, when a redemption is
+///
+/// A redemption **discloses a tenant's plaintext**, so it must prove that the asker holds the private
+/// half of an enrolled key. This discloses nothing: the answer is `Ok(())` or a refusal, and the
+/// asker already holds the capability token — the bearer authenticator for the very capability it is
+/// asking about. There is no state an unauthorised caller could reach through here that it could not
+/// reach through the redemption path with the same token, and the only thing it could learn is
+/// whether a capability it already possesses is still live.
+///
+/// Against that, a signature would cost an Ed25519 sign *and* verify on a path that runs once per
+/// package request rather than once per job — and the section of D§7.4 this module implements is
+/// explicit that a broker round trip must not sit between `npm` and every tarball. Some cost is
+/// unavoidable (that is the trade this whole mechanism makes; see
+/// [`crate::broker::SecretBroker::reassert_proxy_capability`]), but paying it in asymmetric crypto
+/// for a check that discloses nothing would be paying it for nothing.
+///
+/// The `public_key` is still here and still checked, because [`ProxyRegistry::revoke`] is a
+/// break-glass path too: withdrawing a compromised proxy's enrolment has to stop it spending what it
+/// is already holding, not just stop it fetching more. It is a *claim* rather than a proof, and the
+/// worst a caller who lies about it achieves is a refusal — a claimed key that is not enrolled fails,
+/// and a claimed key that is enrolled still has to match the capability's `proxy_id`.
+///
+/// What this does assume is the same thing [`SignedProxyRedemption`] assumes and the crate doc names
+/// under "not channel binding": a forged *affirmative* answer needs an active attacker on the
+/// proxy↔broker link, and that link already carries the plaintext credential itself. A lost answer —
+/// a timeout, a dropped connection, a broker that is down — is an `Err`, and the proxy's contract is
+/// that an `Err` refuses. Losing the signal fails closed; only owning the wire fails open, and owning
+/// the wire was already game over.
+#[derive(Debug, Clone)]
+pub struct ProxyCredentialReassertion {
+    /// The capability the proxy redeemed. Already consumed, and deliberately still checked against
+    /// the record's digest so the answer is only given to whoever actually redeemed it.
+    pub token: CapabilityToken,
+    /// The tenant the proxy believes it is holding this credential for. Checked against the grant, so
+    /// a proxy whose own bookkeeping has drifted across tenants is refused rather than re-authorised.
+    pub tenant: String,
+    /// The job the proxy believes it is serving. Checked against the grant.
+    pub job_id: String,
+    /// The **claimed** identity of the asking proxy. See the type doc for why a claim is enough here.
+    pub public_key: NodePublicKey,
+}
+
 /// The exact bytes a proxy redemption's signature covers.
 ///
 /// Its own domain string, so a proxy redemption can never be replayed as a node redemption over a
@@ -300,6 +360,16 @@ impl ProxyRegistry {
 
     pub fn is_enrolled(&self, key: &NodePublicKey) -> bool {
         self.keys.is_enrolled(key)
+    }
+
+    /// The proxy id enrolled for `key`, if any.
+    ///
+    /// Exposed alongside [`ProxyRegistry::verify`] rather than folded into it because the use-path
+    /// re-assertion ([`ProxyCredentialReassertion`]) needs the id without a signature to check, and
+    /// the alternative — letting that path call `is_enrolled` and then take the proxy id from a
+    /// request field — is the exact mistake `verify` exists to make impossible.
+    pub fn resolve(&self, key: &NodePublicKey) -> Option<String> {
+        self.keys.resolve(key)
     }
 
     /// Verify a redemption and return the proxy id **derived from the verified key**.
@@ -414,6 +484,43 @@ impl ProxyCredentialService {
             });
         }
         Ok(delivered)
+    }
+
+    /// Re-assert a capability the proxy has already spent: may the credential it is holding still be
+    /// used?
+    ///
+    /// Structurally identical to [`ProxyCredentialService::redeem`] — resolve the proxy id from the
+    /// key rather than from a request field, ask the broker, then compare what came back against what
+    /// the request claimed — and identical for the same reasons. The tenant comparison in particular
+    /// matters as much here as there: one proxy process serves every tenant on the fleet, so "the
+    /// credential I am about to spend belongs to the tenant whose job asked for it" is a claim to be
+    /// checked rather than a consequence of the topology, and a re-assertion that skipped it would be
+    /// a way to keep a revoked tenant's credential alive by asking about a different tenant's job.
+    ///
+    /// Returns `Ok(())` and nothing else. There is no value to hand back, which is the property that
+    /// lets this path go unsigned — see [`ProxyCredentialReassertion`].
+    pub fn reassert(&self, req: &ProxyCredentialReassertion) -> Result<(), SecretError> {
+        // Not `is_enrolled` plus a caller-supplied id: the id is *derived* from the key, so a
+        // withdrawn enrolment ([`ProxyRegistry::revoke`]) refuses here and a proxy cannot re-assert
+        // as one it is not.
+        let proxy_id = self
+            .proxies
+            .resolve(&req.public_key)
+            .ok_or_else(|| SecretError::UnenrolledProxy(req.public_key.to_string()))?;
+        let grant = self.broker.reassert_proxy_capability(&req.token, &proxy_id)?;
+        if grant.tenant != req.tenant {
+            return Err(SecretError::WrongTenant {
+                bound: grant.tenant,
+                presented: req.tenant.clone(),
+            });
+        }
+        if grant.job_id != req.job_id {
+            return Err(SecretError::WrongJob {
+                bound: grant.job_id,
+                presented: req.job_id.clone(),
+            });
+        }
+        Ok(())
     }
 }
 
@@ -737,6 +844,189 @@ mod tests {
         let delivered =
             f.service.redeem(&f.proxy.sign(&globex, "globex", "job-for-globex", 1_000)).unwrap();
         assert_eq!(delivered.get("NPM_TOKEN").unwrap().expose(), b"globex-npm-token");
+    }
+
+    // ── Re-assertion: the use-path check ─────────────────────────────────────────────────────────
+    //
+    // Redemption happens once per job. Everything below is about the hundreds of package requests
+    // after it, when the proxy is holding a decrypted credential and the only thing that can stop it
+    // is the broker being asked again.
+
+    fn reassertion(f: &Fixture, token: &CapabilityToken, tenant: &str) -> ProxyCredentialReassertion {
+        ProxyCredentialReassertion {
+            token: token.clone(),
+            tenant: tenant.into(),
+            job_id: format!("job-for-{tenant}"),
+            public_key: f.proxy.public(),
+        }
+    }
+
+    /// Redeem for real, then hand back the spent token — the state every test below starts from.
+    fn spent(f: &Fixture, tenant: &str) -> CapabilityToken {
+        let (token, _) = f.service.mint(&request(tenant, AuthorClass::Member)).unwrap();
+        f.service.redeem(&f.proxy.sign(&token, tenant, &format!("job-for-{tenant}"), 1_000)).unwrap();
+        token
+    }
+
+    #[test]
+    fn a_spent_capability_still_re_asserts_because_the_proxy_is_the_one_that_spent_it() {
+        // The check that would be trivially wrong to get right by refusing everything. A re-assertion
+        // is not a second redemption: it discloses no value, so `consumed` must not be consulted, or
+        // every credential would die the instant it was fetched.
+        let f = fixture();
+        let token = spent(&f, "acme");
+        assert_eq!(f.service.reassert(&reassertion(&f, &token, "acme")), Ok(()));
+        // …repeatedly, because this runs once per package request.
+        for _ in 0..50 {
+            assert!(f.service.reassert(&reassertion(&f, &token, "acme")).is_ok());
+        }
+        // And it did not burn anything: the capability's own single-use property is untouched.
+        assert_eq!(
+            f.service.redeem(&f.proxy.sign(&token, "acme", "job-for-acme", 1_000)).unwrap_err(),
+            SecretError::CapabilityConsumed
+        );
+    }
+
+    #[test]
+    fn revoking_a_tenant_fails_the_re_assertion_of_a_capability_it_already_spent() {
+        let f = fixture();
+        let acme = spent(&f, "acme");
+        let globex = spent(&f, "globex");
+
+        assert_eq!(f.service.broker().revoke_tenant("acme"), 1);
+
+        assert_eq!(
+            f.service.reassert(&reassertion(&f, &acme, "acme")).unwrap_err(),
+            SecretError::CapabilityRevoked
+        );
+        // Blast-radius isolation on the use path.
+        assert!(f.service.reassert(&reassertion(&f, &globex, "globex")).is_ok());
+    }
+
+    #[test]
+    fn crypto_shredding_a_tenant_fails_the_re_assertion_of_a_capability_it_already_spent() {
+        // Not because the KEK is gone — a re-assertion never opens a ciphertext — but because
+        // `shred_tenant` revokes first. That ordering is the only part of a shred that reaches a
+        // proxy already holding the plaintext.
+        let f = fixture();
+        let acme = spent(&f, "acme");
+        let globex = spent(&f, "globex");
+
+        f.service.broker().shred_tenant("acme").unwrap();
+
+        assert_eq!(
+            f.service.reassert(&reassertion(&f, &acme, "acme")).unwrap_err(),
+            SecretError::CapabilityRevoked
+        );
+        assert!(f.service.reassert(&reassertion(&f, &globex, "globex")).is_ok());
+    }
+
+    #[test]
+    fn a_re_assertion_from_an_unenrolled_or_withdrawn_proxy_is_refused() {
+        // The proxy break-glass, reaching what the process is already holding rather than only what
+        // it might fetch next.
+        let f = fixture();
+        let token = spent(&f, "acme");
+        assert!(f.service.reassert(&reassertion(&f, &token, "acme")).is_ok());
+
+        assert!(f.service.proxies().revoke("proxy-a"));
+        assert!(matches!(
+            f.service.reassert(&reassertion(&f, &token, "acme")),
+            Err(SecretError::UnenrolledProxy(_))
+        ));
+
+        // And a key nobody ever enrolled gets the same answer, so the id is derived rather than
+        // claimed: there is no request field a caller could put `proxy-a` into.
+        let mut stranger = reassertion(&f, &token, "acme");
+        stranger.public_key = ProxyIdentity::generate().public();
+        assert!(matches!(f.service.reassert(&stranger), Err(SecretError::UnenrolledProxy(_))));
+    }
+
+    #[test]
+    fn a_re_assertion_is_bound_to_one_proxy_even_between_enrolled_ones() {
+        let f = fixture();
+        let thief = ProxyIdentity::generate();
+        f.service.enrol_proxy("proxy-b", thief.public()).unwrap();
+        let token = spent(&f, "acme");
+
+        let mut as_thief = reassertion(&f, &token, "acme");
+        as_thief.public_key = thief.public();
+        assert_eq!(f.service.reassert(&as_thief).unwrap_err(), SecretError::WrongProxy);
+        // The legitimate proxy is not collateral damage.
+        assert!(f.service.reassert(&reassertion(&f, &token, "acme")).is_ok());
+    }
+
+    #[test]
+    fn a_re_assertion_under_another_tenants_or_jobs_name_is_refused() {
+        // Without this, a proxy holding a revoked tenant's credential could keep it alive by asking
+        // about a tenant that had not been revoked — the cross-tenant shape this whole module exists
+        // to make unreachable, arriving on the use path instead of the disclosure path.
+        let f = fixture();
+        let token = spent(&f, "acme");
+
+        let mut wrong_tenant = reassertion(&f, &token, "acme");
+        wrong_tenant.tenant = "globex".into();
+        assert_eq!(
+            f.service.reassert(&wrong_tenant).unwrap_err(),
+            SecretError::WrongTenant { bound: "acme".into(), presented: "globex".into() }
+        );
+
+        let mut wrong_job = reassertion(&f, &token, "acme");
+        wrong_job.job_id = "some-other-job".into();
+        assert!(matches!(f.service.reassert(&wrong_job), Err(SecretError::WrongJob { .. })));
+    }
+
+    #[test]
+    fn a_forged_or_unknown_token_never_re_asserts() {
+        // The digest is checked here as it is on the redemption path, so the answer is only ever
+        // given to whoever actually redeemed the capability.
+        let f = fixture();
+        let token = spent(&f, "acme");
+
+        let (id, sep) = token.expose().split_at(token.expose().len() - 64);
+        let mut forged = reassertion(&f, &token, "acme");
+        forged.token = CapabilityToken::from_wire(format!("{id}{}", "0".repeat(sep.len())));
+        assert_eq!(f.service.reassert(&forged).unwrap_err(), SecretError::BadCapability);
+
+        let mut garbage = reassertion(&f, &token, "acme");
+        garbage.token = CapabilityToken::from_wire("garbage");
+        assert_eq!(f.service.reassert(&garbage).unwrap_err(), SecretError::BadCapability);
+
+        // …and none of it burnt or broke the real one.
+        assert!(f.service.reassert(&reassertion(&f, &token, "acme")).is_ok());
+    }
+
+    #[test]
+    fn a_capability_that_expires_stops_re_asserting() {
+        let f = fixture();
+        let token = spent(&f, "acme");
+        f.clock.set(1_999);
+        assert!(f.service.reassert(&reassertion(&f, &token, "acme")).is_ok());
+        f.clock.set(2_000);
+        assert_eq!(
+            f.service.reassert(&reassertion(&f, &token, "acme")).unwrap_err(),
+            SecretError::CapabilityExpired
+        );
+    }
+
+    #[test]
+    fn a_swept_capability_record_refuses_rather_than_being_absent() {
+        // `mint_proxy_capability` sweeps expired records, so a long enough job outlives the record
+        // that authorised it. Absent and revoked must be the same answer on this path: a missing
+        // answer that meant "carry on" would be the fail-open direction, and an operator reaching for
+        // break-glass is responding to a compromise.
+        let f = fixture();
+        let token = spent(&f, "acme");
+        f.clock.set(3_000);
+        // Any mint sweeps; this one is for a different tenant entirely.
+        let mut later = request("globex", AuthorClass::Member);
+        later.expires_at = 4_000;
+        f.service.mint(&later).unwrap();
+
+        assert_eq!(
+            f.service.reassert(&reassertion(&f, &token, "acme")).unwrap_err(),
+            SecretError::BadCapability
+        );
     }
 
     #[test]

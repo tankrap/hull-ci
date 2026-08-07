@@ -202,6 +202,27 @@ pub enum CredentialError {
          control minted a package grant without one"
     )]
     Unregistered { job_id: String },
+    /// A credential the proxy was already holding stopped being authorised mid-job, so it was
+    /// dropped. The break-glass answer (D§7.4): a revoked or crypto-shredded tenant, a withdrawn
+    /// proxy enrolment, a revoked capability, or an expiry reached while the job was still running.
+    ///
+    /// **It also covers the case where the proxy could not get an answer at all**, and the two are
+    /// deliberately one variant. The proxy cannot tell "the operator revoked this tenant" from "the
+    /// broker did not reply", and the safe reading of an unanswered re-assertion is the same as a
+    /// refused one — an operator who has just shredded a tenant is responding to a compromise, and a
+    /// mechanism that failed open while the broker was unreachable would be worth very little. The
+    /// `detail` names which it was, for whoever reads the log.
+    ///
+    /// Classified as a *policy* refusal by [`CredentialError::is_policy_refusal`], and so a 403,
+    /// including on the unreachable-broker path where 502 would be the literal truth. The reason is
+    /// operational rather than pedantic: a 502 tells a package manager to retry, and a job whose
+    /// tenant has just been shredded should stop rather than hammer the proxy for the rest of its
+    /// timeout.
+    #[error(
+        "job `{job_id}` may no longer spend a tenant credential for upstream `{upstream}`; \
+         the one it was holding has been dropped: {detail}"
+    )]
+    Invalidated { job_id: String, upstream: String, detail: String },
     /// The job's grant names one tenant and the capability the proxy holds for it names another.
     ///
     /// Unreachable through a correct control plane, and refused loudly rather than resolved in
@@ -230,8 +251,12 @@ impl CredentialError {
         match self {
             // The job (or rather its author) asked for something it is not entitled to, and the
             // cross-tenant case is refused on the same footing because serving it would be a
-            // disclosure.
-            CredentialError::NoAuthority { .. } | CredentialError::TenantMismatch { .. } => true,
+            // disclosure. `Invalidated` is the same answer arriving late: the job was entitled when
+            // it started and is not any more, which is a decision about authority however it was
+            // reached (see the variant's own doc for why the fail-closed case rides along).
+            CredentialError::NoAuthority { .. }
+            | CredentialError::TenantMismatch { .. }
+            | CredentialError::Invalidated { .. } => true,
             // Everything else is a configuration or infrastructure condition. The job's request was
             // well-formed and the proxy could not complete it.
             CredentialError::Missing { .. }
@@ -530,6 +555,14 @@ mod tests {
                 job_id: "j".into(),
                 registered: "acme".into(),
                 presented: "globex".into(),
+            },
+            // A 403 rather than a 502 even when the cause was an unreachable broker: see the
+            // variant's doc. A 502 invites a retry, and a job whose tenant has just been shredded
+            // should stop.
+            CredentialError::Invalidated {
+                job_id: "j".into(),
+                upstream: "npm".into(),
+                detail: "capability was revoked".into(),
             },
         ];
         let operator = [

@@ -762,9 +762,11 @@ async fn an_outsider_authored_job_cannot_spend_the_tenants_registry_credential()
 }
 
 #[tokio::test]
-async fn revoking_a_tenant_stops_its_proxy_access() {
-    // D§7.4 break-glass path one, checked at the proxy. Revocation must bite *before* the capability
-    // is spent, which is why the fetch below is this job's first.
+async fn revoking_a_tenant_stops_a_capability_it_has_not_spent_yet() {
+    // D§7.4 break-glass path one, at the proxy, in the state where the broker itself can refuse: the
+    // fetch below is this job's first, so the capability is still unspent and the redemption is what
+    // fails. The state where the proxy is *already holding* the plaintext shuts through an entirely
+    // different mechanism and has its own test below.
     let (h, b) = brokered_harness().await;
     let token = b.place(&h, "acme", "job-1", AuthorClass::Member);
     assert_eq!(b.service.broker().revoke_tenant("acme"), 1, "the proxy capability, revoked with the rest");
@@ -776,18 +778,66 @@ async fn revoking_a_tenant_stops_its_proxy_access() {
 }
 
 #[tokio::test]
-async fn crypto_shredding_a_tenant_stops_its_proxy_access_and_leaves_others_alone() {
-    // Break-glass path two. Deleting the KEK makes the tenant's stored registry token unrecoverable
-    // — including from any backup — and the proxy simply cannot serve it any more.
+async fn revoking_a_tenant_stops_a_credential_the_proxy_is_already_holding() {
+    // **The break-glass test, over a socket.** A real `npm install` resolves many packages, so by the
+    // time an operator reaches for revocation the interesting state is not "unspent capability" but
+    // "plaintext in the proxy's memory". That is the case an audit found open: revoking marked a
+    // record that was already spent, and the proxy went on authenticating outbound until the job
+    // ended.
     let (h, b) = brokered_harness().await;
     let acme = b.place(&h, "acme", "job-acme", AuthorClass::Member);
     let globex = b.place(&h, "globex", "job-globex", AuthorClass::Member);
 
+    // The install is under way: both jobs have resolved a package, so both credentials are held.
+    assert_eq!(client().get(h.url(&acme, "private", "pkg")).send().await.unwrap().status(), 200);
+    assert_eq!(client().get(h.url(&globex, "private", "pkg")).send().await.unwrap().status(), 200);
+    let upstream_requests = h.seen.lock().unwrap().paths.len();
+
+    assert_eq!(b.service.broker().revoke_tenant("acme"), 1);
+
+    // 403 rather than 502: the job's authority was withdrawn, and a 502 would invite `npm` to retry.
+    let response = client().get(h.url(&acme, "private", "pkg")).send().await.unwrap();
+    assert_eq!(response.status(), 403);
+    let body = response.text().await.unwrap();
+    assert!(!body.contains(UPSTREAM_SECRET), "{body}");
+    assert_eq!(
+        h.seen.lock().unwrap().paths.len(),
+        upstream_requests,
+        "the upstream must not have been contacted at all, let alone with the revoked credential"
+    );
+
+    // Blast-radius isolation on the use path: one tenant's break-glass must not cost every other
+    // tenant on the fleet its package resolution.
+    assert_eq!(client().get(h.url(&globex, "private", "pkg")).send().await.unwrap().status(), 200);
+    assert_eq!(
+        h.seen.lock().unwrap().authorization.last().unwrap().as_deref(),
+        Some(&*format!("Bearer {GLOBEX_SECRET}"))
+    );
+}
+
+#[tokio::test]
+async fn crypto_shredding_a_tenant_stops_its_proxy_access_and_leaves_others_alone() {
+    // Break-glass path two, in both states a live proxy can be in when an operator reaches for it.
+    //
+    // `job-held` has already resolved a package, so the proxy holds its plaintext; `job-fresh` has
+    // not. The two shut through different machinery — the held one because `shred_tenant` revokes
+    // before it destroys the key and the proxy re-reads that mark on the use path, the fresh one
+    // because there is no longer a KEK to open the ciphertext with. Deleting the KEK is what makes
+    // the stored token unrecoverable from any backup; it is *not* what reaches a copy already
+    // decrypted, and the test used to only exercise the half where that distinction did not show.
+    let (h, b) = brokered_harness().await;
+    let held = b.place(&h, "acme", "job-held", AuthorClass::Member);
+    let fresh = b.place(&h, "acme", "job-fresh", AuthorClass::Member);
+    let globex = b.place(&h, "globex", "job-globex", AuthorClass::Member);
+    assert_eq!(client().get(h.url(&held, "private", "pkg")).send().await.unwrap().status(), 200);
+
     b.service.broker().shred_tenant("acme").unwrap();
 
-    let response = client().get(h.url(&acme, "private", "pkg")).send().await.unwrap();
-    assert_eq!(response.status(), 502);
-    assert!(!response.text().await.unwrap().contains(UPSTREAM_SECRET));
+    for (token, expected) in [(&held, 403), (&fresh, 502)] {
+        let response = client().get(h.url(token, "private", "pkg")).send().await.unwrap();
+        assert_eq!(response.status(), expected);
+        assert!(!response.text().await.unwrap().contains(UPSTREAM_SECRET));
+    }
 
     // Blast-radius isolation: one KEK per tenant is what makes this a local event.
     assert_eq!(client().get(h.url(&globex, "private", "pkg")).send().await.unwrap().status(), 200);

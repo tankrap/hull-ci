@@ -113,8 +113,12 @@ Kept here rather than in a tracker, because a runner's honest limits belong next
 
 - **Orphaned containers.** Killing a node mid-step can leave a container running, so `single_use` is
   true in the ordinary path and not across a crash.
-- **Revocation does not reach a credential the package proxy already holds** — shredding a tenant
-  makes the ciphertext unrecoverable and says nothing about a copy already decrypted for a live job.
+- **Revocation reaches a credential the package proxy already holds, but not one already on the
+  wire.** The proxy re-asserts the job's capability with the broker before every use, so a revoke or
+  a crypto-shred stops the *next* package request and destroys the decrypted copy; an upstream
+  request whose `Authorization` header is already built runs to completion, bounded by that request's
+  own timeout rather than by anything Hull controls. A missing answer counts as a refusal, so an
+  unreachable broker stops the proxy instead of being taken for consent.
 - **On `HULL_CI_TRUSTED_TENANTS=*`, the dispatch chooses both the tenant and the author class**, and
   dispatching needs one deployment-wide secret rather than a per-tenant credential. The default
   (`empty`) fails closed; the `*` configuration trusts Hull completely.

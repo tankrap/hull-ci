@@ -79,8 +79,8 @@ pub use identity::{NodeIdentity, NodePublicKey, NodeRegistry, SignedRedemption, 
 pub use infisical::{InfisicalAuth, InfisicalConfig, InfisicalConfigError, InfisicalKeyManager, Redacted};
 pub use keys::{DevKeyManager, KekVersion, KeyManager};
 pub use package::{
-    ProxyCapabilityRequest, ProxyCredentialGrant, ProxyCredentialService, ProxyIdentity,
-    ProxyRegistry, SignedProxyRedemption,
+    ProxyCapabilityRequest, ProxyCredentialGrant, ProxyCredentialReassertion, ProxyCredentialService,
+    ProxyIdentity, ProxyRegistry, SignedProxyRedemption,
 };
 pub use mask::{Masker, MASK, MIN_MASKABLE_LEN};
 pub use seal::{SealedSecret, SecretBytes, Vault};
