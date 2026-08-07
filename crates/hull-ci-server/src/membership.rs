@@ -20,7 +20,7 @@
 use std::collections::BTreeSet;
 
 use hull_ci_control::seams::Membership;
-use hull_ci_proto::AuthorClass;
+use hull_ci_proto::{tenant_of, AuthorClass};
 
 /// The tenants whose authors this deployment treats as members.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -39,13 +39,19 @@ impl TrustedTenants {
     }
 
     /// Parse a comma-separated list. `*` anywhere in the list means every tenant.
+    ///
+    /// Each name goes through [`tenant_of`], the same normalization a dispatch's tenant goes
+    /// through. Both sides of a comparison have to be canonical or neither is: an operator who
+    /// typed `Acme` against dispatches that arrive as `acme` would otherwise have configured a
+    /// deployment that trusts nobody, and the symptom — every job `errored` — points nowhere near
+    /// the capital letter that caused it.
     pub fn parse(raw: &str) -> Self {
         let mut out = TrustedTenants::default();
         for name in raw.split(',').map(str::trim).filter(|s| !s.is_empty()) {
             if name == "*" {
                 out.all = true;
             } else {
-                out.names.insert(name.to_string());
+                out.names.insert(tenant_of(name).into_owned());
             }
         }
         out
@@ -74,11 +80,18 @@ impl TrustedTenants {
 impl Membership for TrustedTenants {
     /// `repo` is `tenant/repo`; the tenant half is the boundary everything else is scoped by (D§1).
     ///
+    /// The tenant comes from [`tenant_of`] rather than from a `split('/')` written here. This
+    /// function used to have its own copy of that expression, which is precisely the shape an
+    /// isolation audit found: two components deriving the boundary two ways, and `Acme` therefore
+    /// trusted in one of them and not the other. Ingest canonicalizes `repo` before this is ever
+    /// called, so on that path the normalization is a second application of the same rule — which is
+    /// the point, because this is also reachable from a `Dispatch` that never went through ingest.
+    ///
     /// `author` is deliberately unused. It is display-only text from the dispatch, and reading an
     /// authorization decision out of it would let whoever authored the change choose their own class.
     fn classify(&self, repo: &str, _author: &str) -> AuthorClass {
-        let tenant = repo.split('/').next().unwrap_or(repo);
-        if self.is_trusted(tenant) {
+        let tenant = tenant_of(repo);
+        if self.is_trusted(&tenant) {
             AuthorClass::Member
         } else {
             AuthorClass::Outsider
@@ -116,6 +129,23 @@ mod tests {
     }
 
     #[test]
+    fn one_tenant_spelled_two_ways_is_trusted_the_same_way_both_times() {
+        // The membership half of the tenant-normalization finding. Trust is decided by comparing
+        // two strings, so both of them have to be canonical: an operator's config entry and a
+        // dispatch's `repo` must not be able to disagree about *padding*.
+        //
+        // Case is emphatically not in that list — see the test below. The padding here is on the
+        // config side on purpose: `parse` normalizes its entries exactly the way `tenant_of`
+        // normalizes a dispatch, which is what makes comparing them meaningful at all.
+        let t = TrustedTenants::parse(" acme , globex");
+        for repo in ["acme/widget", " acme /widget", "acme/widget ", "acme/ widget"] {
+            assert_eq!(t.classify(repo, "justin"), AuthorClass::Member, "{repo} lost its trust");
+        }
+        assert_eq!(t.classify("globex/thing", "justin"), AuthorClass::Member);
+        assert_eq!(t.classify("acmex/widget", "justin"), AuthorClass::Outsider, "and only this tenant");
+    }
+
+    #[test]
     fn a_repo_whose_tenant_half_is_empty_is_never_a_member() {
         // `Dispatch::tenant()` splits on `/` and takes the first component, so a `repo` of
         // `/widget` — or `//x`, or a bare `/` — yields the empty tenant. Nothing upstream rejects
@@ -140,5 +170,18 @@ mod tests {
         let t = TrustedTenants::parse("acme");
         assert_eq!(t.classify("acme/widget", "justin"), t.classify("acme/widget", "admin"));
         assert_eq!(t.classify("evil/widget", "justin"), t.classify("evil/widget", "admin"));
+    }
+
+    #[test]
+    fn a_differently_cased_tenant_must_not_inherit_another_tenants_trust() {
+        // Hull normalizes tenant names nowhere, so `acme` and `ACME` can be two distinct
+        // accounts. Folding case here would let the second one spend the first one's trust.
+        let trusted = TrustedTenants::parse("acme");
+        assert_eq!(trusted.classify("acme/widget", "someone"), AuthorClass::Member);
+        assert_eq!(
+            trusted.classify("ACME/evil", "someone"),
+            AuthorClass::Outsider,
+            "a tenant Hull considers distinct must not be folded into a trusted one"
+        );
     }
 }

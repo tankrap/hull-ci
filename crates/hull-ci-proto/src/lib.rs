@@ -10,6 +10,8 @@
 //! Nothing in this crate does I/O. It is types, parsing, and the invariants that are cheap to encode
 //! in the type system — notably that a [`Verdict`] carries a [`Reason`] only when it is `errored`.
 
+use std::borrow::Cow;
+
 use serde::{Deserialize, Serialize};
 
 /// The contract version we speak, sent by Hull as `X-Hull-CI-Version` (spec §13).
@@ -57,25 +59,93 @@ pub struct Dispatch {
 }
 
 impl Dispatch {
-    /// The tenant half of `repo` (`tenant/repo`), or the whole string if it is unqualified.
+    /// The tenant half of `repo` (`tenant/repo`), or the whole string if it is unqualified —
+    /// **normalized**, so one tenant has exactly one spelling.
     ///
     /// The tenant is the hard isolation boundary for every shared surface (design D§1), so this is
     /// load-bearing rather than cosmetic: cache scopes, blob dedup, log keys, and fair-share
-    /// accounting all key off it.
-    pub fn tenant(&self) -> &str {
-        self.repo.split('/').next().unwrap_or(&self.repo)
+    /// accounting all key off it. That claim used to be a comment on a `split('/').next()`, and an
+    /// isolation audit measured what the gap cost: one tenant under four spellings (`acme`,
+    /// `acme `, `Acme`, `/acme`) opened four independent WFQ flows and four independent quota
+    /// buckets, three of which fell through to the more generous default plan — 17 concurrent grants
+    /// against a plan cap of 2. Nothing about that needed an attacker; it needed a `repo` string
+    /// written two ways.
+    ///
+    /// So the normalization happens here, at the one accessor every tenant-scoped decision goes
+    /// through, and again in [`canonicalize`](Self::canonicalize) at the door. Both, not either:
+    /// this one is total and cannot fail, which is what makes every call site downstream able to
+    /// treat the answer as *the* tenant.
+    ///
+    /// # Where the line is drawn
+    ///
+    /// * **Whitespace is stripped**, around the string and around the segment. Every identifier
+    ///   grammar in this system already forbids it outright ([`check_path_segment`],
+    ///   `hull_ci_plan::validate`), so padding is transport sloppiness rather than a name.
+    /// * **Case is not folded**, and `Acme` is therefore a different tenant from `acme`. This is the
+    ///   one place where the split above is the *cheaper* mistake, because folding decides that two
+    ///   names Hull holds as distinct accounts are one principal — and the trust lookup, the
+    ///   secrets, the shared-cache write bit and the memo all key off the answer. The full argument,
+    ///   including why the "storage already merges them" reasoning does not apply to a store that
+    ///   hashes the tenant, is on [`tenant_of`].
+    /// * **Nothing else is rewritten.** Spec §5 says to tolerate what we do not recognise, and a
+    ///   tenant name we find unusual is still Hull's name for a real customer.
+    ///
+    /// # The one input this cannot answer for
+    ///
+    /// If the first segment is empty — `"/widget"`, `"//x"`, `"/"` — there is no tenant to return
+    /// and this answers with the whole trimmed `repo` instead. Deliberately *not* `""`: the empty
+    /// string is an ordinary, and therefore *shared*, key in the step memo, in `FairShare::plans`
+    /// and in the trusted-tenant set, so returning it hands several unrelated dispatches one
+    /// namespace. The whole repo string cannot collide with any legal tenant, because a legal tenant
+    /// contains no `/`. [`canonicalize`](Self::canonicalize) refuses those repos outright, so on any
+    /// dispatch that reached a job this branch is unreachable; it exists for the [`Dispatch`] built
+    /// in code that never went through the door.
+    pub fn tenant(&self) -> Cow<'_, str> {
+        tenant_of(&self.repo)
     }
 
     /// The repo half of `repo` (`tenant/repo`), or `""` if unqualified.
+    ///
+    /// Case is not folded here — as it is not in [`tenant`](Self::tenant), for a different reason.
+    /// The repo half is not an isolation boundary at all; it is a name Hull displays and puts in
+    /// URLs, and `acme/Widget` costing a duplicate job is a smaller wrong than renaming somebody's
+    /// repository.
     pub fn repo_name(&self) -> &str {
-        self.repo.split_once('/').map(|(_, r)| r).unwrap_or("")
+        self.repo.trim().split_once('/').map(|(_, r)| r.trim()).unwrap_or("")
     }
 
     /// Reject a dispatch that is structurally unusable before any work is queued.
     ///
-    /// Deliberately minimal: the spec tells us to tolerate anything we don't recognise, so this
-    /// checks only the fields without which there is no job — not "fields we would have preferred."
+    /// Deliberately minimal about *fields*: the spec tells us to tolerate anything we don't
+    /// recognise, so this checks only the ones without which there is no job — not "fields we would
+    /// have preferred." What it is **not** minimal about is `repo`, because `repo` is where the
+    /// tenant comes from and the tenant is the boundary; see [`canonical_repo`] for that rule and
+    /// for what it refuses.
     pub fn validate(&self) -> Result<(), ContractError> {
+        self.required_fields()?;
+        canonical_repo(&self.repo).map(|_| ())
+    }
+
+    /// [`validate`](Self::validate), and then write the canonical `repo` back.
+    ///
+    /// This is what ingest calls, and the reason it takes `&mut self`: the tenant is only one string
+    /// if somebody stores the one string. `repo` is read again downstream — it is half the
+    /// idempotency key of spec §9 (`Job::key`), it travels on the `Assignment`, and it is the prefix
+    /// of every log object (D§11) — and each of those readers splitting and folding it for
+    /// themselves is how the four spellings of the audit became four tenants in the first place.
+    ///
+    /// Normalizing at the door also keeps the *rejection* at the door, which matters more than it
+    /// looks: a `repo` we would refuse is refused with a 400 that names the field, before a job
+    /// exists, rather than surfacing an hour later as a step whose log key silently went nowhere.
+    pub fn canonicalize(&mut self) -> Result<(), ContractError> {
+        self.required_fields()?;
+        self.repo = canonical_repo(&self.repo)?;
+        Ok(())
+    }
+
+    /// The fields without which there is no job (spec §5). Shared by `validate` and `canonicalize`
+    /// so the two cannot come to different conclusions about the same dispatch.
+    fn required_fields(&self) -> Result<(), ContractError> {
         for (name, value) in [
             ("repo", &self.repo),
             ("change", &self.change),
@@ -89,6 +159,132 @@ impl Dispatch {
         }
         Ok(())
     }
+}
+
+/// The tenant a `tenant/repo` string names, normalized — [`Dispatch::tenant`]'s rule, as a function.
+///
+/// A free function because the tenant is derived from `repo` in more than one component (the
+/// membership lookup in `hull-ci-server` reads a bare `&str`), and every one of them writing its own
+/// `split('/').next()` is exactly how one tenant became four. There is one rule and it is here; the
+/// reasoning behind each part of it is on [`Dispatch::tenant`], where a reader looking for the
+/// boundary will go first.
+pub fn tenant_of(repo: &str) -> Cow<'_, str> {
+    let repo = repo.trim();
+    let first = repo.split('/').next().unwrap_or(repo).trim();
+    if first.is_empty() {
+        // No tenant, and no invented one either — see `Dispatch::tenant`.
+        return Cow::Borrowed(repo);
+    }
+    // Case is *not* folded, and that is the one deliberate asymmetry in this function.
+    //
+    // Folding looks like the tidier answer — one tenant, one spelling — but it decides that `ACME`
+    // and `acme` name the same principal, and nothing upstream gives us the right to decide that:
+    // Hull normalizes tenant names nowhere, so it can hold both as distinct accounts. Folding then
+    // hands the second one the first one's trust (`TrustedTenants` matches on the folded form), and
+    // with it the secrets, the shared-cache writes and the memo — an escalation across the boundary
+    // this module exists to hold. The store does not fold either: it hashes the tenant, so folding
+    // here would also make the scheduler and the content store disagree about how many tenants there
+    // are.
+    //
+    // Leaving case alone costs a *split*: `ACME/widget` gets its own quota bucket, and a
+    // `HULL_CI_TRUSTED_TENANTS=acme` does not match it, so it runs as an outsider. That is the
+    // failure this direction has, and it is closed — an operator repairs it by spelling the config
+    // the way Hull spells the tenant. The other direction fails open, and no config repairs it.
+    Cow::Borrowed(first)
+}
+
+/// The longest `repo` we will accept, in characters.
+///
+/// Generous — the largest forge names in the wild are an owner of 39 plus a repo of 100 — because
+/// this bound is not trying to have an opinion about names. It is here because `repo` becomes the
+/// prefix of every log object and a component of a workspace path, and an unbounded string in a key
+/// is an unbounded key.
+pub const MAX_REPO_LEN: usize = 256;
+
+/// `repo` (`tenant/repo`, spec §5) in its one canonical spelling, or the reason it has none.
+///
+/// # Normalize or refuse, and how that was decided
+///
+/// Two spellings of one tenant is a split boundary — separate quota buckets, separate memo
+/// namespaces, a `TrustedTenants` entry that matches one of them. One spelling of two tenants is a
+/// *merged* boundary, which is strictly worse. So the rule is: **normalize only what cannot be a
+/// distinct name, refuse only what cannot be a name at all, and pass everything else through.**
+/// Spec §5's "tolerate what you do not recognise" is the constraint that makes the third clause
+/// load-bearing — a refusal here is a change that never gets verified, so it has to be earned.
+///
+/// Normalized: surrounding whitespace only, around the string and around each segment
+/// (`tenant_of` explains why case is deliberately left alone).
+///
+/// Refused, each because the string cannot be used rather than because it is unusual:
+///
+/// * **an empty segment** — `"/widget"`, `"acme//x"`, `"acme/"`. There is no tenant in the first
+///   case, and in the others there is a path component that is not a name. This is the audit's
+///   `/widget`, whose tenant was the empty string.
+/// * **`.` or `..` as a segment** — not names, and the only ones that *mean* something to a path
+///   resolver. The step-name grammar happens to exclude `.` today, which is what has been keeping
+///   `..` out of log keys; an accident of one grammar is not a control, so this says it.
+/// * **whitespace, control characters and invisible formatting inside a segment** — a name that
+///   cannot be seen is a name that cannot be told apart from another one, which is the whole
+///   problem this function exists to solve.
+/// * **`\`** — a path separator on one of the two operating systems this key may be resolved on,
+///   and an escape everywhere else.
+/// * **longer than [`MAX_REPO_LEN`]**.
+///
+/// Everything else survives, including non-ASCII letters, `.` inside a segment (`acme/my.repo`),
+/// and more than two segments.
+pub fn canonical_repo(repo: &str) -> Result<String, ContractError> {
+    let trimmed = repo.trim();
+    if trimmed.is_empty() {
+        return Err(ContractError::MissingField("repo"));
+    }
+    if trimmed.chars().count() > MAX_REPO_LEN {
+        return Err(ContractError::Malformed { field: "repo", why: "longer than 256 characters" });
+    }
+
+    let mut out = String::with_capacity(trimmed.len());
+    for (i, raw) in trimmed.split('/').enumerate() {
+        let segment = raw.trim();
+        check_path_segment(segment).map_err(|why| ContractError::Malformed { field: "repo", why })?;
+        if i > 0 {
+            out.push('/');
+        }
+        // No case folding, in either segment: `tenant_of` explains why the tenant half must not be
+        // folded, and folding the repo half would rewrite a name Hull displays.
+        out.push_str(segment);
+    }
+    Ok(out)
+}
+
+/// One component of any path-like string we accept from the wire — a `repo` segment, a `log_key`
+/// segment — or why it is not usable as one.
+///
+/// **One rule, one function, on purpose.** `repo` and `log_key` are the same kind of value arriving
+/// from two different places (Hull and a node), they are concatenated into the same object key
+/// (D§11), and a traversal that one of them refuses and the other permits is a traversal. Writing
+/// the rule twice is how they would come to disagree.
+///
+/// An allowlist would be the stronger shape, but it would have to be an allowlist of *characters*,
+/// and this string carries a customer's tenant and repository names — which we do not get to
+/// restrict to ASCII on spec §5's tolerance rule. So it is a denylist of the characters that make a
+/// segment mean something other than itself, which is a closed set: the ones a path resolver reads
+/// (`.`, `..`, `/`, `\`, empty) and the ones a reader cannot see (control, whitespace, invisible
+/// formatting). Confusable *visible* characters are out of scope here for the same reason they are
+/// in [`sanitize_summary`]: they need a table and a normalization pass, and claiming otherwise
+/// would be the more dangerous half-measure.
+pub fn check_path_segment(segment: &str) -> Result<(), &'static str> {
+    if segment.is_empty() {
+        return Err("empty path segment");
+    }
+    if segment == "." || segment == ".." {
+        return Err("`.` and `..` are not names");
+    }
+    if segment.chars().any(|c| c.is_whitespace() || c.is_control() || is_invisible_formatting(c)) {
+        return Err("whitespace, control or invisible characters in a path segment");
+    }
+    if segment.contains('\\') {
+        return Err("`\\` is a path separator, not a name character");
+    }
+    Ok(())
 }
 
 // ── Outward contract: us → Hull (spec §7) ────────────────────────────────────────────────────────
@@ -727,11 +923,54 @@ pub struct StepReport {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exit_code: Option<i32>,
     /// Object-store key of the captured log, `tenant/repo/tree_id/step/attempt` (design D§11).
+    ///
+    /// **Node-supplied, so it is a claim about where a log went and not an instruction about where
+    /// to put one.** The node builds it from its [`Assignment`], but every component is a string
+    /// that started somewhere else — `repo` came from Hull, `step_name` came from a pipeline, and
+    /// `hull_ci_plan`'s step-name grammar deliberately permits `/`. A step named `a/../../b` would
+    /// therefore have written a key outside its own tenant's prefix, and the only thing preventing
+    /// it was that the same grammar has no `.` in its charset. That is an accident of one table, not
+    /// a control, so the control is [`check_log_key`] plus the caller's own prefix check — see
+    /// `Control::record_step_report`, which is the point where the expected prefix is known.
+    ///
+    /// Nothing writes objects by this key yet. It is validated now precisely because of that: the
+    /// first writer inherits whatever the control plane has been storing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub log_key: Option<String>,
     /// Already sanitized by the node; the aggregator sanitizes again on the way out (defence in depth).
     #[serde(default)]
     pub detail: String,
+}
+
+/// The longest `log_key` we will store, in characters.
+///
+/// The key is `tenant/repo/tree_id/step/attempt` (D§11), whose parts are already individually
+/// bounded — [`MAX_REPO_LEN`], a 64-character tree id, a 64-character step name. This is the
+/// backstop for their sum, and for a node that is not building the key we think it is.
+pub const MAX_LOG_KEY_LEN: usize = 1024;
+
+/// Whether a node's reported [`StepReport::log_key`] is usable as an object-store key.
+///
+/// Structure only — it says the key is a sequence of ordinary names and therefore cannot address
+/// anything but what it spells. It deliberately does **not** say the key belongs to the step that
+/// reported it: that needs the job's tenant, repo and tree id, which live in the control plane, so
+/// the prefix check belongs there (`Control::record_step_report`). Split that way because they fail
+/// differently — a key that fails *here* is malformed and cannot be stored by anybody, and a key
+/// that fails the prefix check is well-formed and points at somebody else's prefix.
+///
+/// Traversal is what this closes: no empty segment (so no leading `/` and no `//`), no `.` or `..`,
+/// no `\`. Those are [`check_path_segment`]'s rules, shared with `repo` so the two halves of the
+/// same key cannot disagree about what a name is.
+pub fn check_log_key(key: &str) -> Result<(), ContractError> {
+    let len = key.chars().count();
+    if len == 0 || len > MAX_LOG_KEY_LEN {
+        return Err(ContractError::Malformed { field: "log_key", why: "empty or longer than 1024 characters" });
+    }
+    for segment in key.split('/') {
+        check_path_segment(segment)
+            .map_err(|why| ContractError::Malformed { field: "log_key", why })?;
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -751,6 +990,13 @@ pub enum ContractError {
     MissingField(&'static str),
     #[error("unsupported contract version `{0}` (this runner speaks {CONTRACT_VERSION})")]
     UnsupportedVersion(String),
+    /// A field that is present but cannot be used as what it is for.
+    ///
+    /// `why` is a fixed string rather than the offending value: this message is returned to the
+    /// caller and written to a log, and the value is exactly the attacker-controlled bytes we
+    /// refused (spec §14.5). Naming the field and the rule is enough for an operator to fix it.
+    #[error("dispatch field `{field}` is unusable: {why}")]
+    Malformed { field: &'static str, why: &'static str },
 }
 
 /// Accept a dispatch's `X-Hull-CI-Version`.
@@ -800,6 +1046,154 @@ mod tests {
             fetch_token: None,
         };
         assert_eq!(d.validate(), Err(ContractError::MissingField("tree_id")));
+    }
+
+    // ── The tenant boundary (design D§1) ─────────────────────────────────────────────────────────
+
+    fn with_repo(repo: &str) -> Dispatch {
+        Dispatch {
+            repo: repo.into(),
+            change: "21ea".into(),
+            tree_id: "f7a2".into(),
+            intent: String::new(),
+            author: String::new(),
+            source_url: "https://h/tar".into(),
+            callback_url: "https://h/ci-result".into(),
+            fetch_token: None,
+        }
+    }
+
+    #[test]
+    fn one_tenant_has_exactly_one_spelling() {
+        // The audit finding, as a test. These four `repo` values name one customer, and before
+        // normalization they produced four tenants: four WFQ flows, four quota buckets, three of
+        // them on the generous default plan.
+        // Whitespace only. Case is a *different tenant*, pinned by `case_is_not_folded_...` below.
+        let accepted = ["acme/widget", " acme/widget ", "acme /widget", "acme/ widget", "acme/widget "];
+        for repo in accepted {
+            let mut d = with_repo(repo);
+            assert_eq!(d.tenant(), "acme", "{repo:?} must read as one tenant");
+            d.canonicalize().unwrap_or_else(|e| panic!("{repo:?} is a legitimate dispatch: {e}"));
+            assert_eq!(d.repo, "acme/widget", "{repo:?} must be stored one way");
+            assert_eq!(d.tenant(), "acme");
+        }
+
+        // …and the fourth spelling, whose tenant was the empty string, does not get in at all.
+        let mut slashed = with_repo("/widget");
+        assert_eq!(
+            slashed.canonicalize(),
+            Err(ContractError::Malformed { field: "repo", why: "empty path segment" })
+        );
+        assert_ne!(slashed.tenant(), "", "and it is never the empty tenant even unvalidated");
+    }
+
+    #[test]
+    fn the_empty_tenant_is_not_reachable() {
+        // The empty string is an ordinary key in the step memo, in `FairShare::plans` and in the
+        // trusted-tenant set, so several unrelated dispatches landing on it share one namespace.
+        // Every shape that used to produce it is refused at the door, and `tenant()` — which cannot
+        // fail — never answers with it either.
+        for repo in ["/widget", "//x", "/", "/acme/widget", "  /widget"] {
+            let mut d = with_repo(repo);
+            assert!(d.canonicalize().is_err(), "{repo:?} must not become a job");
+            assert!(!d.tenant().is_empty(), "{repo:?} still yielded the empty tenant");
+        }
+    }
+
+    #[test]
+    fn a_repo_cannot_carry_a_path_that_is_not_a_name() {
+        // `repo` is the prefix of every log object (D§11) and a component of a workspace path. A
+        // segment that a path resolver *reads* rather than stores is refused, and so is one a human
+        // reading a log line cannot see.
+        for repo in [
+            "acme/../globex/widget",
+            "../acme/widget",
+            "./acme/widget",
+            "acme/..",
+            "ac\\me/widget",
+            "acme/wid\nget",
+            "ac\u{200b}me/widget", // zero-width space: two tenants, one appearance
+            "acme/wid get",
+            "acme\u{0}/widget",
+        ] {
+            assert!(
+                matches!(with_repo(repo).validate(), Err(ContractError::Malformed { field: "repo", .. })),
+                "{repo:?} must be refused"
+            );
+        }
+        assert!(with_repo(&format!("acme/{}", "x".repeat(MAX_REPO_LEN))).validate().is_err());
+    }
+
+    #[test]
+    fn refusal_is_for_the_unusable_and_not_the_merely_unusual() {
+        // The other failure mode: a bound that refuses real dispatches is an outage, and spec §5
+        // tells us to tolerate what we do not recognise. None of these is a shape we would have
+        // chosen, and every one of them still names a repository.
+        for repo in [
+            "acme/my.repo",          // a dot inside a name is not a dot segment
+            "acme/widget.git",
+            "acme-corp/widget_v2",
+            "acme/group/subgroup/widget", // more than two segments
+            "widget",                     // unqualified: its own tenant, as it always was
+            "acme/rødgrød",               // non-ASCII names are Hull's business, not ours
+            "ACME/Widget",                // a distinct tenant, but a perfectly usable name
+            "9/w",
+            "a~b/c",
+        ] {
+            let mut d = with_repo(repo);
+            d.canonicalize().unwrap_or_else(|e| panic!("{repo:?} is a legitimate repo, refused: {e}"));
+        }
+        // Canonicalization does not rename anybody: not the tenant (which would merge two
+        // accounts) and not the repo (which would rewrite a name Hull displays).
+        let mut d = with_repo("ACME/Widget");
+        d.canonicalize().unwrap();
+        assert_eq!(d.repo, "ACME/Widget", "canonicalization preserves case in both halves");
+        assert_eq!(d.repo_name(), "Widget");
+    }
+
+    /// The security half of the normalization rule, at the unit level.
+    ///
+    /// `tenant_of` is where a tidying instinct would reach for `to_ascii_lowercase`, and doing so
+    /// would merge two accounts Hull holds as distinct — handing one the other's trust, secrets,
+    /// cache-write bit and memo. Whitespace collapses; case must not.
+    #[test]
+    fn case_is_not_folded_because_a_merged_tenant_is_worse_than_a_split_one() {
+        assert_eq!(tenant_of("ACME/widget"), "ACME");
+        assert_eq!(tenant_of("Acme/widget"), "Acme");
+        assert_eq!(tenant_of("acme/widget"), "acme");
+        assert_ne!(tenant_of("ACME/widget"), tenant_of("acme/widget"));
+        // ...while whitespace still collapses, so the split is only ever the one we chose.
+        assert_eq!(tenant_of(" ACME /widget"), "ACME");
+    }
+
+    #[test]
+    fn a_log_key_cannot_leave_the_prefix_it_spells() {
+        // Traversal was being blocked only by `.` being absent from the step-name charset — an
+        // accident of that grammar, not a stated control. These are the keys a step name containing
+        // `/` could have produced.
+        for bad in [
+            "acme/acme/widget/f7a2/../../globex/1",
+            "/acme/acme/widget/f7a2/test/1",
+            "acme//widget/f7a2/test/1",
+            "acme/acme/widget/f7a2/./1",
+            "acme\\..\\globex/1",
+            "acme/acme/widget/f7a2/te st/1",
+            "acme/acme/widget/f7a2/te\nst/1",
+            "",
+        ] {
+            assert!(check_log_key(bad).is_err(), "{bad:?} must not be stored as a key");
+        }
+        assert!(check_log_key(&"x".repeat(MAX_LOG_KEY_LEN + 1)).is_err());
+
+        // The keys a node actually builds — including the legal `/` in a step name (D§4.4 allows
+        // `test/unit`) — are untouched.
+        for ok in [
+            "acme/acme/widget/f7a2/test/1",
+            "acme/acme/widget/f7a2/test/unit/1",
+            "acme/acme/my.repo/f7a2/build-x_1/12",
+        ] {
+            assert!(check_log_key(ok).is_ok(), "{ok:?} is a key a node legitimately builds");
+        }
     }
 
     #[test]

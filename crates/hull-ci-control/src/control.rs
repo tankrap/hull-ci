@@ -259,6 +259,11 @@ impl Control {
             let mut jobs = self.lock_jobs();
             let job = jobs.get_mut(&report.job_id).ok_or(ReportRejected::UnknownJob)?;
             let tenant = job.dispatch.tenant().to_string();
+            // The prefix this job's logs are allowed to occupy — D§11's `tenant/repo/tree_id/…`,
+            // built from the job record rather than from anything the report says. See
+            // `accepted_log_key`.
+            let log_prefix =
+                format!("{}/{}/{}/", tenant, job.dispatch.repo, job.dispatch.tree_id);
             let step = job.step_mut(&report.step_id).ok_or(ReportRejected::UnknownStep)?;
 
             if !matches!(step.state, StepState::Leased | StepState::Running) {
@@ -278,7 +283,12 @@ impl Control {
             };
             step.transition(next).map_err(|_| ReportRejected::NotInFlight)?;
             step.exit_code = report.exit_code;
-            step.log_key = report.log_key.clone();
+            step.log_key = accepted_log_key(
+                report.log_key.as_deref(),
+                &log_prefix,
+                &report.job_id,
+                &report.step_id,
+            );
             // Sanitized again on the way out (aggregate.rs); this is the defence-in-depth pass the
             // proto crate's `StepReport::detail` doc calls for.
             step.detail = sanitize_summary(&report.detail, SUMMARY_MAX_CHARS);
@@ -777,7 +787,9 @@ impl Control {
                 image: step.spec.image.clone(),
                 tier: self.config.tier,
                 author_class: job.author_class,
-                timeout_secs: step.spec.timeout.unwrap_or(self.config.timeouts.step).as_secs(),
+                // Clamped, not merely defaulted: this is the number that arms the sandbox's own
+                // wall clock (§14.4), so it has to be the same one `timeouts::sweep` will use.
+                timeout_secs: self.config.timeouts.step_timeout(step.spec.timeout).as_secs(),
                 lease_secs: self.config.lease_ttl.as_secs(),
             })
         })??;
@@ -988,6 +1000,46 @@ async fn drive(ctrl: Arc<Control>, job_id: JobId) {
     ctrl.retire(&job_id);
 }
 
+/// The `log_key` we are willing to remember for a step, from the one a node reported.
+///
+/// **A node names where it put a log; it does not choose where a log may go.** The key is built on
+/// the node as `{tenant}/{repo}/{tree_id}/{step_name}/{attempt}` (D§11) out of strings that all
+/// started somewhere else — `repo` arrived on a dispatch, `step_name` arrived in a pipeline, and
+/// `hull_ci_plan`'s step-name grammar permits `/`. So a pipeline can put extra path segments into
+/// what will become an object-store key, and the only thing that was stopping `../` was that the
+/// same grammar has no `.` in its charset. That is a property of a table somebody may widen, not a
+/// control, and this is the control:
+///
+/// * [`check_log_key`] says the key is a sequence of names — no empty segment, no `.`/`..`, no `\`,
+///   nothing invisible — so it cannot address anything but what it spells;
+/// * the prefix says the key is *this job's*, under this job's tenant, repo and tree. Only the
+///   control plane knows those three, which is why the check lives here and not in the proto crate.
+///
+/// A key that fails is **dropped, not fatal**. The log key is auxiliary — nothing has ever been read
+/// back by it — and erroring the step would turn a naming problem into a red build on a spec §7
+/// verdict Hull memoizes. It is dropped loudly: the warning names the job and the step, with the
+/// offending key sanitized (spec §14.5) because it is exactly the bytes we refused.
+fn accepted_log_key(
+    reported: Option<&str>,
+    expected_prefix: &str,
+    job_id: &str,
+    step_id: &str,
+) -> Option<String> {
+    let key = reported?;
+    if let Err(e) = hull_ci_proto::check_log_key(key) {
+        tracing::warn!(%job_id, %step_id, error = %e, key = %sanitize_summary(key, 120), "dropped a malformed log key");
+        return None;
+    }
+    if !key.starts_with(expected_prefix) {
+        tracing::warn!(
+            %job_id, %step_id, key = %sanitize_summary(key, 120), expected = %expected_prefix,
+            "dropped a log key outside this job's own prefix"
+        );
+        return None;
+    }
+    Some(key.to_string())
+}
+
 /// One job's steps as the scheduler needs to see them (design D§4.5).
 ///
 /// The priority class is derived here, on every pass, rather than stamped on the job at admission:
@@ -1157,6 +1209,80 @@ mod tests {
         assert_eq!(cancelled.len(), 2);
         assert!(cancelled.contains(&steps[0]) && cancelled.contains(&steps[2]));
         assert!(!cancelled.contains(&steps[1]), "the step that decided the job is not cancelled");
+    }
+
+    #[tokio::test]
+    async fn a_nodes_log_key_is_kept_only_where_it_names_this_jobs_own_prefix() {
+        // Design D§11's key is `tenant/repo/tree_id/step/attempt`, and every component of it is a
+        // string that started somewhere else — so it was being stored verbatim from a node with no
+        // check at all. Nothing writes objects by it *yet*, which is the reason to fix it now: the
+        // first writer inherits whatever is in the field.
+        let live = start(fast_config(), Arc::new(OkFetcher), Arc::new(StaticPlanner::steps(4)), NodeMode::Accept);
+        let steps = live.steps_leased().await;
+
+        let log_key_of = |step_id: &str| {
+            live.ctrl
+                .with_job(&live.job_id, |j| j.step(step_id).and_then(|s| s.log_key.clone()))
+                .flatten()
+        };
+        let report_with_key = |i: usize, key: &str| {
+            let mut r = step_report(&live.job_id, &steps[i], StepOutcome::Passed, "ok");
+            r.log_key = Some(key.to_string());
+            live.ctrl.record_step_report(&r, "node-test").expect("the lease holder is believed");
+        };
+
+        // The dispatch is `t/r` at `tree1`, so this job owns exactly `t/t/r/tree1/…`.
+        //
+        // 1. Traversal out of the prefix — what a step named `a/../../b` produces.
+        report_with_key(0, "t/t/r/tree1/../../../globex/secrets/1");
+        // 2. Well-formed, and somebody else's.
+        report_with_key(1, "globex/globex/r/tree1/test/1");
+        // 3. An absolute key: an empty first segment is a root, not a tenant.
+        report_with_key(2, "/t/t/r/tree1/test/1");
+        // 4. What a node legitimately reports, including the `/` D§4.4 allows in a step name.
+        report_with_key(3, "t/t/r/tree1/test/unit/1");
+
+        for (i, step_id) in steps.iter().take(3).enumerate() {
+            assert_eq!(log_key_of(step_id).as_deref(), None, "case {i} was stored");
+        }
+        assert_eq!(
+            log_key_of(&steps[3]).as_deref(),
+            Some("t/t/r/tree1/test/unit/1"),
+            "a real key must survive — dropping every log is not a control, it is an outage"
+        );
+
+        // A dropped key is the only thing dropped: the step's own result still counts, because a
+        // naming problem must not become a `red` verdict Hull memoizes (spec §7).
+        assert_eq!(live.settled().await.status, Status::Green);
+    }
+
+    #[tokio::test]
+    async fn the_clock_a_pipeline_asks_for_is_clamped_before_it_arms_a_sandbox() {
+        // The half of the step ceiling that leaves this process. `Assignment::timeout_secs` arms the
+        // sandbox's own wall clock (§14.4), and it was `spec.timeout.unwrap_or(config.step)` — the
+        // same unbounded expression the sweep used. Two ceilings that disagree are worse than one,
+        // so both readers go through `Timeouts::step_timeout`.
+        let mut config = fast_config();
+        config.timeouts.max_step = Duration::from_secs(90);
+        let mut greedy = spec("marathon", &[]);
+        greedy.timeout = Some(Duration::from_secs(6 * 60 * 60));
+        let mut modest = spec("quick", &[]);
+        modest.timeout = Some(Duration::from_secs(30));
+        let live = start(
+            config,
+            Arc::new(OkFetcher),
+            Arc::new(StaticPlanner(vec![greedy, modest])),
+            NodeMode::Accept,
+        );
+        live.steps_leased().await;
+
+        let handed: Vec<(String, u64)> =
+            live.node.assigned().into_iter().map(|a| (a.step_name, a.timeout_secs)).collect();
+        assert!(handed.contains(&("marathon".into(), 90)), "the fleet was told {handed:?}");
+        assert!(
+            handed.contains(&("quick".into(), 30)),
+            "and a step under the ceiling keeps its own clock: {handed:?}"
+        );
     }
 
     #[tokio::test]

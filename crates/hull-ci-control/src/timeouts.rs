@@ -6,7 +6,8 @@
 //!
 //! | Scope | Default | On expiry |
 //! |---|---|---|
-//! | Step wall clock | 20 min (pipeline-overridable) | step `errored` → job `errored`, `reason: timeout` |
+//! | Step wall clock | 20 min (pipeline-overridable, up to `max_step`) | step `errored` → job `errored`, `reason: timeout` |
+//! | Step ceiling | 60 min | the longest clock any pipeline can ask for |
 //! | Job wall clock | 60 min | cancel everything, `errored` |
 //! | Queue wait | 30 min | `errored`, `reason: capacity` |
 //! | Fetch | 5 min | `errored`, `reason: infra` |
@@ -20,13 +21,39 @@ use hull_ci_proto::{Reason, Verdict};
 
 use crate::model::{Step, StepId, StepState};
 
-/// The four clocks. Defaults are design D§10.2's table.
+/// The four clocks, and the one ceiling. Defaults are design D§10.2's table.
 #[derive(Debug, Clone, Copy)]
 pub struct Timeouts {
+    /// The step wall clock a pipeline gets when it asks for nothing. A **default**, which is all
+    /// D§10.2 ever meant it to be — see [`max_step`](Self::max_step) for the other half.
     pub step: Duration,
     pub job: Duration,
     pub queue_wait: Duration,
     pub fetch: Duration,
+    /// The longest step wall clock any pipeline may have, whatever it asks for.
+    ///
+    /// # Why this is a second field and not just `step`
+    ///
+    /// `step` was doing both jobs and could only do one. `StepSpec::timeout` arrives from a
+    /// `Planner` — in this deployment, from an attacker-controlled `.hull/ci.star` — and the control
+    /// plane applied it with `unwrap_or(t.step)`, i.e. with no upper bound at all. The job wall
+    /// clock and `hull_ci_plan`'s 24-hour ceiling backstopped it, but neither is the operator's
+    /// number: an operator who configured a 5-minute step clock did not get one, and there was no
+    /// configuration that would have given them one.
+    ///
+    /// Making `step` itself the maximum would have been the smaller change and the wrong one.
+    /// D§10.2 says the step clock is *pipeline-overridable*, so a ceiling equal to the default
+    /// silently shortens every pipeline that legitimately asks for longer than 20 minutes — a
+    /// 45-minute integration suite that passed yesterday starts reporting `errored` today, on a
+    /// deployment whose operator changed nothing. A control that turns working pipelines into
+    /// timeouts is an outage, so the default ceiling is generous (the job wall clock, above which a
+    /// step clock can never fire anyway) and an operator who wants a strict cap sets this to it.
+    ///
+    /// Not the same ceiling as `hull_ci_node`'s `NodeConfig::max_step_timeout`, and deliberately so:
+    /// that one bounds how long a *sandbox* runs on one node, this one bounds how long the control
+    /// plane will hold a tenant's slot waiting for an answer about it. A node that dies is exactly
+    /// the case where only this one is left.
+    pub max_step: Duration,
 }
 
 impl Default for Timeouts {
@@ -36,7 +63,24 @@ impl Default for Timeouts {
             job: Duration::from_secs(60 * 60),
             queue_wait: Duration::from_secs(30 * 60),
             fetch: Duration::from_secs(5 * 60),
+            // The job wall clock. A step clock above it cannot fire — the job is cancelled first —
+            // so this default changes no behaviour a correct pipeline could observe, and it turns
+            // "unbounded" into "bounded" for every pipeline that was asking for more.
+            max_step: Duration::from_secs(60 * 60),
         }
+    }
+}
+
+impl Timeouts {
+    /// The step wall clock actually applied, given what the plan asked for.
+    ///
+    /// The **only** way to answer that question. Both readers go through it — the sweep that decides
+    /// when a step has run too long, and the `timeout_secs` on the `Assignment` that arms the
+    /// sandbox's own clock — because a step the control plane would kill at 60 minutes and a sandbox
+    /// that would run it for six hours is not two opinions, it is a node slot held by a job nobody
+    /// is still waiting for.
+    pub fn step_timeout(&self, requested: Option<Duration>) -> Duration {
+        requested.unwrap_or(self.step).min(self.max_step)
     }
 }
 
@@ -105,7 +149,10 @@ pub fn sweep(steps: &mut [Step], t: &Timeouts, now: Instant) -> Vec<(StepId, Exp
             s.finished_at = Some(now);
             s.detail = format!("{} exceeded {}", expiry.as_str(), human(match expiry {
                 Expiry::QueueWait => t.queue_wait,
-                _ => s.spec.timeout.unwrap_or(t.step),
+                // The clock that actually fired, which is the clamped one — telling an author their
+                // step exceeded the six hours they asked for, when we stopped it at one, is a
+                // message that sends them looking for a bug in their own pipeline.
+                _ => t.step_timeout(s.spec.timeout),
             }));
             fired.push((s.id.clone(), expiry));
         }
@@ -125,7 +172,7 @@ fn step_deadline(s: &Step, t: &Timeouts) -> Option<(Instant, Expiry)> {
         StepState::Pending | StepState::Ready => s.ready_at.map(|at| (at + t.queue_wait, Expiry::QueueWait)),
         // In someone else's hands — the step wall clock.
         StepState::Leased | StepState::Running => {
-            s.started_at.map(|at| (at + s.spec.timeout.unwrap_or(t.step), Expiry::Step))
+            s.started_at.map(|at| (at + t.step_timeout(s.spec.timeout), Expiry::Step))
         }
         _ => None,
     }
@@ -203,6 +250,49 @@ mod tests {
         s.spec.timeout = Some(Duration::from_secs(30));
         let mut steps = vec![s];
         assert_eq!(sweep(&mut steps, &t, start + Duration::from_secs(31)).len(), 1);
+    }
+
+    #[test]
+    fn a_pipeline_cannot_ask_for_a_longer_clock_than_the_operator_allows() {
+        // `StepSpec::timeout` comes from a `Planner`, which on this deployment means an
+        // attacker-controlled `.hull/ci.star`. It used to be applied with `unwrap_or(t.step)` and no
+        // ceiling, so the operator's number was a default a pipeline could simply ignore: a step
+        // asking for six hours held its node slot for six hours.
+        let t = Timeouts { max_step: Duration::from_secs(5 * 60), ..Timeouts::default() };
+        let start = Instant::now();
+        let mut s = leased("greedy", start);
+        s.spec.timeout = Some(Duration::from_secs(6 * 60 * 60));
+        let mut steps = vec![s];
+
+        assert!(sweep(&mut steps, &t, start + Duration::from_secs(299)).is_empty(), "not yet");
+        let fired = sweep(&mut steps, &t, start + Duration::from_secs(301));
+        assert_eq!(fired, vec![("greedy".to_string(), Expiry::Step)], "the ceiling is the clock");
+        assert_eq!(steps[0].error_reason, Some(Reason::Timeout));
+        assert!(
+            steps[0].detail.contains("5m"),
+            "the author is told the clock that fired, not the one they asked for: {:?}",
+            steps[0].detail
+        );
+
+        // And the ceiling is a ceiling, not a replacement: a step under it keeps its own clock, and
+        // a step that asks for nothing keeps the default.
+        assert_eq!(t.step_timeout(Some(Duration::from_secs(60))), Duration::from_secs(60));
+        assert_eq!(
+            Timeouts::default().step_timeout(Some(Duration::from_secs(45 * 60))),
+            Duration::from_secs(45 * 60),
+            "a 45-minute suite is a real pipeline; a default ceiling that shortened it is an outage"
+        );
+        assert_eq!(Timeouts::default().step_timeout(None), Timeouts::default().step);
+    }
+
+    #[test]
+    fn the_default_ceiling_bounds_what_used_to_be_unbounded() {
+        // Nobody has to configure anything to stop being unbounded: a stock deployment already
+        // refuses to run one step past the job wall clock, which is the point past which the step
+        // clock could never have fired anyway.
+        let t = Timeouts::default();
+        assert_eq!(t.step_timeout(Some(Duration::from_secs(24 * 3600))), t.job);
+        assert_eq!(t.max_step, t.job);
     }
 
     #[test]

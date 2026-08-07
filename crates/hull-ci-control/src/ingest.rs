@@ -3,8 +3,9 @@
 //! ```text
 //! 1. constant-time compare X-Hull-CI-Secret        → 401 on mismatch
 //! 2. reject unknown X-Hull-CI-Version major        → 400
-//! 3. record job, keyed (repo, tree_id)             ← idempotency, §9
-//! 4. 202 {"accepted": true, "job_id": "..."}
+//! 3. canonicalize `repo`, or refuse it             → 400   ← the tenant boundary, D§1
+//! 4. record job, keyed (repo, tree_id)             ← idempotency, §9
+//! 5. 202 {"accepted": true, "job_id": "..."}
 //! ```
 //!
 //! The order is not incidental. Authentication happens **before** we parse a byte of the body, so an
@@ -71,7 +72,7 @@ pub async fn ingest(
 
     // 3. Parse. Unknown fields are tolerated by construction (spec §5) — that is a property of the
     //    `Dispatch` type, not of this handler.
-    let dispatch: Dispatch = match serde_json::from_slice(&body) {
+    let mut dispatch: Dispatch = match serde_json::from_slice(&body) {
         Ok(d) => d,
         Err(e) => {
             // serde's message can quote the body, which is attacker-controlled: sanitize before it
@@ -81,8 +82,13 @@ pub async fn ingest(
             return error(StatusCode::BAD_REQUEST, &format!("malformed dispatch: {detail}"));
         }
     };
-    if let Err(e) = dispatch.validate() {
-        tracing::warn!(error = %e, "rejected dispatch: incomplete");
+    // 3. Complete, and usable. `canonicalize` is the one place `repo` is normalized, and it is here
+    //    rather than deeper in because the tenant it yields is the isolation boundary for the memo,
+    //    the fair-share plan table and the log key (design D§1) — every one of which is an ordinary
+    //    map keyed by that string. A boundary that is decided per reader is not a boundary, so it is
+    //    decided once, at the door, and written back onto the dispatch every later reader sees.
+    if let Err(e) = dispatch.canonicalize() {
+        tracing::warn!(error = %e, "rejected dispatch: incomplete or unusable repo");
         return error(StatusCode::BAD_REQUEST, &e.to_string());
     }
 
@@ -211,6 +217,127 @@ mod tests {
         let (status, v) = post_dispatch(&c, headers(Some("s3cret"), Some("1")), incomplete).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert!(v["error"].as_str().unwrap().contains("callback_url"));
+    }
+
+    // ── The tenant boundary at the door (design D§1) ─────────────────────────────────────────────
+
+    /// The other half of the normalization rule, and the more dangerous direction.
+    ///
+    /// Collapsing whitespace spellings is a fix; collapsing *case* would be a vulnerability. Hull
+    /// normalizes tenant names nowhere, so `acme` and `ACME` can be two distinct accounts — and a
+    /// fold here would put the second one inside the first one's quota plan, memo namespace and
+    /// (via `TrustedTenants`) its member-class trust. This test exists to fail if someone tidies
+    /// `tenant_of` by lowercasing it.
+    #[tokio::test]
+    async fn a_differently_cased_tenant_is_a_different_tenant() {
+        let mut config = fast_config();
+        config.fair_share = config.fair_share.clone().with_plan(
+            "acme",
+            crate::fairshare::TenantPlan { max_running_steps: 2, ..Default::default() },
+        );
+        let h = harness(
+            config,
+            Arc::new(OkFetcher),
+            Arc::new(StaticPlanner::steps(5)),
+            NodeMode::Accept,
+        );
+        let hdr = headers(Some("s3cret"), Some("1"));
+
+        for (i, repo) in ["acme/widget", "ACME/widget"].iter().enumerate() {
+            let (status, _) = post_dispatch(&h.control, hdr.clone(), body(repo, &format!("t{i}"))).await;
+            assert_eq!(status, StatusCode::ACCEPTED);
+        }
+
+        let mut tenants = h.control.snapshot_tenants();
+        tenants.sort_by(|a, b| a.tenant.cmp(&b.tenant));
+        assert_eq!(tenants.len(), 2, "case must not merge two accounts: {tenants:#?}");
+        assert_eq!(tenants[0].tenant, "ACME");
+        assert_eq!(tenants[1].tenant, "acme");
+        assert_eq!(
+            tenants[0].max_running_steps,
+            crate::fairshare::TenantPlan::default().max_running_steps,
+            "the uppercase tenant gets the default plan, not the plan configured for `acme`"
+        );
+    }
+
+    #[tokio::test]
+    async fn one_tenant_under_four_spellings_gets_one_flow_and_one_quota_bucket() {
+        // The isolation audit's finding, end to end. `Dispatch::tenant()` was
+        // `repo.split('/').next()` over an unnormalized string, so one customer written four ways
+        // was four tenants: four weighted-fair flows, four quota buckets, and three of them on the
+        // *default* plan rather than on the plan the operator configured for this tenant. The audit
+        // measured 17 concurrent grants against a cap of 2.
+        //
+        // Nothing here is an attack. The first path segment comes from Hull, not from a name a
+        // tenant picks — which is exactly why this had gone unnoticed, and exactly why it is worth
+        // fixing before something else starts choosing that string.
+        let mut config = fast_config();
+        config.fair_share = config.fair_share.clone().with_plan(
+            "acme",
+            crate::fairshare::TenantPlan { max_running_steps: 2, ..Default::default() },
+        );
+        let h = harness(
+            config,
+            Arc::new(OkFetcher),
+            Arc::new(StaticPlanner::steps(5)),
+            NodeMode::Accept,
+        );
+        let hdr = headers(Some("s3cret"), Some("1"));
+
+        // One customer, four whitespace spellings, four different trees so these are four real
+        // jobs. Case is deliberately *not* in this list — `Acme` is a different tenant on purpose,
+        // and `a_differently_cased_tenant_is_a_different_tenant` is the test that pins that.
+        for (i, repo) in ["acme/widget", "acme /widget", " acme/widget", "acme/ widget"].iter().enumerate() {
+            let (status, _) = post_dispatch(&h.control, hdr.clone(), body(repo, &format!("tree{i}"))).await;
+            assert_eq!(status, StatusCode::ACCEPTED, "{repo:?} is a legitimate dispatch");
+        }
+
+        let node = Arc::clone(&h.node);
+        assert!(
+            crate::testing::wait_until(move || node.assigned().len() == 2).await,
+            "the plan's two slots are taken"
+        );
+        let node = Arc::clone(&h.node);
+        assert!(
+            crate::testing::stays_false(move || node.assigned().len() > 2).await,
+            "one tenant, one cap — not one cap per spelling of its name"
+        );
+
+        let tenants = h.control.snapshot_tenants();
+        assert_eq!(tenants.len(), 1, "four spellings must not be four tenants: {tenants:#?}");
+        assert_eq!(tenants[0].tenant, "acme");
+        assert_eq!(tenants[0].jobs_held, 4);
+        assert_eq!(tenants[0].max_running_steps, 2, "and all four are on the configured plan");
+        assert_eq!(h.control.queue_depth("acme").running, 2);
+        for spelling in ["acme ", " acme", "acme/widget", ""] {
+            assert_eq!(
+                h.control.queue_depth(spelling).running,
+                0,
+                "{spelling:?} must not be a tenant of its own"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_repo_with_no_usable_tenant_is_refused_at_the_door() {
+        // `Dispatch::tenant()` split on `/` and took the first component, so `/widget` yielded the
+        // **empty** tenant — an ordinary key in the step memo, in `FairShare::plans` and in the
+        // trusted-tenant set, and therefore a namespace several unrelated dispatches would share.
+        // It is refused here, before a job exists, rather than absorbed.
+        let c = control();
+        for repo in ["/widget", "//x", "/", "acme/../globex", "acme/widget/../.."] {
+            let (status, v) = post_dispatch(&c, headers(Some("s3cret"), Some("1")), body(repo, "t")).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{repo:?} must not become a job");
+            assert!(v["error"].as_str().unwrap().contains("repo"), "the operator is told which field");
+        }
+
+        // …and the line stops there. Spec §5 tells us to tolerate what we do not recognise, so a
+        // repo that is merely unusual is still a repo, and a refusal that caught these would be an
+        // outage for whoever owns them.
+        for repo in ["acme/my.repo", "acme/group/sub/widget", "widget", "acme/rødgrød", "ACME/Widget"] {
+            let (status, _) = post_dispatch(&c, headers(Some("s3cret"), Some("1")), body(repo, "t")).await;
+            assert_eq!(status, StatusCode::ACCEPTED, "{repo:?} is a real repository");
+        }
     }
 
     #[tokio::test]

@@ -38,8 +38,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use hull_ci_proto::{
-    sanitize_summary, Assignment, AuthorClass, BackendCapabilities, NodeState, StepOutcome,
-    StepReport, SUMMARY_MAX_CHARS,
+    check_log_key, sanitize_summary, Assignment, AuthorClass, BackendCapabilities, NodeState,
+    StepOutcome, StepReport, SUMMARY_MAX_CHARS,
 };
 use hull_ci_secrets::{CapabilityToken, NodePublicKey};
 
@@ -530,8 +530,33 @@ fn report(a: &Assignment, outcome: StepOutcome, exit_code: Option<i32>, detail: 
         // so the node can name the object rather than leaving the control plane to guess. The attempt
         // number is not on the assignment; until it is, `1` is the honest value for a report the node
         // produced on its own single execution of this step.
-        log_key: Some(format!("{}/{}/{}/{}/1", a.tenant, a.repo, a.tree_id, a.step_name)),
+        log_key: log_key_for(a),
         detail: sanitize_summary(detail, SUMMARY_MAX_CHARS),
+    }
+}
+
+/// D§11's log key for this assignment, or `None` when the pieces do not make a usable one.
+///
+/// Three of the four components are strings that started outside this node — `repo` came from a
+/// dispatch, `step_name` came from a pipeline, and `hull_ci_plan`'s step-name grammar permits `/`,
+/// so `step_name` alone can add path segments. The control plane checks this key again on arrival,
+/// against a prefix only it knows (`accepted_log_key`), and that is the check that decides. This one
+/// is here because a node that emits a key it can already tell is unusable is a node reporting a
+/// location for a log that cannot exist — and because the two ends agreeing on
+/// `hull_ci_proto::check_log_key` is what keeps "the node names it, the control plane bounds it"
+/// from becoming two different opinions about what a key is.
+fn log_key_for(a: &Assignment) -> Option<String> {
+    let key = format!("{}/{}/{}/{}/1", a.tenant, a.repo, a.tree_id, a.step_name);
+    match check_log_key(&key) {
+        Ok(()) => Some(key),
+        Err(e) => {
+            tracing::warn!(
+                job = %a.job_id, step = %a.step_id, error = %e,
+                key = %sanitize_summary(&key, 120),
+                "not reporting a log key: it is not a usable object-store key"
+            );
+            None
+        }
     }
 }
 
@@ -612,6 +637,39 @@ mod tests {
             author_class: AuthorClass::Member,
             timeout_secs,
             lease_secs: 300,
+        }
+    }
+
+    #[test]
+    fn a_step_name_cannot_write_a_log_key_out_of_its_own_prefix() {
+        // D§4.4's step-name charset permits `/`, so a step name is free to add path segments to
+        // D§11's key. What was keeping `..` out was that the same charset has no `.` in it — an
+        // accident of one table rather than a control. These are the keys that accident was the only
+        // thing preventing, and the node no longer claims any of them.
+        // Asserted through `report`, not through the helper, because the thing that has to hold is
+        // that no report leaves this node carrying such a key.
+        let key_of = |a: &Assignment| report(a, StepOutcome::Passed, Some(0), "ok").log_key;
+        for step_name in ["../../globex/secrets", "a/../../b", "..", "./x", "a//b"] {
+            let a = Assignment { step_name: step_name.into(), ..assignment(&["/bin/true"], 30) };
+            assert_eq!(
+                key_of(&a),
+                None,
+                "{step_name:?} produced a log key that addresses more than it spells"
+            );
+        }
+        // A repo the control plane never canonicalized cannot smuggle one in either.
+        let a = Assignment { repo: "acme/../globex".into(), ..assignment(&["/bin/true"], 30) };
+        assert_eq!(key_of(&a), None);
+
+        // …and the keys a real pipeline produces are untouched, including the `/` D§4.4 allows in a
+        // step name. A control that dropped `test/unit`'s logs would be a bug, not a fix.
+        for (step_name, expected) in [
+            ("test", "acme/acme/widget/tree-1/test/1"),
+            ("test/unit", "acme/acme/widget/tree-1/test/unit/1"),
+            ("build-x_1", "acme/acme/widget/tree-1/build-x_1/1"),
+        ] {
+            let a = Assignment { step_name: step_name.into(), ..assignment(&["/bin/true"], 30) };
+            assert_eq!(key_of(&a).as_deref(), Some(expected));
         }
     }
 

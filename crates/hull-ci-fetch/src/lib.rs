@@ -219,7 +219,9 @@ impl FetchBroker {
     pub async fn ensure(&self, dispatch: &Dispatch) -> Result<StoredTree, FetchError> {
         dispatch.validate()?;
         self.ensure_tree(
-            dispatch.tenant(),
+            // The normalized tenant (`Dispatch::tenant`), which is what makes the store path one
+            // path per tenant rather than one per spelling of a tenant.
+            &dispatch.tenant(),
             &dispatch.tree_id,
             &dispatch.source_url,
             dispatch.fetch_token.as_deref(),

@@ -142,7 +142,7 @@ impl Control {
         self.with_jobs(|iter| {
             for job in iter {
                 let tenant = job.dispatch.tenant();
-                match tenants.iter_mut().find(|(name, _)| name == tenant) {
+                match tenants.iter_mut().find(|(name, _)| name.as_str() == tenant) {
                     Some((_, held)) => *held += 1,
                     None => tenants.push((tenant.to_string(), 1)),
                 }
