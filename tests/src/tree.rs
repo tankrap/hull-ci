@@ -337,11 +337,52 @@ pub fn materialize(files: &[TreeFile], dir: &std::path::Path) -> std::io::Result
     Ok(())
 }
 
+/// A value no other call to [`benign_project`] will produce, so each fixture has its own address.
+fn next_nonce() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::SeqCst);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .subsec_nanos();
+    format!("{:08x}{:04x}{:04x}", nanos, std::process::id() & 0xffff, n & 0xffff)
+}
+
 // ── Fixtures ─────────────────────────────────────────────────────────────────────────────────────
 
 /// A benign little project. Deliberately carries several test entry points, because a runner that
 /// autodetects (design D§6) will pick one of them, and the suite must not care which.
+///
+/// **Every call returns a tree with a different content address**, and that is load-bearing rather
+/// than incidental.
+///
+/// `StubHull::job_raw` already gives each job its own `repo` so that jobs do not collide, and its
+/// comment explains why. That is necessary but not sufficient against a runner whose content store
+/// is scoped to the **tenant** rather than to the repo — which is the design hull-ci ships (D§4.2,
+/// D§6.3: caches are shared *within* a tenant, deliberately, so repos under one org can reuse a
+/// warmed tree). Every job in this suite runs under tenant `tankrap`, so a fixture with a fixed
+/// content address is fetched exactly once per store, ever, and every later job is served from
+/// cache.
+///
+/// That makes the fetch-shaped assertions quietly conditional on the store being cold:
+/// `spec_11_3_fetches_the_source_url_it_was_given` sees no request, `spec_11_5` cannot make a fetch
+/// fail for a tree already held, and `adversarial_corrupt_archive` cannot substitute bytes for an
+/// archive nobody downloads. On a fresh store they pass; on a second run against the same store they
+/// fail, having stopped testing what they name. A per-call nonce removes the dependency: a tree
+/// nothing has seen must actually be fetched.
+///
+/// Tests that mean to exercise de-duplication re-send the *same* `JobSpec`, which keeps its tree, so
+/// they still collide on purpose.
 pub fn benign_project() -> Vec<TreeFile> {
+    let mut files = benign_project_files();
+    // Not in a file any autodetected entry point reads, so it changes the address and nothing else.
+    files.push(TreeFile::new(".conformance-nonce", format!("{}\n", next_nonce())));
+    files
+}
+
+/// The fixture's fixed content, without the nonce — for the rare case that needs two calls to agree.
+pub fn benign_project_files() -> Vec<TreeFile> {
     vec![
         TreeFile::new("README.md", "# conformance fixture\n\nA synthetic keel tree served by the stub Hull.\n"),
         TreeFile::new(
