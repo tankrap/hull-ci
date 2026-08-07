@@ -128,6 +128,13 @@ Kept here rather than in a tracker, because a runner's honest limits belong next
 
 ## Running it
 
+Build the sandbox image first — it is built locally by design and published to no registry, so
+nothing pulls it for you:
+
+```bash
+docker build -t hull-ci/m1:latest images/m1
+```
+
 ```bash
 HULL_CI_SECRET=…                  # spec §8 — checked on dispatch, echoed on the callback
 HULL_CI_TRUSTED_TENANTS=acme      # whose authors count as members; empty means nobody, so nothing runs
@@ -153,8 +160,15 @@ deliberate: see §14.1 of the spec.
 ## Development
 
 ```bash
-cargo test
+cargo test --workspace
 ```
+
+The **27/27 conformance score is a black-box run against a live service**, not part of `cargo test`,
+and it needs its own setup — the endpoint's full path, keel addressing, the `keel` feature, and a
+built sandbox image. [`tests/README.md`](./tests/README.md) has the exact invocation. Getting any of
+it wrong does not fail loudly: point the suite at a bare host with no path and every case answers
+404, at which point the refusal-shaped tests *pass* — a non-2xx is what they assert — and the score
+looks like a partial rather than a miss.
 
 ## License
 

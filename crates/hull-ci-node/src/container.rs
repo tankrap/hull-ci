@@ -1377,7 +1377,7 @@ impl SandboxInstance for ContainerInstance {
             self.created = true;
             let (status, out) = control_command(&self.config, create, &secrets).await?;
             if status != ExecStatus::Exited(0) {
-                return Err(SandboxError::Runtime(format!("container create failed ({status:?}): {out}")));
+                return Err(SandboxError::Runtime(create_failure(&self.spec.image, status, &out)));
             }
 
             let start = vec![
@@ -3306,5 +3306,85 @@ probe_done=1
             Err(other) => panic!("wrong refusal: {other}"),
             Ok(_) => panic!("a backend with no daemon must not hand out a sandbox"),
         }
+    }
+}
+
+/// Why `create` failed, in a form an operator can act on.
+///
+/// The runtime's own text is kept — it is the ground truth, and sometimes the only detail — but a
+/// missing image gets a sentence in front of it, because it is the one failure that is *certain* on
+/// a fresh deployment and the runtime's phrasing points the wrong way. Docker answers "pull access
+/// denied ... repository does not exist or may require 'docker login'", which reads as a credentials
+/// problem. For the default image it is not one: `hull-ci/m1` is built locally and published to no
+/// registry, so no login will ever produce it, and an operator who takes the runtime at its word
+/// goes looking for a registry secret that does not exist.
+///
+/// The verdict summary is truncated to one line (§7), so the actionable half has to come first —
+/// which is the other reason not to let the runtime's text lead.
+fn create_failure(image: &str, status: ExecStatus, out: &str) -> String {
+    if looks_like_missing_image(out) {
+        return format!(
+            "sandbox image `{image}` is not present locally and cannot be pulled - build it with \
+             `docker build -t {image} images/m1`. This image is built locally by design and is \
+             published to no registry, so `docker login` will not help. Runtime said: {out}"
+        );
+    }
+    format!("container create failed ({status:?}): {out}")
+}
+
+/// Does this runtime output mean "the image is not here"?
+///
+/// A substring match on someone else's error text, which is exactly the kind of thing that rots —
+/// so it is only ever used to *add* a sentence. Every branch still returns the runtime's own output,
+/// and a miss costs the operator the hint rather than the information.
+fn looks_like_missing_image(out: &str) -> bool {
+    let out = out.to_ascii_lowercase();
+    out.contains("pull access denied")
+        || out.contains("manifest unknown")
+        || out.contains("not found: manifest")
+        || (out.contains("unable to find image") && out.contains("locally"))
+}
+
+#[cfg(test)]
+mod create_failure_tests {
+    use super::*;
+
+    /// Verbatim from `docker create hull-ci/m1:latest` on a host that has never built it
+    /// (docker 28.0.4). Kept as a fixture rather than paraphrased: the whole point of
+    /// `looks_like_missing_image` is that it matches what the runtime really says.
+    const DOCKER_MISSING: &str = "Unable to find image 'hull-ci/m1:latest' locally\ndocker: Error \
+        response from daemon: pull access denied for hull-ci/m1, repository does not exist or may \
+        require 'docker login': denied: requested access to the resource is denied";
+
+    #[test]
+    fn a_missing_image_is_explained_before_the_runtime_is_quoted() {
+        let msg = create_failure("hull-ci/m1:latest", ExecStatus::Exited(1), DOCKER_MISSING);
+        let hint = msg.find("build it with").expect("the fix must be stated");
+        let quote = msg.find("Runtime said").expect("the runtime's own text must survive");
+        assert!(hint < quote, "the actionable half must come first: a summary is truncated");
+        assert!(msg.contains("docker build -t hull-ci/m1:latest images/m1"));
+        assert!(msg.contains("`docker login` will not help"), "the misleading advice is answered");
+    }
+
+    #[test]
+    fn every_other_failure_is_passed_through_unembellished() {
+        // Guessing wrong here would be worse than not guessing: an operator chasing a fabricated
+        // image problem is further from the truth than one reading the runtime verbatim.
+        for out in [
+            "Error response from daemon: invalid mount config for type \"bind\"",
+            "docker: Error response from daemon: no space left on device",
+            "Cannot connect to the Docker daemon at unix:///var/run/docker.sock",
+        ] {
+            let msg = create_failure("hull-ci/m1:latest", ExecStatus::Exited(125), out);
+            assert!(msg.starts_with("container create failed"), "{out} was rewritten: {msg}");
+            assert!(msg.contains(out));
+        }
+    }
+
+    #[test]
+    fn podman_and_docker_phrasings_are_both_recognised() {
+        assert!(looks_like_missing_image(DOCKER_MISSING));
+        assert!(looks_like_missing_image("Error: initializing source: manifest unknown"));
+        assert!(!looks_like_missing_image("permission denied while trying to connect"));
     }
 }
