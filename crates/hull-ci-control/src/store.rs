@@ -168,7 +168,16 @@ impl JobStore {
         removed
     }
 
-    fn remove(&mut self, job_id: &str) {
+    /// Forget one job and its index entry.
+    ///
+    /// Crate-internal because there is exactly one legitimate caller outside eviction: the rollback in
+    /// [`Control::accept`] when the write-ahead journal refuses a freshly created job. That job has no
+    /// driver, no steps and no verdict, and leaving it would hold the `(repo, tree_id)` index against
+    /// work nobody will ever do — so the dispatcher's retry would come back as `Admit::Live` and get
+    /// acked for a job that is not running.
+    ///
+    /// [`Control::accept`]: crate::control::Control::accept
+    pub(crate) fn remove(&mut self, job_id: &str) {
         if let Some(job) = self.by_id.remove(job_id) {
             // Only clear the index if it still points at *this* job. A later job for the same
             // (repo, tree_id) — which exists precisely because an earlier one was evicted — must not

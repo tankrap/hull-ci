@@ -24,9 +24,12 @@
 //!
 //! ## What M1 is, and is not
 //!
-//! State is in memory: one replica, no Postgres (design D§13 — M1 is a single-tenant bring-up
+//! The job store is in memory: one replica, no Postgres (design D§13 — M1 is a single-tenant bring-up
 //! scaffold). The idempotency decision has the same shape it will have against `INSERT … ON CONFLICT
-//! DO NOTHING`, so moving it later does not move any logic. Steps are scheduled as a DAG ([`graph`],
+//! DO NOTHING`, so moving it later does not move any logic. What must **not** be only in memory is the
+//! promise that every accepted dispatch is answered — spec §10 leaves both the timeout and the
+//! recovery to us, and an unanswered job wedges its tree — so that promise has a durable record of its
+//! own behind the [`journal`] seam. Steps are scheduled as a DAG ([`graph`],
 //! design D§6.5); which of the ready ones actually goes out, and in what order, is the multi-tenant
 //! scheduler's answer ([`fairshare`], design D§4.5). There is still no step memo.
 //!
@@ -41,6 +44,7 @@
 //! | `errored`, not `red`, for infrastructure failures | [`aggregate`], [`timeouts`] |
 //! | Ignores unknown dispatch fields | `hull_ci_proto::Dispatch` |
 //! | Safe under duplicate dispatch and duplicate callback | [`store`], [`callback`] |
+//! | Enforces its own job timeout and answers every accepted dispatch (§10) | [`timeouts`], [`journal`] |
 
 pub mod aggregate;
 pub mod auth;
@@ -50,6 +54,7 @@ pub mod fairshare;
 pub mod graph;
 pub mod ids;
 pub mod ingest;
+pub mod journal;
 pub mod memo;
 pub mod model;
 pub mod seams;
@@ -64,8 +69,9 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-pub use control::{Accepted, Control, ControlConfig, Deps, ReportRejected};
+pub use control::{Accepted, AcceptError, Control, ControlConfig, Deps, ReportRejected};
 pub use fairshare::{Admission, Depth, FairShare, Prioritizer, Priority, TenantPlan};
+pub use journal::{JobIntent, Journal, JournalError, NoJournal};
 pub use memo::{
     InMemoryStepMemo, InputDigest, JobKeyContext, MemoConfig, MemoOutcome, MemoPolicy, StepKey,
     StepMemo, SubtreeDigest,
@@ -97,6 +103,11 @@ impl Default for Deps {
             node: Arc::new(UnwiredNodes),
             transport,
             membership: Arc::new(LeastPrivilege),
+            // The one unwired default that is *not* a loud failure, because remembering nothing is
+            // what this system already did. Refusing every dispatch on a deployment that never asked
+            // for a journal would be an outage introduced by a feature nobody enabled — see
+            // [`journal::NoJournal`].
+            journal: Arc::new(journal::NoJournal),
         }
     }
 }

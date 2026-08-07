@@ -280,7 +280,8 @@ async fn nodes(State(s): State<Arc<AdminState>>, headers: HeaderMap) -> Reply {
             "kind": "in-process",
             "node_count": 1,
             "note": "this server runs one node inside its own process (design D§13). No fleet, no \
-                     heartbeat transport, no autoscaling. A restart forgets in-flight jobs.",
+                     heartbeat transport, no autoscaling. A restart forgets in-flight work; whether \
+                     it also forgets the obligation to answer depends on HULL_CI_JOURNAL.",
         },
         "nodes": [{
             "node_id": state.node_id,
@@ -589,6 +590,8 @@ mod tests {
             node: Arc::new(StubNode),
             transport: Arc::new(SilentTransport),
             membership: Arc::new(Everyone),
+            // The panel is a reader; durability is not what these tests are about.
+            journal: Arc::new(hull_ci_control::NoJournal),
         };
         (dir, Control::new(config, deps))
     }
@@ -782,8 +785,8 @@ mod tests {
     #[tokio::test]
     async fn jobs_reports_state_steps_and_verdicts_and_filters_on_request() {
         let (_d, c) = control(false);
-        c.accept(dispatch("acme/widget", "tree-aaaaaaaaaaaaaaaa"));
-        c.accept(dispatch("globex/thing", "tree-bbbbbbbbbbbbbbbb"));
+        c.accept(dispatch("acme/widget", "tree-aaaaaaaaaaaaaaaa")).unwrap();
+        c.accept(dispatch("globex/thing", "tree-bbbbbbbbbbbbbbbb")).unwrap();
         let s = state(Arc::clone(&c));
 
         let ctrl = Arc::clone(&c);
@@ -831,7 +834,7 @@ mod tests {
         // the shape a renderer is most likely to get wrong, because `steps` is empty and `verdict`
         // is not.
         let (_d, c) = control(true);
-        c.accept(dispatch("acme/widget", "tree1"));
+        c.accept(dispatch("acme/widget", "tree1")).unwrap();
         let s = state(Arc::clone(&c));
 
         let ctrl = Arc::clone(&c);
@@ -912,8 +915,8 @@ mod tests {
     #[tokio::test]
     async fn queue_shows_each_tenants_depth_quota_and_why_it_is_blocked() {
         let (_d, c) = control(false);
-        c.accept(dispatch("acme/widget", "tree1"));
-        c.accept(dispatch("globex/thing", "tree2"));
+        c.accept(dispatch("acme/widget", "tree1")).unwrap();
+        c.accept(dispatch("globex/thing", "tree2")).unwrap();
         let s = state(Arc::clone(&c));
 
         let ctrl = Arc::clone(&c);
@@ -939,7 +942,7 @@ mod tests {
     #[tokio::test]
     async fn summary_counts_what_the_header_strip_shows() {
         let (_d, c) = control(false);
-        c.accept(dispatch("acme/widget", "tree1"));
+        c.accept(dispatch("acme/widget", "tree1")).unwrap();
         let s = state(Arc::clone(&c));
 
         let ctrl = Arc::clone(&c);
@@ -966,7 +969,7 @@ mod tests {
         // assertion is over the *whole serialized response* of every route, so a field added later
         // that happens to carry one fails here rather than in an incident.
         let (_d, c) = control(false);
-        c.accept(dispatch("acme/widget", "tree1"));
+        c.accept(dispatch("acme/widget", "tree1")).unwrap();
         let s = state(Arc::clone(&c));
 
         let ctrl = Arc::clone(&c);
@@ -1059,7 +1062,7 @@ mod tests {
         use tower::ServiceExt;
 
         let (_d, c) = control(false);
-        c.accept(dispatch("acme/widget", "tree1"));
+        c.accept(dispatch("acme/widget", "tree1")).unwrap();
         let app = router(state(Arc::clone(&c)));
 
         for path in ["/admin", "/admin/jobs", "/admin/queue", "/admin/nodes", "/admin/summary"] {

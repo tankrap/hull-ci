@@ -368,6 +368,29 @@ pub fn fast_config() -> ControlConfig {
     }
 }
 
+// ── Journal (design D§4.1's durable outbox) ──────────────────────────────────────────────────────
+
+/// A journal whose `record` always fails, so the "we did not ack a job we could lose" path is
+/// exercised rather than assumed.
+///
+/// `forget` and `outstanding` still behave, because the failure this models is a full or read-only
+/// disk at write time, not a store that has stopped existing — and a fake that broke everything at
+/// once would let a test pass for the wrong reason.
+pub struct RefusingJournal;
+
+impl crate::journal::Journal for RefusingJournal {
+    fn record(&self, intent: &crate::journal::JobIntent) -> Result<(), crate::journal::JournalError> {
+        Err(crate::journal::JournalError::Write {
+            job_id: intent.job_id.clone(),
+            detail: "no space left on device".into(),
+        })
+    }
+    fn forget(&self, _job_id: &str) {}
+    fn outstanding(&self) -> Result<Vec<crate::journal::JobIntent>, crate::journal::JournalError> {
+        Ok(Vec::new())
+    }
+}
+
 pub struct Harness {
     pub control: std::sync::Arc<Control>,
     pub transport: std::sync::Arc<ScriptedTransport>,
@@ -383,19 +406,33 @@ pub fn harness_with(
     node_mode: NodeMode,
     transport: std::sync::Arc<ScriptedTransport>,
 ) -> Harness {
-    let node = std::sync::Arc::new(RecordingNode::new(node_mode));
-    let deps = Deps {
-        fetcher,
-        planner,
-        node: node.clone(),
-        transport: transport.clone(),
-        membership: std::sync::Arc::new(AlwaysMember),
-    };
-    Harness { control: Control::new(config, deps), transport, node }
+    harness_full(config, fetcher, planner, node_mode, transport, std::sync::Arc::new(crate::journal::NoJournal))
 }
 
 pub fn harness(config: ControlConfig, fetcher: std::sync::Arc<dyn Fetcher>, planner: std::sync::Arc<dyn Planner>, node_mode: NodeMode) -> Harness {
-    let transport = std::sync::Arc::new(ScriptedTransport::ok());
+    harness_full(
+        config,
+        fetcher,
+        planner,
+        node_mode,
+        std::sync::Arc::new(ScriptedTransport::ok()),
+        std::sync::Arc::new(crate::journal::NoJournal),
+    )
+}
+
+/// [`harness`] with both the transport and the journal chosen by the caller.
+///
+/// The journal is a parameter rather than a field the harness owns because the restart tests need the
+/// *same* journal behind two different [`Control`]s — that shared `Arc` is what stands in for a
+/// process boundary, and it is the only way to test the thing the journal exists for.
+pub fn harness_full(
+    config: ControlConfig,
+    fetcher: std::sync::Arc<dyn Fetcher>,
+    planner: std::sync::Arc<dyn Planner>,
+    node_mode: NodeMode,
+    transport: std::sync::Arc<ScriptedTransport>,
+    journal: std::sync::Arc<dyn crate::journal::Journal>,
+) -> Harness {
     let node = std::sync::Arc::new(RecordingNode::new(node_mode));
     let deps = Deps {
         fetcher,
@@ -403,6 +440,7 @@ pub fn harness(config: ControlConfig, fetcher: std::sync::Arc<dyn Fetcher>, plan
         node: node.clone(),
         transport: transport.clone(),
         membership: std::sync::Arc::new(AlwaysMember),
+        journal,
     };
     Harness { control: Control::new(config, deps), transport, node }
 }

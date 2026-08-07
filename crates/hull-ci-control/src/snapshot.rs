@@ -232,7 +232,7 @@ mod tests {
         let mut d = dispatch("acme/widget", "tree1");
         d.fetch_token = Some("tok-do-not-leak".into());
         d.source_url = "https://hull.example/api/tree/tree1/tar?sig=do-not-leak".into();
-        control.accept(d);
+        control.accept(d).unwrap();
 
         let jobs = control.snapshot_jobs();
         assert_eq!(jobs.len(), 1);
@@ -246,9 +246,9 @@ mod tests {
     #[tokio::test]
     async fn the_tenant_view_is_assembled_from_per_tenant_answers_only() {
         let control = parked();
-        control.accept(dispatch("acme/widget", "tree1"));
-        control.accept(dispatch("acme/other", "tree2"));
-        control.accept(dispatch("globex/thing", "tree3"));
+        control.accept(dispatch("acme/widget", "tree1")).unwrap();
+        control.accept(dispatch("acme/other", "tree2")).unwrap();
+        control.accept(dispatch("globex/thing", "tree3")).unwrap();
 
         let tenants = control.snapshot_tenants();
         let names: Vec<&str> = tenants.iter().map(|t| t.tenant.as_str()).collect();

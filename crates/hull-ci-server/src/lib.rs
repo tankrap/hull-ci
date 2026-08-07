@@ -41,13 +41,20 @@
 //!
 //! # What M1 does not do
 //!
-//! No pipeline file (M2), no step memo or cache (M4), no fair-share queue, no Postgres — state is in
-//! memory and a restart forgets in-flight jobs, which is survivable because Hull re-dispatches a tree
-//! with no verdict. And one node: [`node::InProcessFleet`] runs assignments here, in this process.
+//! No pipeline file (M2), no step memo or cache (M4), no fair-share queue, no Postgres — the job store
+//! is in memory. And one node: [`node::InProcessFleet`] runs assignments here, in this process.
+//!
+//! What a restart forgets is now a **choice**, not a fact. The line above used to end "…and a restart
+//! forgets in-flight jobs, which is survivable because Hull re-dispatches a tree with no verdict",
+//! and that second clause was simply wrong: spec §10 says Hull neither polls us nor times a dispatched
+//! job out, and it clears its in-flight set only when a callback arrives, so a forgotten job leaves a
+//! tree wedged until a human forces a rerun. [`journal`] is the write-ahead outbox that closes it —
+//! off by default for compatibility, and drained at startup by [`journal::recover`] when it is on.
 
 pub mod admin;
 pub mod config;
 pub mod fetch;
+pub mod journal;
 pub mod membership;
 pub mod memo;
 pub mod node;
@@ -91,6 +98,14 @@ pub enum StartupError {
     Storage { what: &'static str, path: String, detail: String },
     #[error("could not build the fetch broker: {0}")]
     Broker(#[from] hull_ci_fetch::FetchError),
+    /// The write-ahead journal was asked for and could not be opened.
+    ///
+    /// A refusal, like every other variant here, and for the sharpest version of the usual reason: a
+    /// runner that started without the journal an operator configured would accept dispatches it
+    /// cannot answer after a restart, while the operator believes otherwise. Degrading here does not
+    /// lose a feature, it loses jobs.
+    #[error("could not open the write-ahead journal: {0}")]
+    Journal(#[from] hull_ci_control::JournalError),
     #[error("could not bind {addr}: {source}")]
     Bind { addr: std::net::SocketAddr, source: std::io::Error },
     #[error("server failed: {0}")]
@@ -207,6 +222,20 @@ pub async fn assemble(config: &Config) -> Result<Runner, StartupError> {
         ..ControlConfig::default()
     };
 
+    // Built here rather than taken from `Deps::default` so that failing to construct the HTTP client
+    // is a startup error, not a silently unwired verdict sender. Held as its own binding because the
+    // journal recovery pass below needs the *same* transport the runner will use — recovering over a
+    // second, differently-configured client would test a path production never takes.
+    let transport: Arc<dyn hull_ci_control::callback::CallbackTransport> =
+        Arc::new(HttpCallback::new(std::time::Duration::from_secs(30)).map_err(|e| {
+            StartupError::Storage { what: "callback client", path: "-".into(), detail: e.to_string() }
+        })?);
+
+    // Design D§4.1's durable outbox, or the one that remembers nothing. Opened before the control
+    // plane exists, because `Control::accept` refuses a dispatch it cannot journal — a runner whose
+    // journal is broken must fail to start rather than 503 every dispatch it is given.
+    let journal = journal::assemble(config)?;
+
     // Written out in full rather than as overrides on `Deps::default()`: the defaults are the
     // *unwired* seams, which fail loudly by design, and a field forgotten here should be a compile
     // error rather than a runner that reports `errored` on every job because its planner is a stub.
@@ -219,13 +248,26 @@ pub async fn assemble(config: &Config) -> Result<Runner, StartupError> {
             PipelinePlanner::new(config.image.clone()).with_secret_delivery(secrets.is_some()),
         ),
         node: Arc::clone(&fleet) as Arc<dyn hull_ci_control::seams::NodeSink>,
-        // Built here rather than taken from `Deps::default` so that failing to construct the HTTP
-        // client is a startup error, not a silently unwired verdict sender.
-        transport: Arc::new(HttpCallback::new(std::time::Duration::from_secs(30)).map_err(|e| {
-            StartupError::Storage { what: "callback client", path: "-".into(), detail: e.to_string() }
-        })?),
+        transport: Arc::clone(&transport),
         membership: Arc::new(config.trusted.clone()),
+        journal: Arc::clone(&journal),
     };
+
+    // **Answer last run's debts before taking this run's work.** Spec §10: Hull does not poll us and
+    // does not time a dispatched job out, so a job we accepted and never answered leaves its tree
+    // marked in-flight forever — a normal re-check comes back `Pending` and only a human forcing a
+    // rerun recovers it. Draining the journal here is what turns "the runner restarted" from a wedged
+    // tree into an `errored` verdict Hull does not memoize (spec §7) and a re-check clears.
+    //
+    // Before `Control` is built and before the router is served, so recovery can never race a fresh
+    // dispatch for one of the same trees. It does not block startup on failure — see `recover`.
+    journal::recover(
+        &*journal,
+        &*transport,
+        config.secret.as_deref(),
+        &journal::recovery_retry(),
+    )
+    .await;
 
     let control = Control::new(control_config, deps);
     fleet.attach(&control);

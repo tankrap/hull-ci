@@ -92,8 +92,22 @@ pub async fn ingest(
         return error(StatusCode::BAD_REQUEST, &e.to_string());
     }
 
-    // 4. Record, then ack. `accept` returns once the job exists; the pipeline runs on its own task.
-    let accepted = control.accept(dispatch);
+    // 4. Record, then ack. `accept` returns once the job exists **durably**; the pipeline runs on its
+    //    own task.
+    //
+    //    A journal that could not take the entry is a 503 with no job created, not a 202. Spec §5
+    //    makes a 2xx mean *accepted*, and spec §10 says Hull "does not time out a dispatched job" and
+    //    "does not poll you" — it marks the tree in flight on the ack and clears that only when a
+    //    callback arrives. So acking a job we might lose does not produce a slow verdict, it produces
+    //    a tree wedged until a human forces a rerun. A 503 is visible, retryable, and leaves the tree
+    //    exactly as it was.
+    let accepted = match control.accept(dispatch) {
+        Ok(a) => a,
+        Err(e) => {
+            tracing::error!(error = %e, "rejected dispatch: could not record it durably");
+            return error(StatusCode::SERVICE_UNAVAILABLE, &e.to_string());
+        }
+    };
     (
         StatusCode::ACCEPTED,
         Json(serde_json::json!({
@@ -338,6 +352,32 @@ mod tests {
             let (status, _) = post_dispatch(&c, headers(Some("s3cret"), Some("1")), body(repo, "t")).await;
             assert_eq!(status, StatusCode::ACCEPTED, "{repo:?} is a real repository");
         }
+    }
+
+    #[tokio::test]
+    async fn a_dispatch_we_cannot_record_durably_is_503_with_no_job_created() {
+        // The door's half of design D§4.1's "the ack means *durably ours*". Spec §5 makes a 2xx mean
+        // *accepted* — Hull tells the user "dispatched" and stops caring — and spec §10 says Hull
+        // neither polls us nor times a dispatched job out, clearing its in-flight set only when a
+        // callback arrives. So a 202 for a job we cannot record does not degrade to a late verdict;
+        // it degrades to a tree wedged until a human clicks force-rerun. 503 is the honest answer:
+        // visible, retryable, and it leaves the tree untouched.
+        let h = crate::testing::harness_full(
+            fast_config(),
+            Arc::new(OkFetcher),
+            Arc::new(StaticPlanner::steps(1)),
+            NodeMode::NoCapacity,
+            Arc::new(crate::testing::ScriptedTransport::ok()),
+            Arc::new(crate::testing::RefusingJournal),
+        );
+
+        let (status, v) =
+            post_dispatch(&h.control, headers(Some("s3cret"), Some("1")), body("t/r", "tree1")).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "not acked");
+        assert_eq!(v["accepted"], false);
+        assert!(v["error"].as_str().unwrap().contains("durably"), "the operator is told why");
+        assert!(v.get("job_id").is_none(), "and no job id is handed out for a job that does not exist");
+        assert!(h.control.snapshot_jobs().is_empty(), "no job was created");
     }
 
     #[tokio::test]

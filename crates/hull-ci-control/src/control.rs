@@ -43,6 +43,7 @@ use crate::callback::{
 use crate::fairshare::{Admission, Depth, FairQueue, FairShare, Grant, JobView, StepView};
 use crate::graph;
 use crate::ids::new_step_id;
+use crate::journal::{now_unix, JobIntent, Journal, JournalError};
 use crate::memo::{plan_step_keys, JobKeyContext, MemoConfig, MemoOutcome, StepKey};
 use crate::model::{Job, JobId, JobState, Step, StepId, StepSpec, StepState};
 use crate::seams::{
@@ -113,6 +114,13 @@ pub struct Deps {
     pub node: Arc<dyn NodeSink>,
     pub transport: Arc<dyn CallbackTransport>,
     pub membership: Arc<dyn Membership>,
+    /// The durable outbox of dispatches we owe an answer for ([`crate::journal`]).
+    ///
+    /// A seam like the others, and for the same reason: this crate opens no file (spec §14.1). The
+    /// default is [`NoJournal`](crate::journal::NoJournal), which is the behaviour every deployment
+    /// had before the journal existed — a restart strands in-flight jobs — so wiring a real one is an
+    /// operator's decision rather than a new failure mode nobody asked for.
+    pub journal: Arc<dyn Journal>,
 }
 
 /// What the ingest handler answers with.
@@ -122,6 +130,25 @@ pub struct Accepted {
     /// True when `(repo, tree_id)` was already known — attached to a live job, or re-reported from a
     /// finished one (spec §9).
     pub duplicate: bool,
+}
+
+/// Why a dispatch was **not** accepted.
+///
+/// One variant, and it is the only one that can exist here: everything else a dispatch can be wrong
+/// about is decided in [`crate::ingest`] before this point. This is the failure of our own storage,
+/// which is why it becomes a 503 (try us again) rather than a 4xx (you are wrong).
+#[derive(Debug, thiserror::Error)]
+pub enum AcceptError {
+    /// The write-ahead journal refused the entry, so this job would not survive a restart.
+    ///
+    /// **We do not ack.** Spec §5 makes a 2xx mean *accepted* — Hull tells the user "dispatched" and
+    /// stops caring, and spec §10 makes clear it never polls us and never times the job out. So an ack
+    /// for a job we can lose does not degrade to "slow"; it degrades to a tree Hull marks in-flight
+    /// and never clears, recoverable only by a human clicking force-rerun. A visible failed dispatch
+    /// is strictly better: the dispatcher sees the 503, and the tree is never wedged in the first
+    /// place.
+    #[error("the dispatch could not be recorded durably: {0}")]
+    NotDurable(#[from] JournalError),
 }
 
 /// Why a step report was refused. Verdict integrity, design D§10.4: "a step result is accepted only
@@ -193,9 +220,13 @@ impl Control {
     /// Record the job and start (or re-report) it. Returns as soon as the job is recorded — design
     /// D§4.1: ack fast, and only after the record exists.
     ///
+    /// "Recorded" now means recorded *durably*: the write-ahead journal entry is written before this
+    /// returns, and a journal that refuses is a refused dispatch (see [`AcceptError::NotDurable`]).
+    /// Everything after the ack is still asynchronous.
+    ///
     /// Must be called from a tokio context; the pipeline runs on a spawned task so the ack is not
     /// behind any work.
-    pub fn accept(self: &Arc<Self>, dispatch: Dispatch) -> Accepted {
+    pub fn accept(self: &Arc<Self>, dispatch: Dispatch) -> Result<Accepted, AcceptError> {
         let author_class = self.deps.membership.classify(&dispatch.repo, &dispatch.author);
         let repo = dispatch.repo.clone();
         let tree_id = dispatch.tree_id.clone();
@@ -215,6 +246,45 @@ impl Control {
         };
 
         let job_id = admit.job_id().to_string();
+
+        // ── The durable record, before the ack and before the driver (design D§4.1) ───────────────
+        //
+        // Written for `Created` *and* for `Live`. `Live` is the case that is easy to skip and wrong to
+        // skip: it attached a second `callback_url` to a job we already know about, and an entry that
+        // still carried only the first URL would, after a restart, answer one dispatcher and leave the
+        // other waiting forever on a verdict delivered somewhere else. The journal has to carry the
+        // full current URL set, so the second dispatch rewrites the entry.
+        //
+        // `Finished` needs no entry: it re-reports a verdict that is already in memory, and either the
+        // job's own entry is still outstanding (delivery has not been confirmed, so the debt is
+        // already recorded) or it was forgotten because the verdict reached Hull. Recording a fresh
+        // one would resurrect a paid debt as an unpaid one.
+        if !matches!(admit, Admit::Finished { .. }) {
+            if let Err(e) = self.journal_record(&job_id, None) {
+                // Not acked. See `AcceptError::NotDurable`: an ack Hull believes for a job we can lose
+                // wedges the tree until a human forces a rerun, which is strictly worse than a visible
+                // failed dispatch the dispatcher can retry.
+                tracing::error!(
+                    %job_id, %repo, %tree_id, error = %e,
+                    "refusing a dispatch we could not record durably — not acking"
+                );
+                if matches!(admit, Admit::Created { .. }) {
+                    // Undo the admission. The driver was never spawned, so nothing is running; leaving
+                    // the record would hold the `(repo, tree_id)` index against a job nobody will ever
+                    // answer, and the dispatcher's retry would come back as `Admit::Live` on it — an
+                    // ack for work that is not happening, which is the exact outcome the refusal
+                    // exists to prevent.
+                    //
+                    // An `Admit::Live` failure is deliberately *not* rolled back: that job belongs to
+                    // an earlier dispatch that was recorded and is running, and tearing it down
+                    // because a later duplicate could not be journaled would turn one unacked dispatch
+                    // into two lost ones.
+                    self.lock_jobs().remove(&job_id);
+                }
+                return Err(AcceptError::NotDurable(e));
+            }
+        }
+
         match &admit {
             Admit::Created { .. } => {
                 self.wakers
@@ -238,7 +308,31 @@ impl Control {
             }
         }
 
-        Accepted { job_id, duplicate: admit.is_duplicate() }
+        Ok(Accepted { job_id, duplicate: admit.is_duplicate() })
+    }
+
+    /// Write the journal entry for `job_id` from the job record as it stands right now.
+    ///
+    /// One function for both call sites — accept and verdict — because the entry is a *snapshot of
+    /// the whole intent*, not a delta ([`Journal::record`] is an upsert). Two hand-rolled builders
+    /// would be two chances for one of them to forget a `callback_url` that arrived between them, and
+    /// a dropped URL is a change that hangs unverified.
+    ///
+    /// A job that is no longer in the store is not an error: it was evicted or rolled back, which
+    /// means nobody is waiting on this write.
+    fn journal_record(&self, job_id: &str, verdict: Option<Verdict>) -> Result<(), JournalError> {
+        let Some(intent) = self.with_job(job_id, |job| JobIntent {
+            job_id: job.id.clone(),
+            repo: job.dispatch.repo.clone(),
+            tree_id: job.dispatch.tree_id.clone(),
+            // The full current set, never `dispatch.callback_url` alone — see `JobIntent`.
+            callback_urls: job.callback_urls.clone(),
+            accepted_at_unix: now_unix(),
+            verdict,
+        }) else {
+            return Ok(());
+        };
+        self.deps.journal.record(&intent)
     }
 
     // ── The node-facing side (design D§5.3, D§10.4) ──────────────────────────────────────────────
@@ -890,6 +984,27 @@ impl Control {
             .unwrap_or(false);
 
         if recorded {
+            // Move the journal entry from "accepted, no answer" to "answered, delivery unconfirmed",
+            // **before** a single delivery attempt is made. That ordering is the whole point: a crash
+            // between the verdict and its delivery is the window this feature exists for, and an entry
+            // still saying `verdict: None` would make the next start report `errored` for a job that
+            // had genuinely gone green — a wrong answer, and one spec §7 has Hull memoize by `tree_id`
+            // permanently. Reporting a stale `errored` is not memoized and merely costs a re-check;
+            // reporting a *fabricated* one is not recoverable, so the write goes first.
+            //
+            // A failure here is logged and not fatal. The verdict exists and is about to be delivered;
+            // refusing to deliver it because we could not update a file would guarantee the wedge the
+            // file exists to prevent. The worst case is the entry keeps `verdict: None` and a restart
+            // sends `errored` for a job that had a real verdict — bad, but strictly better than
+            // sending nothing at all.
+            let decided = self.with_job(job_id, |job| job.verdict.clone()).flatten();
+            if let Err(e) = self.journal_record(job_id, decided) {
+                tracing::error!(
+                    %job_id, error = %e,
+                    "could not journal the verdict; a restart before delivery would report `errored` for it"
+                );
+            }
+
             // **Release the tenant's quota at the verdict, not at delivery.**
             //
             // `report` below retries for up to the full budget — with the default schedule, roughly
@@ -967,6 +1082,17 @@ impl Control {
         });
 
         if outcome_delivered {
+            // **The debt is paid, and only now.** Hull has the verdict, so this job can no longer
+            // wedge a tree and there is nothing for a restart to re-send.
+            //
+            // The `ReportFailed` branch deliberately keeps the entry, and that asymmetry is what makes
+            // this an outbox rather than a crash log. A verdict that was computed but never delivered
+            // leaves Hull exactly as wedged as one that was never computed — its in-flight set is only
+            // cleared by the callback handler (spec §10: "Hull does not poll you") — so the entry has
+            // to outlive the failed delivery and be retried on the next start. Forgetting here on both
+            // outcomes would mean the journal only survived crashes and quietly dropped every job that
+            // exhausted its retry budget against an unreachable Hull, which is the *likelier* failure.
+            self.deps.journal.forget(job_id);
             // The driver is done with this job; drop its waker so a long-lived process does not
             // accumulate one per job it has ever seen.
             self.wakers.lock().unwrap_or_else(|e| e.into_inner()).remove(job_id);
@@ -1093,7 +1219,7 @@ mod tests {
         node_mode: NodeMode,
     ) -> Live {
         let h = harness(config, fetcher, planner, node_mode);
-        let accepted = h.control.accept(dispatch("t/r", "tree1"));
+        let accepted = h.control.accept(dispatch("t/r", "tree1")).unwrap();
         Live { ctrl: h.control, job_id: accepted.job_id, node: h.node, transport: h.transport }
     }
 
@@ -1417,7 +1543,7 @@ mod tests {
             .unwrap();
         let first = live.settled().await;
 
-        let again = live.ctrl.accept(dispatch("t/r", "tree1"));
+        let again = live.ctrl.accept(dispatch("t/r", "tree1")).unwrap();
         assert_eq!(again.job_id, live.job_id);
         assert!(again.duplicate);
 
@@ -1459,7 +1585,7 @@ mod tests {
             // A Hull that never answers: delivery will retry to exhaustion.
             Arc::new(crate::testing::ScriptedTransport::always_failing()),
         );
-        let accepted = h.control.accept(dispatch("t/r", "tree1"));
+        let accepted = h.control.accept(dispatch("t/r", "tree1")).unwrap();
         let live = Live {
             ctrl: Arc::clone(&h.control),
             job_id: accepted.job_id.clone(),
@@ -1527,7 +1653,7 @@ mod tests {
         let mut second = dispatch("t/r", "tree1");
         second.change = "b2b2b2b2b2b2".into();
         second.callback_url = "https://hull.example/api/repos/t/r/change/b2b2/ci-result".into();
-        let again = live.ctrl.accept(second.clone());
+        let again = live.ctrl.accept(second.clone()).unwrap();
         assert_eq!(again.job_id, live.job_id, "the work is still deduplicated");
 
         let transport = Arc::clone(&live.transport);
@@ -1552,7 +1678,7 @@ mod tests {
             .unwrap();
         live.settled().await;
 
-        live.ctrl.accept(dispatch("t/r", "tree1"));
+        live.ctrl.accept(dispatch("t/r", "tree1")).unwrap();
         let transport = Arc::clone(&live.transport);
         assert!(wait_until(move || transport.seen().len() == 2).await);
         let urls: Vec<String> = live.transport.seen().iter().map(|r| r.url.clone()).collect();
@@ -1783,13 +1909,13 @@ mod tests {
             NodeMode::Accept,
         );
 
-        let flood = h.control.accept(dispatch("flood/api", "flood"));
+        let flood = h.control.accept(dispatch("flood/api", "flood")).unwrap();
         let node = Arc::clone(&h.node);
         assert!(wait_until(move || node.assigned().len() == 1).await, "the flood takes the one slot");
 
         // Wait for the neighbour's step to actually be *in* the queue, so this is a test about the
         // scheduler's choice and not about which driver happened to wake first.
-        h.control.accept(dispatch("solo/api", "solo"));
+        h.control.accept(dispatch("solo/api", "solo")).unwrap();
         let ctrl = Arc::clone(&h.control);
         assert!(wait_until(move || ctrl.queue_depth("solo").queued == 1).await, "solo is waiting");
         assert_eq!(h.control.queue_depth("flood").queued, 5, "and so are five of the flood's");
@@ -1873,11 +1999,11 @@ mod tests {
             NodeMode::Accept,
         );
 
-        let nightly = h.control.accept(dispatch("acme/nightly", "nightly"));
+        let nightly = h.control.accept(dispatch("acme/nightly", "nightly")).unwrap();
         let node = Arc::clone(&h.node);
         assert!(wait_until(move || node.assigned().len() == 1).await);
 
-        h.control.accept(dispatch("acme/api", "click"));
+        h.control.accept(dispatch("acme/api", "click")).unwrap();
         let ctrl = Arc::clone(&h.control);
         assert!(wait_until(move || ctrl.queue_depth("acme").queued == 3).await, "2 nightly + 1 click");
 
@@ -1980,7 +2106,7 @@ mod tests {
 
     /// Run one job to green, passing every step the fleet is handed — however deep the DAG.
     async fn run_to_green(h: &crate::testing::Harness, repo: &str, tree: &str) -> JobId {
-        let job = h.control.accept(dispatch(repo, tree)).job_id;
+        let job = h.control.accept(dispatch(repo, tree)).unwrap().job_id;
         let ctrl = Arc::clone(&h.control);
         let id = job.clone();
         let done = wait_until(move || {
@@ -2012,13 +2138,13 @@ mod tests {
         assert_eq!(h.node.assigned().len(), 1, "the first tree runs");
 
         // Doc-only: a new tree Hull has never seen, whose `crates/**` is unchanged.
-        let doc = h.control.accept(dispatch("acme/api", "doc")).job_id;
+        let doc = h.control.accept(dispatch("acme/api", "doc")).unwrap().job_id;
         assert_eq!(settled_verdict(&h.control, &doc).await.status, Status::Green);
         assert_eq!(state_of_step(&h.control, &doc, "test"), Some(StepState::Cached));
         assert_eq!(h.node.assigned().len(), 1, "a memo hit is never dispatched");
 
         // Code change inside the glob: a miss, and the step runs.
-        let code = h.control.accept(dispatch("acme/api", "code")).job_id;
+        let code = h.control.accept(dispatch("acme/api", "code")).unwrap().job_id;
         let ctrl = Arc::clone(&h.control);
         let id = code.clone();
         assert!(wait_until(move || state_of_step(&ctrl, &id, "test") == Some(StepState::Leased)).await);
@@ -2053,7 +2179,7 @@ mod tests {
         // A tree that differs only where nothing declares an input… every step is a hit.
         let mut second = dispatch("acme/api", "doc");
         second.callback_url = "https://hull.example/api/repos/acme/api/change/doc/ci-result".into();
-        let job = h.control.accept(second).job_id;
+        let job = h.control.accept(second).unwrap().job_id;
         let verdict = settled_verdict(&h.control, &job).await;
 
         assert_eq!(verdict.status, Status::Green);
@@ -2091,7 +2217,7 @@ mod tests {
         run_to_green(&h, "acme/api", "base").await;
         assert_eq!(h.node.assigned().len(), 2);
 
-        let job = h.control.accept(dispatch("acme/api", "code")).job_id;
+        let job = h.control.accept(dispatch("acme/api", "code")).unwrap().job_id;
         let ctrl = Arc::clone(&h.control);
         let id = job.clone();
         assert!(wait_until(move || state_of_step(&ctrl, &id, "build") == Some(StepState::Leased)).await);
@@ -2120,7 +2246,7 @@ mod tests {
         let h = harness(memo_config(store), memo_fetcher(&t), Arc::new(MemoPlanner(plan)), NodeMode::Accept);
 
         run_to_green(&h, "acme/api", "base").await;
-        let job = h.control.accept(dispatch("acme/api", "test")).job_id;
+        let job = h.control.accept(dispatch("acme/api", "test")).unwrap().job_id;
 
         let ctrl = Arc::clone(&h.control);
         let id = job.clone();
@@ -2147,7 +2273,7 @@ mod tests {
         assert_eq!(h.node.assigned().len(), 1);
 
         // A different tenant, the same tree id, the same content, the same step definition.
-        let other = h.control.accept(dispatch("other/api", "base")).job_id;
+        let other = h.control.accept(dispatch("other/api", "base")).unwrap().job_id;
         let ctrl = Arc::clone(&h.control);
         let id = other.clone();
         assert!(
@@ -2158,7 +2284,7 @@ mod tests {
         assert_eq!(h.node.assigned()[1].tenant, "other");
 
         // And `acme`'s own repeat is still a hit, so the miss above is tenancy and nothing else.
-        let again = h.control.accept(dispatch("acme/api", "doc")).job_id;
+        let again = h.control.accept(dispatch("acme/api", "doc")).unwrap().job_id;
         assert_eq!(settled_verdict(&h.control, &again).await.status, Status::Green);
         assert_eq!(state_of_step(&h.control, &again, "test"), Some(StepState::Cached));
         assert_eq!(h.node.assigned().len(), 2);
@@ -2181,7 +2307,7 @@ mod tests {
         );
 
         run_to_green(&h, "acme/api", "base").await;
-        let sibling = h.control.accept(dispatch("acme/web", "doc")).job_id;
+        let sibling = h.control.accept(dispatch("acme/web", "doc")).unwrap().job_id;
         assert_eq!(settled_verdict(&h.control, &sibling).await.status, Status::Green);
         assert_eq!(state_of_step(&h.control, &sibling, "test"), Some(StepState::Cached));
         assert_eq!(h.node.assigned().len(), 1, "a sibling repo of the same tenant is a hit");
@@ -2200,7 +2326,7 @@ mod tests {
             NodeMode::Accept,
         );
 
-        let job = h.control.accept(dispatch("acme/api", "base")).job_id;
+        let job = h.control.accept(dispatch("acme/api", "base")).unwrap().job_id;
         let ctrl = Arc::clone(&h.control);
         let id = job.clone();
         assert!(wait_until(move || state_of_step(&ctrl, &id, "test") == Some(StepState::Leased)).await);
@@ -2209,7 +2335,7 @@ mod tests {
         assert!(store.is_empty(), "nothing may be recorded for an errored step");
 
         // The next tree with identical inputs must therefore run, not be served the outage.
-        let next = h.control.accept(dispatch("acme/api", "doc")).job_id;
+        let next = h.control.accept(dispatch("acme/api", "doc")).unwrap().job_id;
         let ctrl = Arc::clone(&h.control);
         let id = next.clone();
         assert!(wait_until(move || state_of_step(&ctrl, &id, "test") == Some(StepState::Leased)).await);
@@ -2230,7 +2356,7 @@ mod tests {
             NodeMode::Accept,
         );
 
-        let job = h.control.accept(dispatch("acme/api", "base")).job_id;
+        let job = h.control.accept(dispatch("acme/api", "base")).unwrap().job_id;
         let ctrl = Arc::clone(&h.control);
         let id = job.clone();
         assert!(wait_until(move || state_of_step(&ctrl, &id, "test") == Some(StepState::Leased)).await);
@@ -2238,7 +2364,7 @@ mod tests {
         assert_eq!(settled_verdict(&h.control, &job).await.status, Status::Red);
 
         // Served — as `failed`, never as `cached`, because `cached` folds green.
-        let repeat = h.control.accept(dispatch("acme/api", "doc")).job_id;
+        let repeat = h.control.accept(dispatch("acme/api", "doc")).unwrap().job_id;
         let verdict = settled_verdict(&h.control, &repeat).await;
         assert_eq!(verdict.status, Status::Red, "a remembered failure is still red");
         assert_eq!(state_of_step(&h.control, &repeat, "test"), Some(StepState::Failed));
@@ -2261,14 +2387,14 @@ mod tests {
             NodeMode::Accept,
         );
 
-        let job = h.control.accept(dispatch("acme/api", "base")).job_id;
+        let job = h.control.accept(dispatch("acme/api", "base")).unwrap().job_id;
         let ctrl = Arc::clone(&h.control);
         let id = job.clone();
         assert!(wait_until(move || state_of_step(&ctrl, &id, "test") == Some(StepState::Leased)).await);
         report_leased(&h.control, &job, StepOutcome::Failed);
         settled_verdict(&h.control, &job).await;
 
-        let repeat = h.control.accept(dispatch("acme/api", "doc")).job_id;
+        let repeat = h.control.accept(dispatch("acme/api", "doc")).unwrap().job_id;
         let ctrl = Arc::clone(&h.control);
         let id = repeat.clone();
         assert!(
@@ -2296,7 +2422,7 @@ mod tests {
         run_to_green(&h, "acme/api", "base").await;
         assert!(store.is_empty(), "an uncacheable step is never recorded either");
 
-        let repeat = h.control.accept(dispatch("acme/api", "doc")).job_id;
+        let repeat = h.control.accept(dispatch("acme/api", "doc")).unwrap().job_id;
         let ctrl = Arc::clone(&h.control);
         let id = repeat.clone();
         assert!(wait_until(move || state_of_step(&ctrl, &id, "test") == Some(StepState::Leased)).await);
@@ -2319,7 +2445,7 @@ mod tests {
         run_to_green(&h, "acme/api", "base").await;
         assert!(store.is_empty());
 
-        let repeat = h.control.accept(dispatch("acme/api", "doc")).job_id;
+        let repeat = h.control.accept(dispatch("acme/api", "doc")).unwrap().job_id;
         let ctrl = Arc::clone(&h.control);
         let id = repeat.clone();
         assert!(wait_until(move || state_of_step(&ctrl, &id, "test") == Some(StepState::Leased)).await);
@@ -2338,10 +2464,219 @@ mod tests {
             NodeMode::Accept,
         );
         run_to_green(&h, "acme/api", "base").await;
-        let repeat = h.control.accept(dispatch("acme/api", "doc")).job_id;
+        let repeat = h.control.accept(dispatch("acme/api", "doc")).unwrap().job_id;
         let ctrl = Arc::clone(&h.control);
         let id = repeat.clone();
         assert!(wait_until(move || state_of_step(&ctrl, &id, "test") == Some(StepState::Leased)).await);
         assert_eq!(h.node.assigned().len(), 2);
+    }
+}
+
+/// The write-ahead journal, from the control plane's side (design D§4.1, [`crate::journal`]).
+///
+/// Everything here serves one sentence: **every accepted dispatch is eventually answered, across a
+/// restart.** Spec §10 leaves both halves of that to us — "Hull does not time out a dispatched job"
+/// and "Hull does not poll you" — and Hull's in-flight set is cleared only by our callback, so a job
+/// we accept and never answer is a tree wedged until a human forces a rerun. These tests pin the
+/// three moments where that promise is made or broken: the ack, the verdict, and the delivery.
+#[cfg(test)]
+mod journal_tests {
+    use super::*;
+    use crate::journal::{JobIntent, Journal, MemJournal};
+    use crate::testing::{
+        dispatch, fast_config, harness_full, step_report, wait_until, Harness, NodeMode, OkFetcher,
+        RefusingJournal, ScriptedTransport, StaticPlanner,
+    };
+    use hull_ci_proto::{Status, StepOutcome};
+
+    /// A harness over a caller-supplied journal, so a *second* `Control` can be built over the same
+    /// one — which is how a restart is simulated without a process boundary.
+    fn over(journal: Arc<dyn Journal>, transport: Arc<ScriptedTransport>) -> Harness {
+        harness_full(
+            fast_config(),
+            Arc::new(OkFetcher),
+            Arc::new(StaticPlanner::steps(1)),
+            NodeMode::Accept,
+            transport,
+            journal,
+        )
+    }
+
+    fn only(journal: &MemJournal) -> JobIntent {
+        let mut out = journal.outstanding().unwrap();
+        assert_eq!(out.len(), 1, "expected exactly one outstanding entry, got {out:#?}");
+        out.remove(0)
+    }
+
+    /// Drive the one planned step to `outcome` and wait for the job to settle either way.
+    async fn settle(h: &Harness, job_id: &str, outcome: StepOutcome) {
+        let ctrl = Arc::clone(&h.control);
+        let id = job_id.to_string();
+        assert!(
+            wait_until(move || ctrl.with_job(&id, |j| j.steps.len() == 1).unwrap_or(false)).await,
+            "the step never reached the fleet"
+        );
+        let step = h.control.with_job(job_id, |j| j.steps[0].id.clone()).unwrap();
+        h.control
+            .record_step_report(&step_report(job_id, &step, outcome, "ok"), "node-test")
+            .expect("the lease holder is believed");
+        let ctrl = Arc::clone(&h.control);
+        let id = job_id.to_string();
+        assert!(
+            wait_until(move || matches!(
+                ctrl.job_state(&id),
+                Some(JobState::Reported) | Some(JobState::ReportFailed)
+            ))
+            .await,
+            "the job never settled"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_accepted_job_is_outstanding_until_its_verdict_is_delivered() {
+        // The whole lifecycle in one test, because what matters is the *transitions* rather than any
+        // single state: accepted → owed, delivered → paid.
+        let journal = Arc::new(MemJournal::default());
+        let h = over(Arc::clone(&journal) as Arc<dyn Journal>, Arc::new(ScriptedTransport::ok()));
+
+        let accepted = h.control.accept(dispatch("t/r", "tree1")).unwrap();
+        let entry = only(&journal);
+        assert_eq!(entry.job_id, accepted.job_id);
+        assert_eq!(entry.repo, "t/r");
+        assert_eq!(entry.tree_id, "tree1");
+        assert_eq!(entry.callback_urls, ["https://hull.example/api/repos/t/r/change/21ea/ci-result"]);
+        assert!(entry.verdict.is_none(), "nothing has been decided yet");
+
+        settle(&h, &accepted.job_id, StepOutcome::Passed).await;
+        assert_eq!(h.control.job_state(&accepted.job_id), Some(JobState::Reported));
+        assert!(journal.outstanding().unwrap().is_empty(), "Hull has the verdict, so nothing is owed");
+    }
+
+    #[tokio::test]
+    async fn a_verdict_whose_delivery_failed_stays_outstanding_carrying_that_verdict() {
+        // **This is what makes it an outbox rather than a crash log.** A `report_failed` job has a
+        // real verdict Hull never received, so its tree is exactly as wedged as one that never ran —
+        // and unlike a crash this is the *likely* failure: a full retry budget spent against an
+        // unreachable Hull. Forgetting the entry on any settled outcome would drop precisely these.
+        //
+        // The verdict has to survive with it. Re-sending `errored` for a job that genuinely went
+        // green would be a wrong answer rather than a late one.
+        let journal = Arc::new(MemJournal::default());
+        // A Hull that never answers.
+        let h = over(Arc::clone(&journal) as Arc<dyn Journal>, Arc::new(ScriptedTransport::always_failing()));
+
+        let accepted = h.control.accept(dispatch("t/r", "tree1")).unwrap();
+        settle(&h, &accepted.job_id, StepOutcome::Passed).await;
+        assert_eq!(h.control.job_state(&accepted.job_id), Some(JobState::ReportFailed));
+
+        let entry = only(&journal);
+        assert_eq!(entry.job_id, accepted.job_id);
+        assert_eq!(
+            entry.verdict.as_ref().map(|v| v.status),
+            Some(Status::Green),
+            "the entry carries the true answer, not a placeholder"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_second_dispatch_for_a_live_tree_leaves_one_entry_carrying_both_urls() {
+        // `Admit::Live`. Work is deduplicated by `(repo, tree_id)`; delivery is not. An entry still
+        // carrying only the first `callback_url` would, after a restart, answer one dispatcher and
+        // leave the other waiting forever on a verdict delivered somewhere else — the same wedge, one
+        // level down and much harder to notice.
+        let journal = Arc::new(MemJournal::default());
+        let h = over(Arc::clone(&journal) as Arc<dyn Journal>, Arc::new(ScriptedTransport::ok()));
+
+        let first = h.control.accept(dispatch("t/r", "tree1")).unwrap();
+        let mut second = dispatch("t/r", "tree1");
+        second.change = "b2b2b2b2b2b2".into();
+        second.callback_url = "https://hull.example/api/repos/t/r/change/b2b2/ci-result".into();
+        let again = h.control.accept(second.clone()).unwrap();
+        assert_eq!(again.job_id, first.job_id, "one tree, one job");
+        assert!(again.duplicate);
+
+        let entry = only(&journal);
+        assert_eq!(
+            entry.callback_urls,
+            [
+                "https://hull.example/api/repos/t/r/change/21ea/ci-result".to_string(),
+                second.callback_url.clone(),
+            ],
+            "one entry, both destinations, in arrival order"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_dispatch_whose_journal_write_fails_is_refused_and_leaves_no_job() {
+        // Spec §5 makes a 2xx mean *accepted*: Hull tells the user "dispatched" and stops caring, and
+        // §10 says it neither polls us nor times the job out. So an ack for a job we can lose is not
+        // "slow", it is a tree wedged until a human forces a rerun. The store must also be left as if
+        // the dispatch never arrived — otherwise the dispatcher's retry comes back `Admit::Live` and
+        // gets acked for work that is not running, which is the same failure wearing a duplicate's
+        // clothes.
+        let refusing = harness_full(
+            fast_config(),
+            Arc::new(OkFetcher),
+            Arc::new(StaticPlanner::steps(1)),
+            NodeMode::Accept,
+            Arc::new(ScriptedTransport::ok()),
+            Arc::new(RefusingJournal),
+        );
+
+        let refused = refusing.control.accept(dispatch("t/r", "tree1"));
+        assert!(matches!(refused, Err(AcceptError::NotDurable(_))), "got {refused:?}");
+        assert!(refusing.control.snapshot_jobs().is_empty(), "no job was created");
+        assert_eq!(refusing.node.assigned().len(), 0, "and nothing was scheduled");
+
+        // A dispatch that *can* be recorded is still ordinary new work, not a duplicate of a phantom.
+        let ok = over(Arc::new(MemJournal::default()), Arc::new(ScriptedTransport::ok()));
+        assert!(!ok.control.accept(dispatch("t/r", "tree1")).unwrap().duplicate);
+    }
+
+    #[tokio::test]
+    async fn a_restart_can_still_answer_a_job_the_previous_process_never_finished() {
+        // **The test that would have caught the real bug.** All state was in memory, so a runner that
+        // died mid-job left Hull holding an in-flight tree no re-check would dislodge: no callback, no
+        // `errored`, and nothing anywhere that knew a callback was owed.
+        //
+        // The process boundary here is the shared journal. One `Control` accepts a job and is dropped
+        // while it is genuinely in flight; a second is built over the same journal with an empty job
+        // store, and the debt is still legible to it — the job id, the repo, the tree, and every
+        // `callback_url` that has to hear an answer.
+        let journal = Arc::new(MemJournal::default());
+
+        let first = over(Arc::clone(&journal) as Arc<dyn Journal>, Arc::new(ScriptedTransport::ok()));
+        let accepted = first.control.accept(dispatch("t/r", "tree1")).unwrap();
+        let ctrl = Arc::clone(&first.control);
+        let id = accepted.job_id.clone();
+        assert!(
+            wait_until(move || ctrl.with_job(&id, |j| j.steps.len() == 1).unwrap_or(false)).await,
+            "the job should be genuinely in flight when the process dies"
+        );
+
+        // The crash: everything in memory goes, and only the journal survives.
+        drop(first);
+
+        let restarted = over(Arc::clone(&journal) as Arc<dyn Journal>, Arc::new(ScriptedTransport::ok()));
+        assert!(restarted.control.snapshot_jobs().is_empty(), "a fresh process knows no jobs");
+
+        let owed = journal.outstanding().unwrap();
+        assert_eq!(owed.len(), 1, "the debt outlived the process");
+        assert_eq!(owed[0].job_id, accepted.job_id);
+        assert_eq!(owed[0].tree_id, "tree1");
+        assert!(owed[0].verdict.is_none(), "it never reached a verdict, and the entry says so");
+        assert_eq!(
+            owed[0].callback_urls,
+            ["https://hull.example/api/repos/t/r/change/21ea/ci-result"],
+            "and it knows where the answer has to go"
+        );
+
+        // Paying it is what unwedges the tree. The delivery itself belongs to the composition root —
+        // `hull_ci_server::journal::recover`, tested there against the real filesystem journal and a
+        // second live `Control` — and what this asserts is the half the control plane owns: a
+        // restarted process can still see the debt, and settling it clears the record for good.
+        journal.forget(&owed[0].job_id);
+        assert!(journal.outstanding().unwrap().is_empty());
+        drop(restarted);
     }
 }

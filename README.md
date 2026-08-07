@@ -100,9 +100,14 @@ admin grant rather than a string a pipeline can claim.
   keyed on keel subtree digests, off by default behind `HULL_CI_MEMO=on`. Still to come: the internal
   content store with within-tenant dedup, affinity scheduling, CoW workspaces, warm pools.
 - **M5 — scale-out.** Multi-replica control, autoscaling with cache-aware drain, sharding by history.
-  Nothing here yet, and note what that means today: **state is in memory**, so a restart forgets
-  in-flight jobs. Survivable because Hull re-dispatches a tree with no verdict, but it is why there
-  is no horizontal scaling — the fair-share clocks and the job store are process-local.
+  Mostly not here, and **state is still in memory**, which is why there is no horizontal scaling: the
+  fair-share clocks and the job store are process-local. What *is* here is the part a restart made
+  unsafe rather than merely slow. Every accepted dispatch is written to a durable outbox before it is
+  acked (`HULL_CI_JOURNAL=on`) and drained at startup, because the thing that survives a restart has
+  to be the **obligation to answer**, not the work. A forgotten job is not a lost job; it is a tree
+  Hull holds in-flight forever, since spec §10 has Hull neither polling nor timing out, and clearing
+  that mark only on a callback. Reporting *something* unwedges it, so recovery re-sends a recorded
+  verdict when there is one and `errored` when there is not, and either beats silence.
 
 The ordering is deliberate: multi-tenancy is the product, so isolation precedes the performance
 layer rather than following it.
@@ -124,6 +129,11 @@ Kept here rather than in a tracker, because a runner's honest limits belong next
   (`empty`) fails closed; the `*` configuration trusts Hull completely.
 - **Crypto-shredding via Infisical is unverified** — the delete endpoint exists; whether it destroys
   key material or soft-deletes is not documented, so it ships described as revocation.
+- **Tenant names are case-sensitive**, so `HULL_CI_TRUSTED_TENANTS` must spell a tenant the way Hull
+  spells it. Getting it wrong is quiet in the right direction — every job runs as an outsider and
+  comes back `errored` — but the reason is in the verdict, not in the startup banner. This is
+  deliberate: folding case would decide that two accounts Hull holds as distinct are one principal,
+  which fails open and no config repairs.
 
 
 ## Running it

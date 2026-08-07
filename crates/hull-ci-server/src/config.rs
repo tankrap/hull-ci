@@ -21,6 +21,7 @@
 //! | `HULL_CI_SECRETS` | `off` | `off` \| `dev` — the tenant secret broker (design D§7.4) |
 //! | `HULL_CI_DEV_SECRETS` | *none* | `tenant/NAME=value,…` seed for `HULL_CI_SECRETS=dev`; **dev only** |
 //! | `HULL_CI_PROXY` | `off` | `off` \| `on` — the package proxy (spec §14.3); see [`hull_ci_proxy::config`] for the rest of the `HULL_CI_PROXY_*` family |
+//! | `HULL_CI_JOURNAL` | **`on`** | `on` \| `off` — the write-ahead journal under `HULL_CI_STORE_ROOT/journal` ([`crate::journal`]). The one switch here that defaults **on**: off means a restart strands every in-flight job |
 //!
 //! `HULL_CI_SECRET` deserves its own note: spec §8 makes configuring one a SHOULD, and this process
 //! treats a missing one as a loud warning rather than a refusal, because a loopback bring-up run
@@ -161,6 +162,17 @@ pub struct Config {
     /// re-check dislodges, and it is silent, because a wrongly-cached pass looks exactly like a fast
     /// one. Opting in is the operator saying they want that trade.
     pub memo: bool,
+    /// Whether accepted dispatches are recorded durably, so a restart still answers them
+    /// (design D§4.1, [`crate::journal`]).
+    ///
+    /// **Off by default**, which is the behaviour every deployment already had: state is in memory and
+    /// a restart strands in-flight jobs. That default is a statement about compatibility, not about
+    /// what is right — spec §10 leaves the timeout and the recovery entirely to us, and Hull's
+    /// in-flight set is cleared only by our callback, so an unanswered job wedges its tree until a
+    /// human forces a rerun. Turning this on is the operator accepting the one cost it has: the
+    /// journal directory has to be writable, on storage that outlives the process, or **every**
+    /// dispatch is refused with a 503 rather than acked and lost.
+    pub journal: bool,
 }
 
 impl Default for Config {
@@ -193,6 +205,10 @@ impl Default for Config {
             proxy: hull_ci_proxy::ProxyConfig::default(),
             dev_secrets: None,
             memo: false,
+            // On, and it must stay in step with `from_env`'s default. Two spellings of one default
+            // is how a switch comes to mean different things depending on which door you came in
+            // through, and this one decides whether a dispatch is ever answered.
+            journal: true,
         }
     }
 }
@@ -235,7 +251,54 @@ impl Config {
                 .map_err(|e| ConfigError::Value { var: "HULL_CI_PROXY", detail: e.to_string() })?,
             dev_secrets: var("HULL_CI_DEV_SECRETS"),
             memo: var("HULL_CI_MEMO").as_deref().is_some_and(is_truthy),
+            // On unless explicitly turned off, which is the opposite of every other switch here.
+            //
+            // The others gate a *capability* — a memo, a proxy, a secret broker — and a deployment
+            // that never asked for one is simply a deployment without it. This one gates whether an
+            // accepted dispatch is ever answered, and what it prevents is not a missing feature:
+            // spec §10 has Hull neither polling nor timing a job out, and clearing its in-flight
+            // mark only when a callback arrives, so a dispatch this process forgets leaves that tree
+            // wedged until a human forces a rerun. Verified end to end — with this off, a `kill -9`
+            // between accept and verdict produces no callback, ever.
+            //
+            // Defaulting off would ship that as what an operator gets for doing nothing, which is
+            // the wrong direction to be wrong in for a runner whose stated posture is to refuse
+            // rather than degrade. The cost of on is one small fsync per dispatch, into a store root
+            // this process already requires and already writes.
+            journal: journal_enabled(var("HULL_CI_JOURNAL").as_deref())?,
         })
+    }
+}
+
+/// Is the write-ahead journal on? The `HULL_CI_JOURNAL` rule, as a function of the raw value.
+///
+/// A named predicate rather than an expression inside `from_env`, for the same reason the rest of
+/// this crate names its gates: `from_env` reads the real process environment, so the only way to
+/// test the rule inside it is to mutate global state from a test — which is racy under a parallel
+/// harness and `unsafe` besides. Taking `Option<&str>` makes the decision an ordinary pure function,
+/// and the thing that decides whether a dispatch is ever answered is worth being able to test
+/// directly.
+///
+/// Unset means **on**. See the call site for why this switch defaults the opposite way to every
+/// other one here.
+fn journal_enabled(raw: Option<&str>) -> Result<bool, ConfigError> {
+    match raw.map(|v| v.trim().to_ascii_lowercase()) {
+        // Unset is on. An operator who configured nothing gets a runner that answers.
+        None => Ok(true),
+        Some(v) => match v.as_str() {
+            "1" | "true" | "yes" | "on" => Ok(true),
+            "0" | "false" | "no" | "off" => Ok(false),
+            // Refuse rather than guess, exactly as `SandboxChoice` and `SecretsMode` do, and for
+            // the same reason: this is a safety switch, and the two ways to be wrong about it are
+            // not equally bad. Reading an unrecognised value as *on* would ignore an operator who
+            // is trying to turn it off; reading it as *off* would let a typo silently disarm the
+            // thing that answers dispatches, which is the failure the default exists to prevent.
+            // Neither is worth guessing at when the variable is right there to be spelled properly.
+            other => Err(ConfigError::Value {
+                var: "HULL_CI_JOURNAL",
+                detail: format!("expected `on` or `off`, got `{other}`"),
+            }),
+        },
     }
 }
 
@@ -310,6 +373,41 @@ mod tests {
         }
         for no in ["0", "false", "", "maybe"] {
             assert!(!is_truthy(no));
+        }
+    }
+}
+#[cfg(test)]
+mod journal_switch_tests {
+    use super::journal_enabled;
+
+    #[test]
+    fn an_operator_who_configures_nothing_gets_the_journal() {
+        assert!(journal_enabled(None).unwrap(), "silence must not be how a runner stops answering (spec §10)");
+    }
+
+    #[test]
+    fn off_is_the_one_spelling_that_turns_a_safety_property_off() {
+        for raw in ["off", "0", "false", "no", "OFF", "False"] {
+            assert!(!journal_enabled(Some(raw)).unwrap(), "{raw:?} should turn the journal off");
+        }
+    }
+
+    #[test]
+    fn turning_it_on_explicitly_still_works() {
+        for raw in ["on", "1", "true", "yes", "ON"] {
+            assert!(journal_enabled(Some(raw)).unwrap(), "{raw:?} should leave the journal on");
+        }
+    }
+
+    #[test]
+    fn a_value_nobody_recognises_refuses_to_start() {
+        // `HULL_CI_JOURNAL=maybe` must not resolve to either answer. Reading it as *on* ignores an
+        // operator trying to turn the journal off; reading it as *off* lets a typo silently disarm
+        // the thing that answers dispatches. The variable is right there to be spelled properly, so
+        // this refuses at startup where it is cheap to notice.
+        for raw in ["maybe", "onn", "disabled", "enabled", "y"] {
+            let err = journal_enabled(Some(raw)).expect_err("{raw:?} must not be guessed at");
+            assert!(err.to_string().contains("HULL_CI_JOURNAL"), "the error must name the variable");
         }
     }
 }
