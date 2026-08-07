@@ -266,6 +266,9 @@
      ["slots", node.slots_free + " free / " + node.slots_total + " total"],
      ["warm trees", node.warm_trees],
      ["admits untrusted", node.admits_untrusted ? "yes" : "no"],
+     // The clauses standing between this node and untrusted work — not the full gap list, which is
+     // below under "unmet clauses". An operator reading "no" above needs to know which one to fix.
+     ["blocking untrusted", (node.blocking_untrusted || []).join("; ") || "none"],
      ["egress deny", node.capabilities.egress_deny ? "yes" : "no"],
      ["metadata blackhole", node.capabilities.metadata_blackhole ? "yes" : "no"],
      ["single-use sandbox", node.capabilities.single_use ? "yes" : "no"],

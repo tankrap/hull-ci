@@ -342,25 +342,330 @@ pub struct NodeState {
     pub capabilities: BackendCapabilities,
 }
 
-/// What a sandbox backend can enforce. Reported by the node, honoured by the scheduler.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+/// What a sandbox backend can enforce, **one field per §14 clause**. Reported by the node, honoured
+/// by the scheduler.
+///
+/// # Why every clause is on the wire
+///
+/// This carried four booleans until an isolation audit pointed out what that meant:
+/// [`admits_untrusted`](Self::admits_untrusted) read four of §14's eighteen clauses, so a backend
+/// with a real microVM boundary, no seccomp profile, no memory ceiling and no output cap answered
+/// `true`. The gate cannot weigh a clause the wire does not carry, so the wire now carries all of
+/// them and the gate is written out clause by clause.
+///
+/// Every field is `#[serde(default)]`, and the direction of each one is the reason that is safe:
+/// they all state what the backend **does** enforce, so a field a peer omits — an older node, a
+/// truncated payload, a hand-written test fixture — reads as `false`, i.e. "not enforced". A
+/// capability struct can therefore only ever *understate* a backend, never flatter it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct BackendCapabilities {
-    /// Default-deny egress in the sandbox's own network namespace (spec §14.3).
-    pub egress_deny: bool,
-    /// Cloud metadata endpoints blackholed (spec §14.2).
-    pub metadata_blackhole: bool,
+    // §14.1 — isolation boundary
     /// One job per sandbox, destroyed afterward (spec §14.1).
+    #[serde(default)]
     pub single_use: bool,
     /// Hardware/kernel isolation strong enough to place two tenants' jobs on one host (spec §14.1).
+    #[serde(default)]
     pub cross_tenant_safe: bool,
+
+    // §14.2 — credentials & environment
+    /// The job environment is built from an allowlist rather than inherited (spec §14.2).
+    #[serde(default)]
+    pub env_allowlist: bool,
+    /// Cloud metadata endpoints blackholed (spec §14.2).
+    #[serde(default)]
+    pub metadata_blackhole: bool,
+
+    // §14.3 — network
+    /// Default-deny egress in the sandbox's own network namespace (spec §14.3).
+    #[serde(default)]
+    pub egress_deny: bool,
+    /// No inbound network reaches the sandbox (spec §14.3).
+    #[serde(default)]
+    pub no_inbound: bool,
+
+    // §14.4 — privilege & resources
+    #[serde(default)]
+    pub non_root: bool,
+    #[serde(default)]
+    pub read_only_rootfs: bool,
+    #[serde(default)]
+    pub tmpfs_scratch: bool,
+    #[serde(default)]
+    pub caps_dropped: bool,
+    #[serde(default)]
+    pub no_new_privileges: bool,
+    #[serde(default)]
+    pub seccomp_default_deny: bool,
+    #[serde(default)]
+    pub cpu_limit: bool,
+    #[serde(default)]
+    pub memory_limit: bool,
+    #[serde(default)]
+    pub pid_limit: bool,
+    #[serde(default)]
+    pub disk_limit: bool,
+    #[serde(default)]
+    pub wall_clock_timeout: bool,
+    #[serde(default)]
+    pub output_cap: bool,
+}
+
+/// One §14 clause, and whether admitting untrusted work may proceed without it.
+///
+/// A named enum rather than a list of field reads, because [`Clause::required_for_untrusted`] is an
+/// **exhaustive match**: adding a clause to §14 is a compile error here until somebody decides which
+/// side of the gate it falls on. That is the property the previous four-boolean gate lacked — it
+/// could not fail to compile when §14 grew, so it silently kept answering about four clauses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Clause {
+    SingleUse,
+    KernelIsolation,
+    EnvAllowlist,
+    MetadataBlackhole,
+    EgressDeny,
+    NoInbound,
+    NonRoot,
+    ReadOnlyRootfs,
+    TmpfsScratch,
+    CapsDropped,
+    NoNewPrivileges,
+    SeccompDefaultDeny,
+    CpuLimit,
+    MemoryLimit,
+    PidLimit,
+    DiskLimit,
+    WallClockTimeout,
+    OutputCap,
+}
+
+impl Clause {
+    /// Every §14 clause, in spec order. The array length is the count `unmet_clauses` asserts against.
+    pub const ALL: [Clause; 18] = [
+        Clause::SingleUse,
+        Clause::KernelIsolation,
+        Clause::EnvAllowlist,
+        Clause::MetadataBlackhole,
+        Clause::EgressDeny,
+        Clause::NoInbound,
+        Clause::NonRoot,
+        Clause::ReadOnlyRootfs,
+        Clause::TmpfsScratch,
+        Clause::CapsDropped,
+        Clause::NoNewPrivileges,
+        Clause::SeccompDefaultDeny,
+        Clause::CpuLimit,
+        Clause::MemoryLimit,
+        Clause::PidLimit,
+        Clause::DiskLimit,
+        Clause::WallClockTimeout,
+        Clause::OutputCap,
+    ];
+
+    /// The clause in the operator's words, spec reference first.
+    pub fn description(self) -> &'static str {
+        match self {
+            Clause::SingleUse => "§14.1 single-use sandbox, destroyed after each job",
+            Clause::KernelIsolation => "§14.1 kernel/hardware isolation (microVM-class boundary)",
+            Clause::EnvAllowlist => "§14.2 environment scrubbed to an allowlist",
+            Clause::MetadataBlackhole => "§14.2 cloud metadata endpoint blocked",
+            Clause::EgressDeny => "§14.3 default egress-deny",
+            Clause::NoInbound => "§14.3 no inbound network to the sandbox",
+            Clause::NonRoot => "§14.4 non-root user",
+            Clause::ReadOnlyRootfs => "§14.4 read-only root filesystem",
+            Clause::TmpfsScratch => "§14.4 writable tmpfs scratch that dies with the job",
+            Clause::CapsDropped => "§14.4 all capabilities dropped",
+            Clause::NoNewPrivileges => "§14.4 no-new-privileges",
+            Clause::SeccompDefaultDeny => "§14.4 default-deny seccomp profile",
+            Clause::CpuLimit => "§14.4 CPU limit",
+            Clause::MemoryLimit => "§14.4 memory limit",
+            Clause::PidLimit => "§14.4 PID limit",
+            Clause::DiskLimit => "§14.4 disk limit",
+            Clause::WallClockTimeout => "§14.4 wall-clock timeout",
+            Clause::OutputCap => "§14.4 captured output cap",
+        }
+    }
+
+    /// Whether [`BackendCapabilities::admits_untrusted`] refuses when this clause is unmet.
+    ///
+    /// # The rule, and why it is this one
+    ///
+    /// A clause is **required** if the harm it prevents lands *outside* the sandbox — on the
+    /// platform, on the host, or on another tenant. A clause is **waivable** if the harm it prevents
+    /// lands *inside* the sandbox, because the required clauses already say what that sandbox is: a
+    /// kernel-isolated box, with no network, destroyed when the job ends. A job that defeats a
+    /// waivable clause has won control of a box that shares nothing and does not outlive it.
+    ///
+    /// That rule is what keeps this gate **passable**. Requiring all eighteen would refuse a
+    /// correct Firecracker backend on a host whose kernel has no seccomp, or one whose guest disk is
+    /// a fixed-size block device rather than a quota'd filesystem — and a gate no correct backend can
+    /// pass is a gate that gets deleted the first time it blocks a deploy. Requiring only the clauses
+    /// whose absence is a real escape keeps the refusal credible.
+    ///
+    /// Each waiver below names the required clause that contains it. If any of those were ever
+    /// downgraded to waivable, every waiver resting on it would have to be revisited — which is why
+    /// the reasons are written here rather than in a design document.
+    pub fn required_for_untrusted(self) -> bool {
+        match self {
+            // ── Required: the boundary itself ────────────────────────────────────────────────
+            //
+            // §14.1. Without a kernel/hardware boundary there is no isolation to reason about and
+            // every waiver below loses its justification. This is the load-bearing clause.
+            Clause::KernelIsolation => true,
+            // §14.1. Cross-job survival is the one harm no boundary contains: job A plants, the
+            // sandbox is reused, and job B — another tenant — runs on it. The harm is *between*
+            // sandboxes, so no property of one sandbox prevents it.
+            Clause::SingleUse => true,
+
+            // ── Required: the platform's own secrets, which live outside the box ─────────────
+            //
+            // §14.2. An inherited environment hands the job the CI shared secret and the host's
+            // cloud keys. Isolation does not help against a credential we put inside the box
+            // ourselves.
+            Clause::EnvAllowlist => true,
+            // §14.2 names this one by name. The instance-role credential lives on the host's
+            // metadata service, outside the sandbox, and the sandbox reaches it over a network path
+            // that looks entirely legitimate from inside the guest.
+            Clause::MetadataBlackhole => true,
+
+            // ── Required: the network, which is how anything leaves ─────────────────────────
+            //
+            // §14.3. Exfiltration is the whole point of attacking a CI runner, and the destination
+            // is by definition outside the boundary. A microVM with the open internet in it is a
+            // very well-isolated place to stage data from.
+            Clause::EgressDeny => true,
+            // §14.3. Inbound is how one tenant's job reaches another's — a channel between two
+            // sandboxes, which is exactly what the kernel boundary is not able to close on its own.
+            Clause::NoInbound => true,
+
+            // ── Required: the two resources whose exhaustion is an outage for other tenants ──
+            //
+            // §14.4. Uncapped CPU and memory are not confined by isolation: a microVM with no
+            // memory ceiling still takes the *host's* memory, and the tenants co-resident on that
+            // node are the ones who pay. D§1 lists noisy-neighbour as a cross-tenant channel for
+            // this reason.
+            Clause::CpuLimit => true,
+            Clause::MemoryLimit => true,
+
+            // ── Required: the two controls that protect the runner from the job's output ────
+            //
+            // §14.4 ties the wall clock to reporting `errored`, but its first job is simpler: a
+            // sandbox with no clock holds a node slot forever, which is a denial of service against
+            // every other tenant in the queue. Nothing inside the box bounds it.
+            Clause::WallClockTimeout => true,
+            // §14.4 says why in the spec's own words: "Cap captured output so a job can't OOM the
+            // runner by flooding logs." The buffer being flooded is the *node's*, on the far side of
+            // the boundary, so the guest's own memory ceiling does not bound it.
+            Clause::OutputCap => true,
+
+            // ── Waivable: hardening *inside* a box that is already isolated, empty and doomed ──
+            //
+            // All six of these limit what a job can do to its own sandbox. Under the required
+            // `KernelIsolation` + `SingleUse` + `EgressDeny` set, a job that wins all six has: root
+            // in a guest kernel that is not the host's, a rootfs that is destroyed when the job
+            // ends, and nowhere to send anything. They are defence in depth against a guest escape,
+            // and they remain worth having — `unmet_for_untrusted` never hides them, and
+            // `fully_conforming` still demands them — but their absence is not itself an escape.
+            //
+            // This is the concrete case the audit raised: a correct Firecracker backend on a host
+            // without seccomp. It is admitted, and the missing profile is still reported.
+            Clause::NonRoot => false,
+            Clause::ReadOnlyRootfs => false,
+            Clause::TmpfsScratch => false,
+            Clause::CapsDropped => false,
+            Clause::NoNewPrivileges => false,
+            Clause::SeccompDefaultDeny => false,
+
+            // §14.4 PID limit. A fork bomb exhausts the *guest's* process table; the host's is
+            // behind the kernel boundary. Under a shared kernel this would be required — but a
+            // shared kernel already fails `KernelIsolation` and never reaches this question.
+            Clause::PidLimit => false,
+            // §14.4 disk limit. Same shape: a microVM's writable storage is a fixed-size virtio-blk
+            // device plus a guest tmpfs sized at boot (D§7.2), so "fill the disk" fills a device
+            // whose size the host chose. The host filesystem is not mounted into the guest at all.
+            // Note this is also the clause the M1 container backend has never claimed, and that
+            // backend is refused on `KernelIsolation` long before this matters.
+            Clause::DiskLimit => false,
+        }
+    }
 }
 
 impl BackendCapabilities {
+    /// Whether this backend enforces one named clause.
+    ///
+    /// The single point where a [`Clause`] meets a field, so the enum and the struct cannot drift:
+    /// a new clause has no arm here until somebody writes one.
+    pub fn enforces(self, clause: Clause) -> bool {
+        match clause {
+            Clause::SingleUse => self.single_use,
+            Clause::KernelIsolation => self.cross_tenant_safe,
+            Clause::EnvAllowlist => self.env_allowlist,
+            Clause::MetadataBlackhole => self.metadata_blackhole,
+            Clause::EgressDeny => self.egress_deny,
+            Clause::NoInbound => self.no_inbound,
+            Clause::NonRoot => self.non_root,
+            Clause::ReadOnlyRootfs => self.read_only_rootfs,
+            Clause::TmpfsScratch => self.tmpfs_scratch,
+            Clause::CapsDropped => self.caps_dropped,
+            Clause::NoNewPrivileges => self.no_new_privileges,
+            Clause::SeccompDefaultDeny => self.seccomp_default_deny,
+            Clause::CpuLimit => self.cpu_limit,
+            Clause::MemoryLimit => self.memory_limit,
+            Clause::PidLimit => self.pid_limit,
+            Clause::DiskLimit => self.disk_limit,
+            Clause::WallClockTimeout => self.wall_clock_timeout,
+            Clause::OutputCap => self.output_cap,
+        }
+    }
+
+    /// Every §14 clause this backend does **not** enforce, waivable or not.
+    ///
+    /// The operator-facing list. It never shrinks because a clause is waivable — a waiver changes
+    /// whether the scheduler refuses, not whether the gap is reported.
+    pub fn unmet_clauses(self) -> Vec<&'static str> {
+        Clause::ALL
+            .iter()
+            .filter(|c| !self.enforces(**c))
+            .map(|c| c.description())
+            .collect()
+    }
+
+    /// The unmet clauses that are the *reason* [`admits_untrusted`](Self::admits_untrusted) is false.
+    ///
+    /// Attached to the node's refusal so an operator reads "this is what would have to change",
+    /// rather than the full gap list with the actionable entries buried in it.
+    pub fn unmet_for_untrusted(self) -> Vec<&'static str> {
+        Clause::ALL
+            .iter()
+            .filter(|c| c.required_for_untrusted() && !self.enforces(**c))
+            .map(|c| c.description())
+            .collect()
+    }
+
+    /// Whether every §14 clause is enforced — the strict answer, waivers and all.
+    ///
+    /// Kept distinct from [`admits_untrusted`](Self::admits_untrusted) on purpose: this is what a
+    /// backend aims at, that is what the scheduler gates on, and conflating them is what turns a
+    /// gate into something nobody can pass.
+    pub fn fully_conforming(self) -> bool {
+        Clause::ALL.iter().all(|c| self.enforces(*c))
+    }
+
     /// Whether this backend may run work from an untrusted author on a shared fleet.
     ///
-    /// The M1 container scaffold answers `false`, which is exactly why M1 is single-tenant.
+    /// **What this guarantees, in one sentence:** a backend answers `true` only when it reports a
+    /// kernel/hardware boundary, a sandbox destroyed after a single job, an allowlisted environment,
+    /// no egress, no route to the cloud metadata endpoint, no inbound from another sandbox, CPU and
+    /// memory ceilings, a wall clock, and an output cap — i.e. every §14 clause whose absence would
+    /// let a hostile job reach past its own sandbox — while tolerating a missing *in-sandbox*
+    /// hardening clause (non-root, read-only rootfs, tmpfs scratch, dropped capabilities,
+    /// no-new-privileges, seccomp, PID and disk ceilings) only because winning those still leaves
+    /// the job inside a networkless box that is destroyed when it ends.
+    ///
+    /// See [`Clause::required_for_untrusted`] for the per-clause reasoning. The M1 container
+    /// scaffold answers `false` on `cross_tenant_safe` alone, which is exactly why M1 is
+    /// single-tenant.
     pub fn admits_untrusted(self) -> bool {
-        self.egress_deny && self.metadata_blackhole && self.single_use && self.cross_tenant_safe
+        self.unmet_for_untrusted().is_empty()
     }
 }
 
@@ -585,22 +890,163 @@ mod tests {
         assert!(!AuthorClass::Outsider.may_receive_secrets());
     }
 
+    /// A backend that enforces every §14 clause. The only starting point a gate test may use:
+    /// building the "good" case field by field is how a test ends up asserting about four booleans.
+    fn fully_conforming_backend() -> BackendCapabilities {
+        let mut caps = BackendCapabilities::default();
+        for clause in Clause::ALL {
+            caps = caps.with(clause, true);
+        }
+        assert!(caps.fully_conforming());
+        caps
+    }
+
+    impl BackendCapabilities {
+        /// Test-only setter, exhaustive so it cannot drift from `enforces`.
+        fn with(mut self, clause: Clause, on: bool) -> BackendCapabilities {
+            match clause {
+                Clause::SingleUse => self.single_use = on,
+                Clause::KernelIsolation => self.cross_tenant_safe = on,
+                Clause::EnvAllowlist => self.env_allowlist = on,
+                Clause::MetadataBlackhole => self.metadata_blackhole = on,
+                Clause::EgressDeny => self.egress_deny = on,
+                Clause::NoInbound => self.no_inbound = on,
+                Clause::NonRoot => self.non_root = on,
+                Clause::ReadOnlyRootfs => self.read_only_rootfs = on,
+                Clause::TmpfsScratch => self.tmpfs_scratch = on,
+                Clause::CapsDropped => self.caps_dropped = on,
+                Clause::NoNewPrivileges => self.no_new_privileges = on,
+                Clause::SeccompDefaultDeny => self.seccomp_default_deny = on,
+                Clause::CpuLimit => self.cpu_limit = on,
+                Clause::MemoryLimit => self.memory_limit = on,
+                Clause::PidLimit => self.pid_limit = on,
+                Clause::DiskLimit => self.disk_limit = on,
+                Clause::WallClockTimeout => self.wall_clock_timeout = on,
+                Clause::OutputCap => self.output_cap = on,
+            }
+            self
+        }
+    }
+
     #[test]
     fn m1_container_backend_does_not_admit_untrusted_work() {
-        let m1 = BackendCapabilities {
-            egress_deny: false,
-            metadata_blackhole: false,
-            single_use: true,
-            cross_tenant_safe: false,
-        };
+        // The M1 shape: every hardening flag a locked-down container can set, and the one it never
+        // can. It must not admit untrusted work, and the reason it does not must be the boundary.
+        let m1 = fully_conforming_backend()
+            .with(Clause::KernelIsolation, false)
+            .with(Clause::DiskLimit, false);
         assert!(!m1.admits_untrusted(), "M1 is single-tenant by construction, not by convention");
+        assert_eq!(
+            m1.unmet_for_untrusted(),
+            vec!["§14.1 kernel/hardware isolation (microVM-class boundary)"],
+            "and the shared kernel is the whole reason — the disk quota is waivable"
+        );
 
-        let fleet = BackendCapabilities {
-            egress_deny: true,
-            metadata_blackhole: true,
-            single_use: true,
-            cross_tenant_safe: true,
-        };
-        assert!(fleet.admits_untrusted());
+        assert!(fully_conforming_backend().admits_untrusted());
+    }
+
+    #[test]
+    fn the_gate_reads_every_clause_and_names_the_side_each_one_is_on() {
+        // The audit finding, as a test. The old gate read four of eighteen clauses, so a backend
+        // that had a microVM boundary and nothing else answered `true`. Turning each clause off on
+        // its own is the only way to show which ones the gate can actually see.
+        let mut required = Vec::new();
+        let mut waived = Vec::new();
+        for clause in Clause::ALL {
+            let caps = fully_conforming_backend().with(clause, false);
+            assert!(!caps.fully_conforming(), "{clause:?}: a missing clause is always a gap");
+            assert!(
+                caps.unmet_clauses().contains(&clause.description()),
+                "{clause:?}: a waiver must never hide the gap from an operator"
+            );
+            if caps.admits_untrusted() { waived.push(clause) } else { required.push(clause) }
+            assert_eq!(
+                clause.required_for_untrusted(),
+                !caps.admits_untrusted(),
+                "{clause:?}: the gate must follow `required_for_untrusted` and nothing else"
+            );
+        }
+        // Written out rather than counted, because the point of this test is that a future edit to
+        // `required_for_untrusted` has to come here and say so.
+        assert_eq!(
+            required,
+            vec![
+                Clause::SingleUse,
+                Clause::KernelIsolation,
+                Clause::EnvAllowlist,
+                Clause::MetadataBlackhole,
+                Clause::EgressDeny,
+                Clause::NoInbound,
+                Clause::CpuLimit,
+                Clause::MemoryLimit,
+                Clause::WallClockTimeout,
+                Clause::OutputCap,
+            ],
+            "every clause whose harm lands outside the sandbox"
+        );
+        assert_eq!(
+            waived,
+            vec![
+                Clause::NonRoot,
+                Clause::ReadOnlyRootfs,
+                Clause::TmpfsScratch,
+                Clause::CapsDropped,
+                Clause::NoNewPrivileges,
+                Clause::SeccompDefaultDeny,
+                Clause::PidLimit,
+                Clause::DiskLimit,
+            ],
+            "every clause whose harm lands inside a box that is isolated, networkless and doomed"
+        );
+    }
+
+    #[test]
+    fn the_backend_the_old_gate_would_have_admitted_is_now_refused() {
+        // The audit's exact counter-example: "a future kernel-isolated backend with no seccomp, no
+        // memory limit and no output cap would answer `true`". Two of those three are required, so
+        // it is refused — and the seccomp gap, which is waivable, is still reported.
+        let caps = fully_conforming_backend()
+            .with(Clause::SeccompDefaultDeny, false)
+            .with(Clause::MemoryLimit, false)
+            .with(Clause::OutputCap, false);
+        // What the four-boolean gate saw, unchanged and still all true:
+        assert!(caps.egress_deny && caps.metadata_blackhole && caps.single_use && caps.cross_tenant_safe);
+        assert!(!caps.admits_untrusted(), "…and it is no longer enough");
+        assert_eq!(
+            caps.unmet_for_untrusted(),
+            vec!["§14.4 memory limit", "§14.4 captured output cap"]
+        );
+        assert!(caps.unmet_clauses().contains(&"§14.4 default-deny seccomp profile"));
+
+        // The gate stays passable for the backend this design is actually for: a correct microVM on
+        // a host whose kernel offers no seccomp filtering.
+        let firecracker_without_seccomp =
+            fully_conforming_backend().with(Clause::SeccompDefaultDeny, false);
+        assert!(
+            firecracker_without_seccomp.admits_untrusted(),
+            "a gate no correct backend can pass is a gate that gets deleted"
+        );
+        assert!(!firecracker_without_seccomp.fully_conforming(), "…but it is still not conforming");
+    }
+
+    #[test]
+    fn a_capability_field_a_peer_omits_reads_as_not_enforced() {
+        // Why every field states what *is* enforced rather than what is missing: a truncated or
+        // older payload must understate a backend, never flatter it.
+        let empty: BackendCapabilities = serde_json::from_str("{}").expect("all fields default");
+        assert_eq!(empty, BackendCapabilities::default());
+        assert!(!empty.admits_untrusted());
+        assert_eq!(empty.unmet_clauses().len(), Clause::ALL.len());
+
+        // A payload carrying only the four booleans the wire used to have — which is exactly what a
+        // node built before this change would send — still cannot answer `true`.
+        let old_wire: BackendCapabilities = serde_json::from_str(
+            r#"{"egress_deny":true,"metadata_blackhole":true,"single_use":true,"cross_tenant_safe":true}"#,
+        )
+        .expect("the old four fields still parse");
+        assert!(
+            !old_wire.admits_untrusted(),
+            "an old node cannot be admitted on the strength of the fields it happens to send"
+        );
     }
 }

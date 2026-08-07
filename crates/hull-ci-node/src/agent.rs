@@ -264,9 +264,13 @@ impl NodeAgent {
         }
         if a.author_class == AuthorClass::Outsider && !self.backend.capabilities().admits_untrusted() {
             return Err(format!(
-                "backend `{}` cannot admit untrusted work; unmet: {}",
+                // The clauses that are the *reason*, not the full gap list. A refusal that recites
+                // every unmet clause buries the actionable ones among the waivable ones, and an
+                // operator reading it at 3am has to know which of §14's eighteen clauses is the one
+                // standing between them and a running job.
+                "backend `{}` cannot admit untrusted work; blocking: {}",
                 self.backend.name(),
-                self.backend.controls().unmet_clauses().join("; ")
+                self.backend.capabilities().unmet_for_untrusted().join("; ")
             ));
         }
         Ok(())

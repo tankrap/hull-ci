@@ -289,7 +289,19 @@ async fn choose_backend(
             // The one place the sandbox's network posture is chosen. `detect_backend` runs the live
             // posture probe for a proxy network and derives `egress_deny` from what it found, so a
             // misconfigured network costs a capability rather than a job's isolation (§14.3).
-            Ok(hull_ci_node::detect_backend(ContainerConfig { network, ..ContainerConfig::default() }).await?)
+            //
+            // `runner_id` comes from the node id for the reason `ContainerConfig::runner_id`
+            // documents: the orphan reaper must recognise this runner's own containers across a
+            // restart and never another runner's, and `node_id` is the identity the scheduler's
+            // roster already requires to be unique per node (D§5.1). Deriving it from anything
+            // process-local — a pid, a boot nonce — would leave the reaper unable to find the
+            // containers it exists to remove.
+            Ok(hull_ci_node::detect_backend(ContainerConfig {
+                network,
+                runner_id: config.node_id.clone(),
+                ..ContainerConfig::default()
+            })
+            .await?)
         }
         SandboxChoice::LocalProcess if !config.allow_unsandboxed => {
             Err(StartupError::UnsandboxedNotPermitted)
@@ -306,9 +318,14 @@ async fn choose_backend(
 /// operator should learn what their runner cannot contain when they start it, not from a refused job
 /// at 3am — and least of all from an incident.
 fn announce_isolation(config: &Config, backend: &dyn SandboxBackend) {
-    let controls = backend.controls();
-    let unmet = controls.unmet_clauses();
-    let admits = backend.capabilities().admits_untrusted();
+    let caps = backend.capabilities();
+    let unmet = caps.unmet_clauses();
+    // Three different questions, reported as three, because collapsing them is how an operator ends
+    // up believing a backend enforces §14 in full when it merely enforces enough to be trusted with
+    // untrusted work. `admits_untrusted()` waives the in-sandbox hardening clauses on purpose (see
+    // `hull_ci_proto::Clause::required_for_untrusted`); `fully_conforming()` waives nothing.
+    let admits = caps.admits_untrusted();
+    let conforming = caps.fully_conforming();
 
     tracing::info!(
         backend = backend.name(),
@@ -317,16 +334,25 @@ fn announce_isolation(config: &Config, backend: &dyn SandboxBackend) {
         "sandbox backend selected"
     );
 
-    if admits {
-        tracing::info!(backend = backend.name(), "backend enforces every §14 clause");
-    } else {
-        tracing::warn!(
+    match (conforming, admits) {
+        (true, _) => tracing::info!(backend = backend.name(), "backend enforces every §14 clause"),
+        // The case the gate exists to allow: a real boundary with a gap that is defence in depth
+        // rather than an escape. Worth a warning — it is still a gap — but not a refusal.
+        (false, true) => tracing::warn!(
             backend = backend.name(),
             unmet = ?unmet,
-            "SPEC §14 NOT FULLY ENFORCED — this runner refuses work from untrusted authors. \
-             Design D§13: M1 is single-tenant, trusted-input only and MUST NOT take untrusted or \
-             multi-tenant input."
-        );
+            "SPEC §14 NOT FULLY ENFORCED, but every clause required to admit untrusted work is: \
+             the gaps above are in-sandbox hardening, contained by the kernel boundary, the \
+             single-use rootfs and egress-deny that this backend does enforce."
+        ),
+        (false, false) => tracing::warn!(
+            backend = backend.name(),
+            unmet = ?unmet,
+            blocking = ?caps.unmet_for_untrusted(),
+            "SPEC §14 NOT FULLY ENFORCED — this runner refuses work from untrusted authors. The \
+             `blocking` clauses are the ones that would have to change. Design D§13: M1 is \
+             single-tenant, trusted-input only and MUST NOT take untrusted or multi-tenant input."
+        ),
     }
 
     if config.sandbox == SandboxChoice::LocalProcess {

@@ -1,11 +1,15 @@
 //! What a backend actually enforces, clause by clause.
 //!
-//! `BackendCapabilities` (in `hull-ci-proto`) is the *wire* answer — four booleans the scheduler acts
-//! on. [`EnforcedControls`] is the node-local long form: one flag per §14 requirement, so that the
-//! wire answer is **derived** from enforcement facts instead of asserted by hand. That derivation is
-//! the whole point. Design D§7.2: "A backend that cannot enforce §14.3 egress-deny reports so, and the
-//! scheduler refuses to place untrusted work on it — the conformance gap is a property the code knows
-//! about, not a comment in a doc."
+//! [`EnforcedControls`] is where the §14 answer is **measured**: one flag per requirement, each set
+//! from a live probe of this host plus this configuration. `BackendCapabilities` (in `hull-ci-proto`)
+//! is where the same answer is **claimed** — the value that crosses to the scheduler, which believes
+//! it. The two are separate types because only one of them crosses a trust boundary; they carry the
+//! same eighteen clauses because a claim that carries fewer clauses than the gate needs is how the
+//! gate ends up reading four of them. See `BackendCapabilities::admits_untrusted`.
+//!
+//! Design D§7.2: "A backend that cannot enforce §14.3 egress-deny reports so, and the scheduler
+//! refuses to place untrusted work on it — the conformance gap is a property the code knows about,
+//! not a comment in a doc."
 //!
 //! The rule for every field here: **set it `true` only if this process, on this host, with this
 //! configuration, actually causes the control to be applied.** A flag that is optimistic about the
@@ -74,18 +78,34 @@ impl EnforcedControls {
         output_cap: false,
     };
 
-    /// The wire form the scheduler consumes.
+    /// The wire form the scheduler consumes — **every clause, not a summary**.
     ///
-    /// `cross_tenant_safe` is deliberately tied to [`kernel_isolation`](Self::kernel_isolation) and
-    /// nothing else: co-residency of two tenants is a question about the kernel boundary, and a
-    /// container that has every other flag set is still a shared kernel (§14.1, D§7.2). This is why
-    /// the M1 container backend can never report `admits_untrusted()`.
+    /// Written out field by field with no `..` fallback, so a clause added to either type is a
+    /// compile error here rather than a silent `false` on the wire. The mapping is one-to-one except
+    /// for the name: `cross_tenant_safe` *is* [`kernel_isolation`](Self::kernel_isolation), because
+    /// co-residency of two tenants is a question about the kernel boundary and nothing else — a
+    /// container with every other flag set is still a shared kernel (§14.1, D§7.2). That is why the
+    /// M1 container backend can never report `admits_untrusted()`.
     pub fn to_capabilities(self) -> BackendCapabilities {
         BackendCapabilities {
-            egress_deny: self.egress_deny,
-            metadata_blackhole: self.metadata_blackhole,
             single_use: self.single_use,
             cross_tenant_safe: self.kernel_isolation,
+            env_allowlist: self.env_allowlist,
+            metadata_blackhole: self.metadata_blackhole,
+            egress_deny: self.egress_deny,
+            no_inbound: self.no_inbound,
+            non_root: self.non_root,
+            read_only_rootfs: self.read_only_rootfs,
+            tmpfs_scratch: self.tmpfs_scratch,
+            caps_dropped: self.caps_dropped,
+            no_new_privileges: self.no_new_privileges,
+            seccomp_default_deny: self.seccomp_default_deny,
+            cpu_limit: self.cpu_limit,
+            memory_limit: self.memory_limit,
+            pid_limit: self.pid_limit,
+            disk_limit: self.disk_limit,
+            wall_clock_timeout: self.wall_clock_timeout,
+            output_cap: self.output_cap,
         }
     }
 
@@ -93,34 +113,20 @@ impl EnforcedControls {
     ///
     /// Logged once at node start and attached to refusals, so an operator never has to diff a struct
     /// against the spec by eye to learn what this node is not allowed to be given.
+    ///
+    /// Delegates to the wire type rather than keeping a second list: two copies of §14 in one
+    /// workspace is two copies that can disagree about what the spec says.
     pub fn unmet_clauses(self) -> Vec<&'static str> {
-        let checks: [(bool, &'static str); 18] = [
-            (self.single_use, "§14.1 single-use sandbox, destroyed after each job"),
-            (self.kernel_isolation, "§14.1 kernel/hardware isolation (microVM-class boundary)"),
-            (self.env_allowlist, "§14.2 environment scrubbed to an allowlist"),
-            (self.metadata_blackhole, "§14.2 cloud metadata endpoint blocked"),
-            (self.egress_deny, "§14.3 default egress-deny"),
-            (self.no_inbound, "§14.3 no inbound network to the sandbox"),
-            (self.non_root, "§14.4 non-root user"),
-            (self.read_only_rootfs, "§14.4 read-only root filesystem"),
-            (self.tmpfs_scratch, "§14.4 writable tmpfs scratch that dies with the job"),
-            (self.caps_dropped, "§14.4 all capabilities dropped"),
-            (self.no_new_privileges, "§14.4 no-new-privileges"),
-            (self.seccomp_default_deny, "§14.4 default-deny seccomp profile"),
-            (self.cpu_limit, "§14.4 CPU limit"),
-            (self.memory_limit, "§14.4 memory limit"),
-            (self.pid_limit, "§14.4 PID limit"),
-            (self.disk_limit, "§14.4 disk limit"),
-            (self.wall_clock_timeout, "§14.4 wall-clock timeout"),
-            (self.output_cap, "§14.4 captured output cap"),
-        ];
-        checks.iter().filter(|(ok, _)| !ok).map(|(_, name)| *name).collect()
+        self.to_capabilities().unmet_clauses()
     }
 
     /// Whether every §14 clause is enforced. Nothing in M1 answers `true`; it exists so the M3
     /// Firecracker backend has an assertion to aim at rather than a prose target.
+    ///
+    /// Strictly stronger than `admits_untrusted()`, and deliberately not the same question — see
+    /// `hull_ci_proto::Clause::required_for_untrusted`.
     pub fn fully_conforming(self) -> bool {
-        self.unmet_clauses().is_empty()
+        self.to_capabilities().fully_conforming()
     }
 }
 
@@ -173,5 +179,48 @@ mod tests {
     fn unmet_clauses_name_what_is_missing() {
         let c = EnforcedControls { egress_deny: false, ..EnforcedControls::NONE };
         assert!(c.unmet_clauses().iter().any(|s| s.contains("§14.3 default egress-deny")));
+    }
+
+    /// Every field, as an `EnforcedControls` with only that one turned on.
+    fn one_control_at_a_time() -> Vec<(&'static str, EnforcedControls)> {
+        let n = EnforcedControls::NONE;
+        vec![
+            ("single_use", EnforcedControls { single_use: true, ..n }),
+            ("kernel_isolation", EnforcedControls { kernel_isolation: true, ..n }),
+            ("env_allowlist", EnforcedControls { env_allowlist: true, ..n }),
+            ("metadata_blackhole", EnforcedControls { metadata_blackhole: true, ..n }),
+            ("egress_deny", EnforcedControls { egress_deny: true, ..n }),
+            ("no_inbound", EnforcedControls { no_inbound: true, ..n }),
+            ("non_root", EnforcedControls { non_root: true, ..n }),
+            ("read_only_rootfs", EnforcedControls { read_only_rootfs: true, ..n }),
+            ("tmpfs_scratch", EnforcedControls { tmpfs_scratch: true, ..n }),
+            ("caps_dropped", EnforcedControls { caps_dropped: true, ..n }),
+            ("no_new_privileges", EnforcedControls { no_new_privileges: true, ..n }),
+            ("seccomp_default_deny", EnforcedControls { seccomp_default_deny: true, ..n }),
+            ("cpu_limit", EnforcedControls { cpu_limit: true, ..n }),
+            ("memory_limit", EnforcedControls { memory_limit: true, ..n }),
+            ("pid_limit", EnforcedControls { pid_limit: true, ..n }),
+            ("disk_limit", EnforcedControls { disk_limit: true, ..n }),
+            ("wall_clock_timeout", EnforcedControls { wall_clock_timeout: true, ..n }),
+            ("output_cap", EnforcedControls { output_cap: true, ..n }),
+        ]
+    }
+
+    #[test]
+    fn nothing_measured_here_is_dropped_on_the_way_to_the_wire() {
+        // What went wrong before: the wire form carried four of the eighteen clauses, so
+        // `admits_untrusted()` could only ever weigh four of them however carefully this struct was
+        // filled in. The projection is now total, and this is what keeps it total — a field added to
+        // `EnforcedControls` and forgotten in `to_capabilities` turns exactly one clause into a
+        // permanent `false`, which no compiler error would catch.
+        assert_eq!(one_control_at_a_time().len(), hull_ci_proto::Clause::ALL.len());
+        for (name, controls) in one_control_at_a_time() {
+            let missing = controls.unmet_clauses();
+            assert_eq!(
+                missing.len(),
+                hull_ci_proto::Clause::ALL.len() - 1,
+                "`{name}` did not reach the wire: {missing:?}"
+            );
+        }
     }
 }

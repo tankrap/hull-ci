@@ -20,6 +20,23 @@
 //! [`ContainerBackend::detect`] refuses to construct — a backend that cannot run a container must not
 //! advertise one.
 //!
+//! # Why there is a reaper
+//!
+//! §14.1's single-use rule is a statement about what is left behind, and this backend's teardown
+//! runs in a future: `destroy()` is an `async fn` the node awaits after a job. Every way that future
+//! fails to run — the node is `SIGKILL`ed, the host loses power, the `run_assignment` future is
+//! dropped on a cancelled lease — leaves a container the daemon is perfectly happy to keep running,
+//! with the job's workspace still bind-mounted, past whatever wall clock §14.4 was enforcing. An
+//! audit demonstrated it directly: killing the attaching CLI leaves the container `Up`, because the
+//! CLI is not the container's parent — the daemon is.
+//!
+//! Nothing in a destructor can close that, because the case that matters most is the one where no
+//! destructor runs at all. So the guarantee is placed where it can actually hold: [`reap_orphans`]
+//! runs at node start, before this backend has created anything, and removes every container
+//! carrying **this runner's** label. See [`ContainerConfig::runner_id`] for what makes that "this
+//! runner's" and not "everybody's". [`ContainerInstance`]'s `Drop` is a best-effort second line,
+//! documented at the impl.
+//!
 //! Two flags are `false` on **every** host, by construction rather than by detection:
 //!
 //! - `kernel_isolation` (→ `cross_tenant_safe`): a container shares the host kernel. That is the whole
@@ -252,6 +269,25 @@ impl NetworkPosture {
     }
 }
 
+/// The label key every container this backend creates carries, and the only thing [`reap_orphans`]
+/// matches on.
+pub const RUNNER_LABEL: &str = "hull-ci.runner";
+
+/// The runner identity a [`ContainerConfig`] carries when nobody sets one.
+///
+/// Deliberately a **fixed** string rather than something process-unique. The reaper's entire job is
+/// to find containers left behind by a *previous incarnation of this runner*, and an id that changed
+/// on every boot could never match one — a per-process default would compile, run, reap nothing, and
+/// look exactly like a working feature.
+///
+/// The price of a fixed default is the collision case, and it is worth stating plainly: two node
+/// agents sharing one daemon and both left at this default would reap each other's **live**
+/// containers at start. So the composition root sets [`ContainerConfig::runner_id`] from
+/// `NodeConfig::node_id`, which the scheduler's node roster already requires to be unique across the
+/// fleet (D§5.1), and [`ContainerBackend::detect`] says so out loud when it finds the default still
+/// in place.
+pub const DEFAULT_RUNNER_ID: &str = "hull-ci-node-0";
+
 /// Configuration for the container backend.
 #[derive(Debug, Clone)]
 pub struct ContainerConfig {
@@ -265,6 +301,20 @@ pub struct ContainerConfig {
     pub seccomp_profile: Option<PathBuf>,
     /// How long a `create`/`rm` control command may take before we give up on the daemon.
     pub control_timeout: Duration,
+    /// **Stable identity of this runner**, stamped on every container as `hull-ci.runner=<id>`.
+    ///
+    /// Two requirements pull in opposite directions and both have to hold, which is why this is
+    /// configuration rather than something derived:
+    ///
+    /// * **Stable across restarts**, or [`reap_orphans`] cannot recognise the containers this
+    ///   runner's previous incarnation left behind — which is the only thing it exists to do.
+    /// * **Unique across runners sharing a daemon**, or one node's start reaps another node's
+    ///   in-flight jobs. Several nodes on one daemon is a normal development and CI topology, so the
+    ///   reaper never removes a container that does not carry *this* id — never by name prefix,
+    ///   never by the `hull-ci.job` label, never "everything that looks like ours".
+    ///
+    /// Defaults to [`DEFAULT_RUNNER_ID`].
+    pub runner_id: String,
 }
 
 impl Default for ContainerConfig {
@@ -275,8 +325,103 @@ impl Default for ContainerConfig {
             user: "65534:65534".into(),
             seccomp_profile: None,
             control_timeout: Duration::from_secs(60),
+            runner_id: DEFAULT_RUNNER_ID.into(),
         }
     }
+}
+
+impl ContainerConfig {
+    /// The `--label` / `--filter` value that ties a container to this runner.
+    ///
+    /// One function for both the writing side ([`create_argv`]) and the reading side
+    /// ([`reap_orphans`]), because a reaper whose filter does not exactly match the label the
+    /// creator wrote is a reaper that silently removes nothing — and "silently removes nothing" is
+    /// indistinguishable from "there was nothing to remove".
+    pub fn runner_label(&self) -> String {
+        format!("{RUNNER_LABEL}={}", sanitize_name(&self.runner_id))
+    }
+}
+
+/// What one [`reap_orphans`] pass did.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Reaped {
+    /// Container ids removed.
+    pub removed: Vec<String>,
+    /// Containers found but not removable, and why. Reported rather than swallowed: an orphan that
+    /// could not be removed is still an orphan, and the operator is the only one who can act on it.
+    pub failures: Vec<String>,
+}
+
+/// Remove every container carrying this runner's label. Runs at node start (§14.1).
+///
+/// This is the teardown for the cases no teardown code can reach: a node killed with `SIGKILL`, a
+/// host that lost power, a `create` whose CLI was killed while the daemon went on creating the
+/// container. In every one of those the daemon still holds a container with the job's workspace
+/// bind-mounted and its wall clock long expired — under `--network none` an unreachable one, but
+/// under a proxy network with inter-container communication left on, a **peer another job can open a
+/// connection to** (see [`NetworkPosture::peer_unreachable`]).
+///
+/// # Why it is safe with several nodes on one daemon
+///
+/// The filter is `label=hull-ci.runner=<this runner's id>` and nothing else — an exact key/value
+/// match, verified against docker 28.0.4 (a filter value that is a *prefix* of a container's label
+/// matches nothing). A runner therefore cannot see, let alone remove, a container another runner
+/// created, whatever its name, image or job label. The contract that makes that true is on
+/// [`ContainerConfig::runner_id`]: distinct ids for distinct runners.
+///
+/// # Why it runs before anything else
+///
+/// [`ContainerBackend::detect`] calls this **before** [`probe_network_posture`], because the posture
+/// probe starts a peer container carrying this same label. Reaping afterwards would remove the peer
+/// the probe is currently measuring against, and the probe would conclude that inter-container
+/// communication is off when nobody had asked the question.
+pub async fn reap_orphans(config: &ContainerConfig) -> Result<Reaped, SandboxError> {
+    let label = config.runner_label();
+    let list = vec![
+        config.runtime.clone(),
+        "ps".into(),
+        "--all".into(),
+        "--quiet".into(),
+        "--filter".into(),
+        format!("label={label}"),
+    ];
+    let (status, out) = control_command(config, list, &[]).await?;
+    if status != ExecStatus::Exited(0) {
+        return Err(SandboxError::Runtime(format!(
+            "could not list containers for reaping ({status:?}): {out}"
+        )));
+    }
+
+    let mut reaped = Reaped::default();
+    for id in out.lines().map(str::trim).filter(|l| !l.is_empty()) {
+        let rm = vec![
+            config.runtime.clone(),
+            "rm".into(),
+            "--force".into(),
+            "--volumes".into(),
+            id.to_string(),
+        ];
+        match control_command(config, rm, &[]).await {
+            Ok((ExecStatus::Exited(0), _)) => reaped.removed.push(id.to_string()),
+            Ok((status, out)) => reaped.failures.push(format!("{id}: rm exited {status:?}: {out}")),
+            Err(e) => reaped.failures.push(format!("{id}: {e}")),
+        }
+    }
+
+    if !reaped.removed.is_empty() {
+        // Warn, not info. Every entry here is a container that outlived the job it was created for,
+        // which means a node died holding one — the operator wants to know that happened even though
+        // we have now cleaned up after it.
+        tracing::warn!(
+            runner = %config.runner_id,
+            removed = ?reaped.removed,
+            "reaped orphaned job containers left by a previous incarnation of this runner (§14.1)"
+        );
+    }
+    for failure in &reaped.failures {
+        tracing::error!(runner = %config.runner_id, %failure, "could not reap an orphaned container");
+    }
+    Ok(reaped)
 }
 
 /// What the container runtime told us about itself.
@@ -492,6 +637,11 @@ pub async fn probe_network_posture(
         proxy.network.clone(),
         "--label".into(),
         "hull-ci.probe=peer".into(),
+        // Reapable (§14.1). A peer left behind by a probe that was interrupted is a live container
+        // on the sandbox network — the exact thing `peer_unreachable` exists to detect — so it has
+        // to carry the runner label like everything else this backend creates.
+        "--label".into(),
+        config.runner_label(),
         PROBE_IMAGE.to_string(),
         "nc".into(),
         "-l".into(),
@@ -532,6 +682,8 @@ pub async fn probe_network_posture(
         config.user.clone(),
         "--label".into(),
         "hull-ci.probe=posture".into(),
+        "--label".into(),
+        config.runner_label(),
     ];
     for (k, v) in &env {
         probe_argv.push("--env".into());
@@ -833,12 +985,41 @@ impl ContainerBackend {
     /// container on that network was actually able to reach. That probe costs a few seconds of
     /// container churn at startup, once — which is the correct price for not guessing about the one
     /// control that decides whether a job can talk to the internet.
+    ///
+    /// It also runs [`reap_orphans`] first, which is what makes §14.1's single-use rule survive a
+    /// node that died without tearing its sandbox down. Node start is the only moment at which "every
+    /// container carrying this runner's label is an orphan" is true by construction: this process has
+    /// not created one yet.
     pub async fn detect(config: ContainerConfig) -> Result<Self, SandboxError> {
         let probe = probe_docker(&config.runtime).await;
         if !probe.daemon_reachable {
             return Err(SandboxError::Unavailable(
                 probe.failure.unwrap_or_else(|| format!("`{}` daemon is not reachable", config.runtime)),
             ));
+        }
+        if config.runner_id == DEFAULT_RUNNER_ID {
+            // Not an error — a single-node host is the common case and the default is correct there.
+            // But the failure mode of two nodes sharing it is one node reaping the other's running
+            // jobs, and that is not something an operator should have to deduce from a requeue storm.
+            tracing::warn!(
+                runner = %config.runner_id,
+                "container backend is using the default runner id; if more than one node shares \
+                 this daemon, set a distinct one (HULL_CI_NODE_ID) or they will reap each other's \
+                 running containers at start"
+            );
+        }
+        // Before the posture probe, which starts a peer container carrying this same label.
+        if let Err(e) = reap_orphans(&config).await {
+            // A reap that could not run is not a reason to refuse the backend — it leaves us exactly
+            // where we were before there was a reaper, which is where every job ran until now. It is
+            // very much a reason to say so at `error`, because §14.1 is no longer being kept by
+            // anything but `destroy()`.
+            tracing::error!(
+                runner = %config.runner_id,
+                error = %e,
+                "could not reap orphaned containers at start; a previous incarnation's sandboxes may \
+                 still be running (§14.1)"
+            );
         }
         let mut config = config;
         if let NetworkMode::ProxyOnly(proxy) = &config.network {
@@ -985,7 +1166,22 @@ pub fn create_argv(
             a.push(name.to_string());
         }
 
-        // Labels let an operator find and reap orphans after a node crash without guessing names.
+        // §14.1 teardown, in the two places it can be made to hold without a live process.
+        //
+        // `--rm` sets `HostConfig.AutoRemove`, which is a **daemon-side** promise: when this
+        // container exits, the daemon removes it, whether or not anybody is still attached. That
+        // closes the narrower half of the orphan problem — a node killed while a job was finishing
+        // — and it closes it in the one place a dead node cannot. Verified against docker 28.0.4
+        // that it does not cost us the exit status: `create --rm` + `start --attach` on a container
+        // exiting 7 still returns 7, and the container is gone afterwards.
+        //
+        // It does **not** close the wider half: a container still running when the node dies never
+        // exits, so AutoRemove never fires. That one is `reap_orphans`'s, and the label below is
+        // what it matches on — the reason the label exists is no longer "so an operator can reap
+        // orphans" but "so this runner reaps its own, at start, without guessing names".
+        a.push("--rm".into());
+        a.push("--label".into());
+        a.push(config.runner_label());
         a.push("--label".into());
         a.push(format!("hull-ci.job={}", spec.job_id));
         a.push("--label".into());
@@ -1164,11 +1360,25 @@ impl SandboxInstance for ContainerInstance {
             // this supplies the values out of band (see the `--env NAME` block there).
             let secrets: Vec<(String, String)> =
                 self.spec.secret_env.iter().map(|(n, v)| (n.clone(), v.to_string())).collect();
+
+            // **Before** the create, not after it, and this ordering is the whole point.
+            //
+            // `self.created` gates whether `destroy` issues an `rm` at all, and it used to be set
+            // from the CLI's exit status. But the CLI's exit status is a statement about the CLI: a
+            // `create` that hits `control_timeout` while the daemon goes on to create the container
+            // exits non-zero, leaves `created = false`, and `destroy` then skips the `rm` for a
+            // container that exists. The daemon's work is not observable from a process we killed,
+            // so the flag has to mean "an attempt was made that the daemon may have completed"
+            // rather than "the CLI said yes".
+            //
+            // The cost of the conservative reading is one `rm` against a container that was never
+            // created, and that costs nothing: `docker rm --force` on a missing container exits 0
+            // (verified against docker 28.0.4), so a failed create still ends in a clean `destroy`.
+            self.created = true;
             let (status, out) = control_command(&self.config, create, &secrets).await?;
             if status != ExecStatus::Exited(0) {
                 return Err(SandboxError::Runtime(format!("container create failed ({status:?}): {out}")));
             }
-            self.created = true;
 
             let start = vec![
                 self.config.runtime.clone(),
@@ -1228,6 +1438,78 @@ impl SandboxInstance for ContainerInstance {
             self.guard.mark_destroyed();
             result
         })
+    }
+}
+
+impl Drop for ContainerInstance {
+    /// Best-effort teardown for an instance that is dropped without `destroy()` (§14.1).
+    ///
+    /// # What was chosen, and why it is not the guarantee
+    ///
+    /// A destructor cannot be where §14.1 lives. `destroy()` is async because removing a container
+    /// is a request to a daemon over a socket, and the two ways to run that from `Drop` are both
+    /// worse than the disease:
+    ///
+    /// * **Blocking on it** — `block_on`, or a synchronous `rm` — would stall whichever thread is
+    ///   unwinding, inside a Tokio worker, on a daemon that may be the very thing that has stopped
+    ///   answering. A `control_timeout`-long stall per dropped sandbox, on the runtime's own
+    ///   threads, is how a node stops taking work at all. `block_on` inside a runtime thread panics
+    ///   outright.
+    /// * **Forking a detached `rm` and never waiting on it** would leave a zombie process per drop,
+    ///   for as long as the node lives.
+    ///
+    /// So this **spawns** the removal onto the current runtime and returns immediately: it never
+    /// blocks, and the task properly reaps its child. It covers the cases where the node itself
+    /// survives — a dropped `run_assignment` future, an early `?` return, an unwinding panic — which
+    /// is the common half of the problem, and it says so when it cannot run.
+    ///
+    /// It does **not** cover the case the audit was actually about: `SIGKILL`, a lost host, a
+    /// runtime torn down before the task is polled. No destructor covers those. [`reap_orphans`] at
+    /// node start does, which is why that is the guarantee and this is a courtesy.
+    fn drop(&mut self) {
+        // `destroy()` marks the guard before dropping the box, so the ordinary path is a no-op here.
+        // `!created` means no `create` was ever issued, so there is nothing that could exist.
+        if !self.created || self.guard.state() == Lifecycle::Destroyed {
+            return;
+        }
+        let config = self.config.clone();
+        let name = self.name.clone();
+        let job = self.guard.job_id().to_string();
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                tracing::warn!(
+                    container = %name,
+                    %job,
+                    "sandbox dropped without destroy(); removing the container best-effort (§14.1)"
+                );
+                handle.spawn(async move {
+                    let argv = vec![
+                        config.runtime.clone(),
+                        "rm".into(),
+                        "--force".into(),
+                        "--volumes".into(),
+                        name.clone(),
+                    ];
+                    match control_command(&config, argv, &[]).await {
+                        Ok((ExecStatus::Exited(0), _)) => {}
+                        Ok((status, out)) => tracing::error!(
+                            container = %name, ?status, %out,
+                            "best-effort removal of a dropped sandbox failed; it will be reaped at next node start"
+                        ),
+                        Err(e) => tracing::error!(
+                            container = %name, error = %e,
+                            "best-effort removal of a dropped sandbox failed; it will be reaped at next node start"
+                        ),
+                    }
+                });
+            }
+            Err(_) => tracing::error!(
+                container = %name,
+                %job,
+                "sandbox dropped without destroy() and outside a Tokio runtime, so nothing could be \
+                 issued; it will be reaped at next node start (§14.1)"
+            ),
+        }
     }
 }
 
@@ -1722,7 +2004,7 @@ probe_done=1
     #[ignore = "requires a running container daemon and the alpine image"]
     async fn live_container_runs_argv_and_is_destroyed() {
         let t = tempfile::tempdir().unwrap();
-        let backend = ContainerBackend::detect(ContainerConfig::default()).await.expect("daemon");
+        let backend = ContainerBackend::detect(live_config()).await.expect("daemon");
         assert!(backend.controls().egress_deny, "the live probe must confirm --network none");
 
         let mut s = spec(t.path());
@@ -1804,6 +2086,21 @@ probe_done=1
         assert!(second.contains("rc=1"), "a fresh sandbox must not carry the last job's writes: {second}");
     }
 
+    /// A [`ContainerConfig`] whose runner id is unique to this call.
+    ///
+    /// Every live probe needs its own, because [`ContainerBackend::detect`] now reaps every
+    /// container carrying its runner's label at start (§14.1) and `cargo test` runs these in
+    /// parallel. Sharing [`DEFAULT_RUNNER_ID`] across probes would have one probe's node start
+    /// remove a container another probe was in the middle of measuring — the same "passes alone,
+    /// fails as a suite" trap [`stub_port`] documents, and for a security probe that is the worst
+    /// of both: it looks verified and is not.
+    fn live_config() -> ContainerConfig {
+        ContainerConfig {
+            runner_id: format!("hull-ci-test-{}", short_id()),
+            ..ContainerConfig::default()
+        }
+    }
+
     /// Run one argv in a single-use live container and return its captured output.
     async fn run_live(argv: &[&str]) -> String {
         run_live_on(&ContainerConfig::default(), argv).await
@@ -1812,7 +2109,8 @@ probe_done=1
     /// [`run_live`], on a given network posture.
     async fn run_live_on(config: &ContainerConfig, argv: &[&str]) -> String {
         let t = tempfile::tempdir().unwrap();
-        let backend = ContainerBackend::detect(config.clone()).await.expect("daemon");
+        let config = ContainerConfig { runner_id: live_config().runner_id, ..config.clone() };
+        let backend = ContainerBackend::detect(config).await.expect("daemon");
         let mut s = spec(t.path());
         s.image = "alpine:3".into();
         let mut sbx = backend.spawn(&s).await.expect("spawn");
@@ -1937,7 +2235,9 @@ probe_done=1
         fn config(&self) -> ContainerConfig {
             ContainerConfig {
                 network: NetworkMode::ProxyOnly(self.proxy_network()),
-                ..Default::default()
+                // `live_config`, not `default`: this config is handed to `ContainerBackend::detect`,
+                // whose start-of-node reap must not reach a parallel probe's containers.
+                ..live_config()
             }
         }
 
@@ -1988,7 +2288,7 @@ probe_done=1
         // The posture, measured rather than assumed. Every field is a thing a container on this
         // network actually tried.
         let net = LiveNetwork::internal(stub_port()).await.with_proxy_stub().await;
-        let posture = probe_network_posture(&ContainerConfig::default(), &net.proxy_network()).await;
+        let posture = probe_network_posture(&live_config(), &net.proxy_network()).await;
         net.destroy().await;
 
         assert!(posture.failure.is_none(), "the probe must have run: {posture:?}");
@@ -2018,7 +2318,7 @@ probe_done=1
         // This is the same standard the pre-existing §14 probes were held to: `wget` returns rc=0
         // with a network and rc=1 without, so rc=1 means something.
         let net = LiveNetwork::open_bridge(stub_port()).await.with_proxy_stub().await;
-        let posture = probe_network_posture(&ContainerConfig::default(), &net.proxy_network()).await;
+        let posture = probe_network_posture(&live_config(), &net.proxy_network()).await;
         net.destroy().await;
 
         assert!(posture.failure.is_none(), "the probe must have run: {posture:?}");
@@ -2049,7 +2349,7 @@ probe_done=1
         // on its network can *do*, in both directions.
 
         // 1. The default. `--network none`, and every network capability true.
-        let none = ContainerBackend::detect(ContainerConfig::default()).await.expect("daemon");
+        let none = ContainerBackend::detect(live_config()).await.expect("daemon");
         assert!(none.controls().egress_deny, "`--network none` is still the default and still holds");
         assert!(none.controls().metadata_blackhole && none.controls().no_inbound);
         assert!(none.network_posture().is_none(), "there is no network to have a posture");
@@ -2302,7 +2602,7 @@ probe_done=1
         let config = net.config();
 
         // The posture is still measured, and must still hold with the proxy in place.
-        let posture = probe_network_posture(&ContainerConfig::default(), &net.proxy_network()).await;
+        let posture = probe_network_posture(&live_config(), &net.proxy_network()).await;
         assert!(posture.egress_denied(), "the network must still deny egress: {posture:?}");
         assert!(posture.proxy_reachable, "…and the real proxy must be the thing answering");
 
@@ -2345,6 +2645,227 @@ probe_done=1
             !out.contains(E2E_UPSTREAM_SECRET),
             "the upstream credential must never appear in a job's output (D§7.4): {out}"
         );
+    }
+
+    // ── §14.1 across a crash, against a real daemon ────────────────────────────────────────────
+    //
+    // The unit tests above settle our control flow. These settle the thing the audit actually
+    // observed, which is a fact about the daemon rather than about us: the container runtime, not
+    // the CLI, owns the container, so killing the CLI leaves it running. Each "the orphan is gone"
+    // below is paired with a run in which the identical probe finds it — a probe that cannot fail is
+    // not evidence, which is the standard the §14.3 probes in this file are already held to.
+
+    /// Does the daemon still have this container?
+    ///
+    /// One helper for every orphan assertion in this section, so the "gone" case and the control
+    /// case are literally the same question asked twice.
+    async fn container_exists(config: &ContainerConfig, name: &str) -> bool {
+        let argv = vec![config.runtime.clone(), "inspect".into(), name.to_string()];
+        matches!(control_command(config, argv, &[]).await, Ok((ExecStatus::Exited(0), _)))
+    }
+
+    async fn container_running(config: &ContainerConfig, name: &str) -> bool {
+        let argv = vec![
+            config.runtime.clone(),
+            "inspect".into(),
+            name.to_string(),
+            "--format".into(),
+            "{{.State.Running}}".into(),
+        ];
+        matches!(control_command(config, argv, &[]).await, Ok((ExecStatus::Exited(0), out)) if out.trim() == "true")
+    }
+
+    /// Create and start a job container exactly the way `exec` does, then kill the attaching CLI —
+    /// which is what a node crash looks like from the daemon's side. Returns the container's name.
+    ///
+    /// The argv is a long sleep on purpose: `--rm` (AutoRemove) removes a container **when it
+    /// exits**, so a container that never exits is precisely the case AutoRemove cannot reach and
+    /// the reaper must.
+    async fn leak_an_orphan(config: &ContainerConfig) -> String {
+        let ws = tempfile::tempdir().expect("workspace");
+        let mut s = spec(ws.path());
+        s.image = "alpine:3".into();
+        let name = format!("hull-ci-orphan-{}", short_id());
+        let create = create_argv(config, &s, &name, &["/bin/sleep".into(), "600".into()]);
+        let (status, out) = control_command(config, create, &[]).await.expect("create");
+        assert_eq!(status, ExecStatus::Exited(0), "could not create the orphan: {out}");
+
+        let start = vec![config.runtime.clone(), "start".into(), "--attach".into(), name.clone()];
+        let mut child = command_from_argv(&start, &runtime_env())
+            .expect("start command")
+            .spawn()
+            .expect("spawn the attaching CLI");
+        // Let the daemon actually start it before we pull the rug out.
+        for _ in 0..100 {
+            if container_running(config, &name).await {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        child.start_kill().expect("kill the attaching CLI");
+        let _ = child.wait().await;
+        name
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a running container daemon and the alpine image"]
+    async fn live_killing_the_attaching_cli_leaves_the_container_running() {
+        // The audit's finding itself, asserted rather than believed. Everything else in this section
+        // is only worth building because this is true: the CLI is not the container's parent, so its
+        // death is not the container's death, and `--rm` cannot help because the container never
+        // exits.
+        let config = live_config();
+        let name = leak_an_orphan(&config).await;
+        assert!(
+            container_running(&config, &name).await,
+            "the daemon owns the container; killing the CLI must not have stopped it"
+        );
+
+        reap_orphans(&config).await.expect("reap");
+        assert!(!container_exists(&config, &name).await, "and the reaper is what removes it");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a running container daemon and the alpine image"]
+    async fn live_the_reaper_removes_this_runners_orphan_and_the_probe_would_have_found_it() {
+        // The negative test and its positive control, in one run so the pairing cannot drift apart.
+        //
+        // The control is the same reaper, the same probe and the same orphan, with exactly one thing
+        // changed: the runner id it is asked about. If `container_exists` came back `false` for a
+        // reason other than the reaper — a container that never started, a name we got wrong — the
+        // control would report `false` too, and the test would fail instead of passing vacuously.
+        let mine = live_config();
+        let name = leak_an_orphan(&mine).await;
+
+        // Control: a reaper that is not this runner's must leave the orphan alone.
+        let someone_else = ContainerConfig { runner_id: live_config().runner_id, ..mine.clone() };
+        let swept = reap_orphans(&someone_else).await.expect("reap");
+        assert!(swept.removed.is_empty(), "another runner's reaper removed something: {swept:?}");
+        assert!(
+            container_exists(&mine, &name).await,
+            "the probe finds the orphan when the reaper that would remove it has not run"
+        );
+
+        // The test proper.
+        let reaped = reap_orphans(&mine).await.expect("reap");
+        assert_eq!(reaped.removed.len(), 1, "exactly this runner's one orphan: {reaped:?}");
+        assert!(reaped.failures.is_empty(), "{reaped:?}");
+        assert!(!container_exists(&mine, &name).await, "…and the same probe no longer finds it");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a running container daemon and the alpine image"]
+    async fn live_two_runners_on_one_daemon_do_not_reap_each_other() {
+        // The property that makes a reaper safe to run at all. Several nodes against one daemon is
+        // an ordinary development and CI topology, and a reaper that swept by name prefix or by the
+        // `hull-ci.job` label would turn one node's restart into every other node's outage.
+        let alpha = live_config();
+        let beta = live_config();
+        assert_ne!(alpha.runner_label(), beta.runner_label(), "two runners, two labels");
+        let alpha_orphan = leak_an_orphan(&alpha).await;
+        let beta_orphan = leak_an_orphan(&beta).await;
+
+        let reaped = reap_orphans(&alpha).await.expect("reap alpha");
+        assert_eq!(reaped.removed.len(), 1, "alpha reaped more than its own: {reaped:?}");
+        assert!(!container_exists(&alpha, &alpha_orphan).await, "alpha's orphan is gone");
+        assert!(
+            container_running(&beta, &beta_orphan).await,
+            "beta's container is still running its job and must be untouched"
+        );
+
+        // …and beta can still reap its own afterwards, so alpha's pass did not merely miss it.
+        let reaped = reap_orphans(&beta).await.expect("reap beta");
+        assert_eq!(reaped.removed.len(), 1, "{reaped:?}");
+        assert!(!container_exists(&beta, &beta_orphan).await);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[ignore = "requires a running container daemon and the alpine image"]
+    async fn live_a_create_the_daemon_completed_but_we_never_heard_about_is_still_torn_down() {
+        // The audit's second path, against the real daemon: a `create` that hits `control_timeout`
+        // *after* the daemon has created the container. The runtime here is a wrapper that runs the
+        // real `docker create` and then hangs, which is what an unresponsive daemon connection looks
+        // like from our side and produces the same state on the daemon's side.
+        let t = tempfile::tempdir().unwrap();
+        let wrapper = fake_runtime(
+            t.path(),
+            "#!/bin/sh\n\
+             if [ \"$1\" = create ]; then docker \"$@\"; sleep 30; fi\nexec docker \"$@\"\n",
+        );
+        let config = ContainerConfig {
+            runtime: wrapper,
+            control_timeout: Duration::from_secs(5),
+            runner_id: live_config().runner_id,
+            ..Default::default()
+        };
+        let real = ContainerConfig::default();
+        let ws = tempfile::tempdir().unwrap();
+        let mut s = spec(ws.path());
+        s.image = "alpine:3".into();
+
+        let backend = ContainerBackend::from_probe(config.clone(), linux_probe());
+        let mut sbx = backend.spawn(&s).await.expect("spawn");
+        let name = sbx.id().to_string();
+        let req = ExecRequest {
+            job_id: s.job_id.clone(),
+            argv: vec!["/bin/sleep".into(), "600".into()],
+            timeout: Duration::from_secs(60),
+            caps: crate::capture::OutputCaps::default(),
+        };
+        sbx.exec(&req).await.expect_err("the create timed out, so exec must not report success");
+
+        // The control that makes the assertion afterwards mean something: the daemon really did
+        // create the container we were about to give up on. Without this line, "gone after destroy"
+        // could just as well mean "never created".
+        assert!(
+            container_exists(&real, &name).await,
+            "the daemon completed the create even though our CLI never came back"
+        );
+
+        sbx.destroy().await.expect("destroy");
+        assert!(
+            !container_exists(&real, &name).await,
+            "a create we timed out on must still be torn down (§14.1)"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a running container daemon and the alpine image"]
+    async fn live_a_container_that_exits_after_its_node_died_removes_itself() {
+        // The half `--rm` covers, and why it is worth setting alongside the reaper: AutoRemove is the
+        // *daemon's* promise, so it is kept even though the process that asked for it is gone. Its
+        // control is the first test in this section — a container that never exits is still there
+        // afterwards, which is exactly why the reaper exists as well.
+        let config = live_config();
+        let ws = tempfile::tempdir().unwrap();
+        let mut s = spec(ws.path());
+        s.image = "alpine:3".into();
+        let name = format!("hull-ci-autorm-{}", short_id());
+        let create = create_argv(&config, &s, &name, &["/bin/sleep".into(), "3".into()]);
+        let (status, out) = control_command(&config, create, &[]).await.expect("create");
+        assert_eq!(status, ExecStatus::Exited(0), "{out}");
+
+        let start = vec![config.runtime.clone(), "start".into(), "--attach".into(), name.clone()];
+        let mut child =
+            command_from_argv(&start, &runtime_env()).expect("start").spawn().expect("spawn");
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(container_exists(&config, &name).await, "it exists while it runs");
+        child.start_kill().expect("kill the attaching CLI");
+        let _ = child.wait().await;
+
+        for _ in 0..100 {
+            if !container_exists(&config, &name).await {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(
+            !container_exists(&config, &name).await,
+            "AutoRemove must fire on exit even with nobody attached"
+        );
+        // And there is nothing left for the reaper to find, which is the point.
+        assert!(reap_orphans(&config).await.expect("reap").removed.is_empty());
     }
 
     // ── the isolation audit's regressions ───────────────────────────────────────────────────────
@@ -2473,6 +2994,305 @@ probe_done=1
         let real = "iprc=0\ndefault_route=0\nraw_ip=1\nmetadata=124\npublic_dns=1\nproxy=0\npeer=1\nroute_add=1\nprobe_done=1\n";
         let p = parse_posture(real, NetworkPosture { declared_internal: true, ..Default::default() }, true);
         assert!(p.failure.is_none() && p.egress_denied(), "{p:?}");
+    }
+
+    // ── §14.1 across a crash: the label, the reaper, and the two ordering bugs ──────────────────
+    //
+    // The audit's finding, in its own words: "killing the attaching CLI leaves the container
+    // **running**". `destroy()` is an async function, so every way it fails to run — SIGKILL, a lost
+    // host, a dropped `run_assignment` future — left a live container with the workspace mounted and
+    // its wall clock expired. These tests cover the parts that can be settled without a daemon; the
+    // `live_` ones below settle the rest against a real one.
+
+    #[test]
+    fn every_container_this_backend_creates_carries_the_label_the_reaper_matches() {
+        // The reaper can only remove what the creator marked, and it matches on an exact key/value.
+        // A label written one way and filtered another is a reaper that removes nothing — which is
+        // indistinguishable, in a log, from a reaper that found nothing to remove.
+        let t = tempfile::tempdir().unwrap();
+        let config = ContainerConfig { runner_id: "node-7".into(), ..Default::default() };
+        let argv = create_argv(&config, &spec(t.path()), "sbx", &["/bin/true".into()]);
+        assert!(
+            argv.windows(2).any(|w| w[0] == "--label" && w[1] == config.runner_label()),
+            "the runner label must be on the create argv: {argv:?}"
+        );
+        assert_eq!(config.runner_label(), "hull-ci.runner=node-7");
+        // …and `--rm`, the daemon-side half: a container that exits after its node died still goes
+        // away, because AutoRemove is the daemon's promise rather than the CLI's.
+        assert!(argv.iter().any(|a| a == "--rm"), "AutoRemove must be set: {argv:?}");
+    }
+
+    #[test]
+    fn two_runners_sharing_a_daemon_write_labels_that_cannot_match_each_other() {
+        // The safety property `reap_orphans` rests on. Verified against docker 28.0.4 that a filter
+        // value which is a *prefix* of a label matches nothing, so these two are genuinely disjoint
+        // rather than merely different-looking.
+        let alpha = ContainerConfig { runner_id: "node-a".into(), ..Default::default() };
+        let beta = ContainerConfig { runner_id: "node-a-2".into(), ..Default::default() };
+        assert_ne!(alpha.runner_label(), beta.runner_label());
+
+        // A runner id is operator configuration and lands in an argv element and a filter string, so
+        // it goes through the same sanitiser a job id does: nothing in it can become a second flag.
+        let hostile = ContainerConfig { runner_id: "--privileged x".into(), ..Default::default() };
+        assert!(!hostile.runner_label().contains(' '));
+        assert!(hostile.runner_label().starts_with("hull-ci.runner="));
+    }
+
+    /// Write an executable stand-in for the runtime CLI, which records every argv it is handed.
+    ///
+    /// Lets the three bugs below be settled deterministically: "did `destroy` issue an `rm`" is a
+    /// question about our control flow, and answering it against a real daemon would make it a
+    /// question about timing as well.
+    #[cfg(unix)]
+    fn fake_runtime(dir: &Path, body: &str) -> String {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join("fake-runtime");
+        std::fs::write(&path, body).expect("write the stand-in runtime");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        path.display().to_string()
+    }
+
+    /// The argv lines a [`fake_runtime`] recorded.
+    #[cfg(unix)]
+    fn recorded(log: &Path) -> String {
+        std::fs::read_to_string(log).unwrap_or_default()
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_create_that_times_out_is_still_torn_down() {
+        // The second half of the audit's §14.1 finding: `self.created` was set from the *CLI's* exit
+        // status, so a `create` that hit `control_timeout` while the daemon went on creating the
+        // container left `created = false` and `destroy` skipped the `rm` entirely. The flag has to
+        // mean "an attempt was made the daemon may have completed", not "the CLI said yes".
+        let t = tempfile::tempdir().unwrap();
+        let log = t.path().join("calls.log");
+        let runtime = fake_runtime(
+            t.path(),
+            &format!(
+                "#!/bin/sh\necho \"$@\" >> {log}\nif [ \"$1\" = create ]; then sleep 30; fi\nexit 0\n",
+                log = log.display()
+            ),
+        );
+        let config = ContainerConfig {
+            runtime,
+            // Generous: the assertion below is about ordering, not about speed, and a
+            // fork+exec on a loaded machine has been seen to take longer than a tight budget.
+            control_timeout: Duration::from_secs(3),
+            runner_id: "node-under-test".into(),
+            ..Default::default()
+        };
+        let ws = tempfile::tempdir().unwrap();
+        let mut s = spec(ws.path());
+        s.image = "alpine:3".into();
+        let backend = ContainerBackend::from_probe(config.clone(), linux_probe());
+
+        let mut sbx = backend.spawn(&s).await.expect("spawn");
+        let name = sbx.id().to_string();
+        let req = ExecRequest {
+            job_id: s.job_id.clone(),
+            argv: vec!["/bin/true".into()],
+            timeout: Duration::from_secs(5),
+            caps: crate::capture::OutputCaps::default(),
+        };
+        let err = sbx.exec(&req).await.expect_err("a create we never heard back from is not a success");
+        assert!(matches!(err, SandboxError::Runtime(_)), "wrong error: {err}");
+        assert!(recorded(&log).contains("create "), "the create was in fact attempted");
+
+        sbx.destroy().await.expect("destroy");
+        assert!(
+            recorded(&log).contains(&format!("rm --force --volumes {name}")),
+            "a create that timed out must still be torn down: {}",
+            recorded(&log)
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_sandbox_that_never_created_anything_issues_no_rm() {
+        // The positive control for the test above, and the reason its assertion means something: the
+        // same probe over the same log comes out the other way when there is nothing to remove. If
+        // `destroy` issued an `rm` unconditionally, "the rm is there" would be true for every
+        // possible bug in the ordering.
+        let t = tempfile::tempdir().unwrap();
+        let log = t.path().join("calls.log");
+        let runtime = fake_runtime(
+            t.path(),
+            &format!("#!/bin/sh\necho \"$@\" >> {log}\nexit 0\n", log = log.display()),
+        );
+        let config = ContainerConfig { runtime, ..Default::default() };
+        let ws = tempfile::tempdir().unwrap();
+        let backend = ContainerBackend::from_probe(config, linux_probe());
+
+        // Spawned and torn down without ever running: `spawn` reserves the name, `exec` is what
+        // creates the container, and this never gets there.
+        let sbx = backend.spawn(&spec(ws.path())).await.expect("spawn");
+        sbx.destroy().await.expect("destroy");
+        assert!(
+            !recorded(&log).contains("rm --force"),
+            "nothing was created, so nothing is removed: {}",
+            recorded(&log)
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_sandbox_dropped_without_destroy_still_removes_its_container() {
+        // `ContainerInstance` had no `Drop` at all: a dropped `run_assignment` future — a cancelled
+        // lease, an early `?`, a panic unwinding through the node — left the container behind with
+        // nothing scheduled to remove it. This is the best-effort second line; see the `Drop` impl
+        // for why it is not the guarantee.
+        let t = tempfile::tempdir().unwrap();
+        let log = t.path().join("calls.log");
+        let runtime = fake_runtime(
+            t.path(),
+            &format!("#!/bin/sh\necho \"$@\" >> {log}\nexit 0\n", log = log.display()),
+        );
+        let config = ContainerConfig { runtime, ..Default::default() };
+        let ws = tempfile::tempdir().unwrap();
+        let mut s = spec(ws.path());
+        s.image = "alpine:3".into();
+        let backend = ContainerBackend::from_probe(config, linux_probe());
+
+        let mut sbx = backend.spawn(&s).await.expect("spawn");
+        let name = sbx.id().to_string();
+        let req = ExecRequest {
+            job_id: s.job_id.clone(),
+            argv: vec!["/bin/true".into()],
+            timeout: Duration::from_secs(5),
+            caps: crate::capture::OutputCaps::default(),
+        };
+        sbx.exec(&req).await.expect("exec");
+        // `rm --force`, not `rm ` — every create argv now carries `--rm`, and a probe that
+        // matches the flag it is meant to ignore is a probe that can never fail.
+        assert!(!recorded(&log).contains("rm --force"), "nothing has been torn down yet");
+
+        // The whole point: no `destroy()`, just a drop.
+        drop(sbx);
+        // The removal is *spawned*, never awaited in the destructor — a destructor that blocks on a
+        // daemon socket is how a node stops taking work. So the test yields to the runtime rather
+        // than expecting the effect to have happened by the time `drop` returned.
+        for _ in 0..200 {
+            if recorded(&log).contains("rm --force --volumes") {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            recorded(&log).contains(&format!("rm --force --volumes {name}")),
+            "a dropped sandbox must still try to take its container with it: {}",
+            recorded(&log)
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_destroyed_sandbox_is_not_removed_a_second_time_by_its_drop() {
+        // The control for the test above: `destroy()` marks the guard, so the ordinary path must not
+        // also fire the destructor's removal. Without this, the previous test would pass even if
+        // `Drop` ignored the lifecycle entirely.
+        let t = tempfile::tempdir().unwrap();
+        let log = t.path().join("calls.log");
+        let runtime = fake_runtime(
+            t.path(),
+            &format!("#!/bin/sh\necho \"$@\" >> {log}\nexit 0\n", log = log.display()),
+        );
+        let config = ContainerConfig { runtime, ..Default::default() };
+        let ws = tempfile::tempdir().unwrap();
+        let mut s = spec(ws.path());
+        s.image = "alpine:3".into();
+        let backend = ContainerBackend::from_probe(config, linux_probe());
+
+        let mut sbx = backend.spawn(&s).await.expect("spawn");
+        let req = ExecRequest {
+            job_id: s.job_id.clone(),
+            argv: vec!["/bin/true".into()],
+            timeout: Duration::from_secs(5),
+            caps: crate::capture::OutputCaps::default(),
+        };
+        sbx.exec(&req).await.expect("exec");
+        sbx.destroy().await.expect("destroy");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            recorded(&log).matches("rm --force --volumes").count(),
+            1,
+            "exactly one removal on the ordinary path: {}",
+            recorded(&log)
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_reaper_asks_for_this_runners_label_and_removes_what_it_is_given() {
+        let t = tempfile::tempdir().unwrap();
+        let log = t.path().join("calls.log");
+        // `ps` answers with two container ids; everything else just records and succeeds.
+        let runtime = fake_runtime(
+            t.path(),
+            &format!(
+                "#!/bin/sh\necho \"$@\" >> {log}\n\
+                 if [ \"$1\" = ps ]; then echo abc123; echo def456; fi\nexit 0\n",
+                log = log.display()
+            ),
+        );
+        let config = ContainerConfig { runtime, runner_id: "node-9".into(), ..Default::default() };
+
+        let reaped = reap_orphans(&config).await.expect("reap");
+        assert_eq!(reaped.removed, vec!["abc123", "def456"]);
+        assert!(reaped.failures.is_empty());
+
+        let calls = recorded(&log);
+        assert!(
+            calls.contains("--filter label=hull-ci.runner=node-9"),
+            "the filter must be this runner's label, exactly: {calls}"
+        );
+        assert!(calls.contains("ps --all --quiet"), "stopped orphans count too: {calls}");
+        assert!(calls.contains("rm --force --volumes abc123"), "{calls}");
+        assert!(calls.contains("rm --force --volumes def456"), "{calls}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_reaper_that_is_given_nothing_removes_nothing() {
+        // The control: the same code path over a daemon that reports no matching containers. This is
+        // what a second runner on the same daemon sees, and it must be a no-op rather than a sweep.
+        let t = tempfile::tempdir().unwrap();
+        let log = t.path().join("calls.log");
+        let runtime = fake_runtime(
+            t.path(),
+            &format!("#!/bin/sh\necho \"$@\" >> {log}\nexit 0\n", log = log.display()),
+        );
+        let config = ContainerConfig { runtime, runner_id: "node-9".into(), ..Default::default() };
+        assert_eq!(reap_orphans(&config).await.expect("reap"), Reaped::default());
+        assert!(!recorded(&log).contains("rm --force"), "no ids, no removals: {}", recorded(&log));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_daemon_that_will_not_answer_the_listing_is_an_error_rather_than_an_empty_sweep() {
+        // A `ps` that fails must not read as "there are no orphans". The distinction matters at node
+        // start: one of those means §14.1 is being kept, the other means nobody looked.
+        let t = tempfile::tempdir().unwrap();
+        let runtime =
+            fake_runtime(t.path(), "#!/bin/sh\necho 'cannot connect to the daemon' >&2\nexit 1\n");
+        let config = ContainerConfig { runtime, ..Default::default() };
+        assert!(matches!(reap_orphans(&config).await, Err(SandboxError::Runtime(_))));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_orphan_that_cannot_be_removed_is_reported_rather_than_swallowed() {
+        let t = tempfile::tempdir().unwrap();
+        let runtime = fake_runtime(
+            t.path(),
+            "#!/bin/sh\nif [ \"$1\" = ps ]; then echo stuck1; exit 0; fi\n\
+             echo 'device or resource busy' >&2\nexit 1\n",
+        );
+        let config = ContainerConfig { runtime, ..Default::default() };
+        let reaped = reap_orphans(&config).await.expect("the listing succeeded");
+        assert!(reaped.removed.is_empty());
+        assert_eq!(reaped.failures.len(), 1, "an orphan we could not remove is still an orphan");
+        assert!(reaped.failures[0].contains("stuck1"));
     }
 
     #[tokio::test]

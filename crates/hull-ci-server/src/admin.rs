@@ -302,6 +302,11 @@ async fn nodes(State(s): State<Arc<AdminState>>, headers: HeaderMap) -> Reply {
             // against, in the spec's own words (design D§7.2).
             "admits_untrusted": caps.admits_untrusted(),
             "unmet_clauses": unmet,
+            // The subset of `unmet_clauses` that is the *reason* `admits_untrusted` is false. Two
+            // different questions: a panel showing only the first leaves an operator to work out,
+            // from eighteen clauses, which one is actually blocking them. See
+            // `hull_ci_proto::Clause::required_for_untrusted`.
+            "blocking_untrusted": caps.unmet_for_untrusted(),
         }],
         "bind": s.bind.to_string(),
         "bind_is_loopback": s.bind.ip().is_loopback(),
@@ -759,6 +764,18 @@ mod tests {
         assert_eq!(unmet.len(), unmet_here());
         assert!(unmet.len() > 10, "the development backend enforces almost nothing, and says so");
         assert!(unmet.iter().any(|c| c.as_str().unwrap().contains("§14.3 default egress-deny")));
+
+        // …and the narrower list beside it: the clauses that are the *reason* untrusted work is
+        // refused. It must be a strict subset of the gap list and must not be empty here, because
+        // "admits_untrusted: false" with nothing blocking would be a contradiction the panel showed.
+        let blocking = node["blocking_untrusted"].as_array().unwrap();
+        assert!(!blocking.is_empty(), "something must be blocking, since nothing is admitted");
+        assert!(blocking.len() < unmet.len(), "the waivable clauses are not blocking anything");
+        assert!(blocking.iter().all(|b| unmet.contains(b)), "a blocker is always also a gap");
+        assert!(blocking
+            .iter()
+            .any(|c| c.as_str().unwrap().contains("§14.1 kernel/hardware isolation")));
+
         assert_eq!(v["nodes"][0]["warm_trees"], 0, "a count, never the tree ids");
     }
 

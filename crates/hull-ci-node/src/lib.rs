@@ -104,6 +104,27 @@
 //! on every backend in this crate. That is not an oversight — it is design D§13's M1 statement
 //! ("**M1 is single-tenant, trusted-input only and MUST NOT take untrusted or multi-tenant input**")
 //! expressed as a value the scheduler reads, rather than as a sentence in a document.
+//!
+//! # What survives a crash (§14.1)
+//!
+//! §14.1's "destroy the whole rootfs after each job" is the one clause whose enforcement lives in
+//! code that might not run. `destroy()` is async, so a `SIGKILL`, a lost host or a dropped
+//! `run_assignment` future used to leave a live container with the job's workspace bind-mounted and
+//! its wall clock long expired. Three mechanisms now hold it, in decreasing order of how much they
+//! can be relied on:
+//!
+//! 1. [`container::reap_orphans`] at node start, which is the **guarantee**: every container
+//!    carrying this runner's `hull-ci.runner` label is removed before any job is placed. Node start
+//!    is the only moment at which "this label means orphan" is true by construction.
+//! 2. `--rm` (AutoRemove) on every container, which is the **daemon's** promise rather than ours, so
+//!    a container that exits after its node died still goes away. It cannot help with one that never
+//!    exits, which is why (1) exists.
+//! 3. `ContainerInstance`'s `Drop`, which spawns a best-effort removal and never blocks. It covers
+//!    the cases where the node survives — a cancelled lease, a panic — and nothing else.
+//!
+//! The reaper is scoped by an exact `hull-ci.runner=<id>` label match and never removes another
+//! runner's containers, so several nodes may share one daemon. See [`ContainerConfig::runner_id`]
+//! for the identity contract that makes that true.
 
 pub mod agent;
 pub mod capture;

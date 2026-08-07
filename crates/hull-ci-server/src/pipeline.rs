@@ -198,14 +198,25 @@ impl Planner for PipelinePlanner {
                 return self.fallback.plan(tree).await;
             };
 
-            // Evaluation is CPU-bound, bounded, and runs the evaluator's own guarded thread inside —
-            // but it is still blocking, so it does not belong on an async worker.
+            // Evaluation is CPU-bound, bounded, and spawns the evaluator's own bounded child process
+            // inside — but it is still blocking, so it does not belong on an async worker.
             let limits = self.limits.clone();
-            let evaluated = tokio::task::spawn_blocking(move || {
-                hull_ci_plan::evaluate_with(&source, &limits, ACTIONS)
+            let (evaluated, cost) = tokio::task::spawn_blocking(move || {
+                hull_ci_plan::evaluate_measured(&source, &limits, ACTIONS)
             })
             .await
             .map_err(|e| PlanError::Invalid(format!("evaluating {PIPELINE_PATH} did not complete: {e}")))?;
+
+            // What it cost, logged whether or not it produced a DAG. starlark-rust's own
+            // documentation asks anyone relying on a heap limit to watch how close real evaluations
+            // run to it, so the limit is retuned before it starts refusing an honest pipeline —
+            // and nothing could measure that until evaluation had a process of its own.
+            tracing::debug!(
+                tree_id = %tree.tree_id,
+                peak_bytes = cost.peak_bytes,
+                ceiling_bytes = self.limits.hard_memory_bytes(),
+                "evaluated {PIPELINE_PATH}"
+            );
 
             let pipeline = match evaluated {
                 Ok(p) => p,
