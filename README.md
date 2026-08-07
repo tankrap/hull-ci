@@ -103,11 +103,12 @@ admin grant rather than a string a pipeline can claim.
   Mostly not here, and **state is still in memory**, which is why there is no horizontal scaling: the
   fair-share clocks and the job store are process-local. What *is* here is the part a restart made
   unsafe rather than merely slow. Every accepted dispatch is written to a durable outbox before it is
-  acked (`HULL_CI_JOURNAL=on`) and drained at startup, because the thing that survives a restart has
-  to be the **obligation to answer**, not the work. A forgotten job is not a lost job; it is a tree
-  Hull holds in-flight forever, since spec §10 has Hull neither polling nor timing out, and clearing
-  that mark only on a callback. Reporting *something* unwedges it, so recovery re-sends a recorded
-  verdict when there is one and `errored` when there is not, and either beats silence.
+  acked, because the thing that has to survive is the **obligation to answer**, not the work. A
+  forgotten job is not a lost job; it is a tree Hull holds in-flight forever, since spec §10 has Hull
+  neither polling nor timing out, and clearing that mark only on a callback. Reporting *something*
+  unwedges it, so the outbox drains from both ends — at startup, and again whenever a later dispatch
+  arrives — re-sending a recorded verdict when there is one and `errored` when there is not. On by
+  default; `HULL_CI_JOURNAL=off` turns it off.
 
 The ordering is deliberate: multi-tenancy is the product, so isolation precedes the performance
 layer rather than following it.
@@ -116,8 +117,14 @@ layer rather than following it.
 
 Kept here rather than in a tracker, because a runner's honest limits belong next to its claims:
 
-- **Orphaned containers.** Killing a node mid-step can leave a container running, so `single_use` is
-  true in the ordinary path and not across a crash.
+- **Orphaned containers outlive a crash until the next start.** Killing a node mid-step leaves a
+  live container, because §14.1's teardown is async code that a `SIGKILL` skips. Three things hold
+  the clause and none of them closes the window: the reaper removes every container carrying this
+  runner's label at node start, `--rm` collects any that exit on their own, and `Drop` covers the
+  cases where the node survives. So `single_use` is never violated — nothing is ever *reused* — but
+  a node that crashes and does not come back leaves a job's process running with its workspace still
+  mounted, and no other node will clean it up, because the label is deliberately scoped so one
+  runner cannot reap another's.
 - **Revocation reaches a credential the package proxy already holds, but not one already on the
   wire.** The proxy re-asserts the job's capability with the broker before every use, so a revoke or
   a crypto-shred stops the *next* package request and destroys the decrypted copy; an upstream
@@ -129,6 +136,12 @@ Kept here rather than in a tracker, because a runner's honest limits belong next
   (`empty`) fails closed; the `*` configuration trusts Hull completely.
 - **Crypto-shredding via Infisical is unverified** — the delete endpoint exists; whether it destroys
   key material or soft-deletes is not documented, so it ships described as revocation.
+- **An undelivered verdict can still be dropped under memory pressure.** The outbox never lets the
+  retention clock forget a job Hull has not acknowledged, but the hard `max_jobs` ceiling can, once
+  every delivered job has already been evicted — loudly, naming the job. Its journal entry survives
+  on disk, so a restart answers it; nothing else in the running process will. The alternative, an
+  absolute exemption, turns a Hull that refuses every callback while still dispatching into an
+  unbounded store.
 - **Tenant names are case-sensitive**, so `HULL_CI_TRUSTED_TENANTS` must spell a tenant the way Hull
   spells it. Getting it wrong is quiet in the right direction — every job runs as an outsider and
   comes back `errored` — but the reason is in the verdict, not in the startup banner. This is

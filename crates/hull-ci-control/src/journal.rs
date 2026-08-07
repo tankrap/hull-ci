@@ -29,8 +29,16 @@
 //!
 //! The middle row is what makes this an outbox rather than a crash log. A verdict whose delivery
 //! failed (`report_failed`) leaves Hull exactly as wedged as one that was never computed, so the
-//! entry has to outlive the failed delivery and be retried on the next start — see the settle site in
-//! [`crate::control`].
+//! entry has to outlive the failed delivery — see the settle site in [`crate::control`].
+//!
+//! It is then retried from **two** places, and it needs both:
+//!
+//! * in this process, by `Control::drain_undelivered`, whenever a later dispatch arrives. An
+//!   unreachable Hull is the likelier failure, and a runner that is still up and still holding the
+//!   verdict must not need a restart to try again;
+//! * at the next start, by `hull_ci_server::journal::recover`, which is the only thing that can
+//!   answer a debt this process no longer remembers — one it crashed on, or one eviction gave up
+//!   under cap pressure (see [`JobStore::evict`](crate::store::JobStore::evict)).
 //!
 //! ## Why `record` is fallible and `forget` is not
 //!

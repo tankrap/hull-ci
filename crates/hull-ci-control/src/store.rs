@@ -135,19 +135,41 @@ impl JobStore {
     /// and describes our re-report as a convenience that heals a lost callback. Trading it for a
     /// bounded process is the right way round; the alternative is a store that grows until the
     /// process dies, which loses every verdict rather than one.
+    ///
+    /// # A settled job is not necessarily a paid one
+    ///
+    /// `ReportFailed` is settled — the work is over — but Hull never heard the verdict, so its tree is
+    /// as wedged as one that never ran (spec §10: Hull does not poll us, and clears its in-flight set
+    /// only in the callback handler). Those jobs are exactly the ones `Control::drain_undelivered`
+    /// exists to retry while this process is alive, and eviction is the one thing that can put them
+    /// out of its reach: after eviction only the journal entry remains, and that is drained on the
+    /// *next start*, so a long-lived runner would never answer them at all.
+    ///
+    /// So the sweep runs in two passes, and the difference between them is the whole point:
+    ///
+    /// 1. **Paid** jobs — [`Reported`](crate::model::JobState::Reported), Hull has the verdict — are
+    ///    evicted by the retention clock or by cap pressure, oldest first, exactly as before.
+    /// 2. **Owed** jobs — settled but still [owing a verdict](crate::model::JobState::owes_a_verdict)
+    ///    — are *never* dropped by the retention clock. Time passing is not evidence that a debt was paid,
+    ///    and an hour of silence is the case the outbox was built for.
+    ///
+    /// A debt is dropped only as the last thing standing between this process and its hard `max_jobs`
+    /// ceiling, after every paid job has already gone — and then **loudly**, at alert level, naming
+    /// the job. The invariant that buys is "a job whose verdict was never delivered is not *silently*
+    /// forgotten", not "is never forgotten": the residual failure mode is real and worth stating
+    /// plainly. Under sustained cap pressure with an unreachable Hull, the oldest debts leave memory
+    /// and no dispatch will retry them again in this process. Their journal entries survive on disk,
+    /// so a restart still answers them; nothing else will. The alternative — exempting them
+    /// absolutely — turns a Hull that refuses every callback while continuing to dispatch (a wrong
+    /// secret, a 404 route) into an unbounded store and eventually a runner that dies holding every
+    /// verdict it ever computed, which is strictly worse than losing the oldest few.
     pub fn evict(&mut self, now: Instant, retention: Duration, max_jobs: usize) -> usize {
-        let mut settled: Vec<(Instant, JobId)> = self
-            .by_id
-            .values()
-            .filter_map(|j| j.settled_at.map(|t| (t, j.id.clone())))
-            .collect();
-        // Oldest first, so both passes below take from the same end.
-        settled.sort_by_key(|(t, _)| *t);
+        // The two classes, each oldest-first so both passes below take from the same end.
+        let paid = self.settled_oldest_first(false);
+        let owed = self.settled_oldest_first(true);
 
         let mut removed = 0;
-        let mut i = 0;
-        while i < settled.len() {
-            let (settled_at, id) = &settled[i];
+        for (settled_at, id) in &paid {
             let too_old = now.duration_since(*settled_at) >= retention;
             let over_cap = self.by_id.len() - removed > max_jobs;
             if !too_old && !over_cap {
@@ -155,7 +177,26 @@ impl JobStore {
             }
             self.remove(id);
             removed += 1;
-            i += 1;
+        }
+
+        // Debts, and only under the hard cap. No retention clause: see the note above.
+        for (_, id) in &owed {
+            if self.by_id.len() - removed <= max_jobs {
+                break;
+            }
+            // Alert level, because this is the one path in the system that gives up on answering a
+            // dispatch we acked. Not silent, and not the end of the story either — the journal entry
+            // is still on disk and the next start drains it (`hull_ci_server::journal::recover`).
+            tracing::error!(
+                alert = true,
+                job_id = %id,
+                max_jobs,
+                "dropping a job whose verdict Hull never received — the store is at its cap with \
+                 nothing paid left to evict; nothing in this process will retry it again, and only a \
+                 restart will answer it from the journal"
+            );
+            self.remove(id);
+            removed += 1;
         }
 
         if self.by_id.len() > max_jobs {
@@ -166,6 +207,21 @@ impl JobStore {
             );
         }
         removed
+    }
+
+    /// Settled jobs that do (or do not) still owe Hull an answer, oldest settlement first.
+    ///
+    /// A live job is in neither list: it has no `settled_at`, which is what makes "a running job is
+    /// never evicted" structural rather than a check somebody has to remember to write.
+    fn settled_oldest_first(&self, owing: bool) -> Vec<(Instant, JobId)> {
+        let mut out: Vec<(Instant, JobId)> = self
+            .by_id
+            .values()
+            .filter(|j| j.state.owes_a_verdict() == owing)
+            .filter_map(|j| j.settled_at.map(|t| (t, j.id.clone())))
+            .collect();
+        out.sort_by_key(|(t, _)| *t);
+        out
     }
 
     /// Forget one job and its index entry.
@@ -334,6 +390,70 @@ mod retention_tests {
         let again = store.admit(dispatch("t/r", "tree1"), AuthorClass::Member, t0, Duration::from_secs(60));
         assert!(matches!(again, Admit::Created { .. }), "got {again:?}");
         assert!(store.get(again.job_id()).is_some(), "and the new job is really there");
+    }
+
+    /// A job parked in `report_failed`: settled, but Hull never heard the verdict.
+    fn undelivered_job(store: &mut JobStore, repo: &str, tree: &str, at: Instant) -> JobId {
+        let admit = store.admit(dispatch(repo, tree), AuthorClass::Member, at, Duration::from_secs(60));
+        let id = admit.job_id().to_string();
+        let job = store.get_mut(&id).unwrap();
+        for s in [JobState::Fetching, JobState::Planning, JobState::Running, JobState::Green, JobState::ReportFailed] {
+            job.transition_at(s, at).unwrap();
+        }
+        id
+    }
+
+    #[test]
+    fn a_verdict_hull_never_received_outlives_the_retention_clock() {
+        // The interaction that makes the in-process drain worth having. `report_failed` is settled —
+        // the work is over — so the retention sweep used to take it like any other finished job, and
+        // once it left memory nothing in this process could retry it: only the journal entry remained,
+        // and that is drained at the next start. A long-lived runner would therefore never answer it,
+        // and spec §10 leaves the tree wedged until a human forces a rerun.
+        //
+        // Time passing is not evidence that a debt was paid. An hour of silence is precisely the case
+        // the outbox was built for.
+        let mut store = JobStore::new();
+        let t0 = Instant::now();
+        let paid = settled_job(&mut store, "t/r", "delivered", t0);
+        let owed = undelivered_job(&mut store, "t/r", "undelivered", t0);
+
+        let removed = store.evict(t0 + Duration::from_secs(7200), Duration::from_secs(3600), usize::MAX);
+        assert_eq!(removed, 1, "only the job Hull has already heard about");
+        assert!(store.get(&paid).is_none());
+        assert!(store.get(&owed).is_some(), "an undelivered verdict must still be retryable");
+    }
+
+    #[test]
+    fn the_cap_takes_delivered_jobs_first_and_a_debt_only_as_a_last_resort() {
+        // The other half, and the honest one: `max_jobs` stays a real ceiling. A Hull that refuses
+        // every callback while continuing to dispatch — a wrong secret, a 404 route — would otherwise
+        // grow the store without bound and eventually take the runner down holding every verdict it
+        // ever computed, which is worse than losing the oldest few.
+        //
+        // So debts are evicted last, after every delivered job has gone, and never on age alone. The
+        // oldest job here is a debt and it still outlives two newer delivered ones.
+        let mut store = JobStore::new();
+        let t0 = Instant::now();
+        let owed = undelivered_job(&mut store, "t/r", "undelivered", t0);
+        let newer_paid = settled_job(&mut store, "t/r", "b", t0 + Duration::from_secs(1));
+        settled_job(&mut store, "t/r", "c", t0 + Duration::from_secs(2));
+
+        let removed = store.evict(t0 + Duration::from_secs(3), Duration::from_secs(3600), 2);
+        assert_eq!(removed, 1);
+        assert!(store.get(&newer_paid).is_none(), "the oldest *delivered* job goes first");
+        assert!(store.get(&owed).is_some(), "even though the debt is older still");
+
+        // Pressed again, the last delivered job goes and the debt still does not.
+        assert_eq!(store.evict(t0 + Duration::from_secs(4), Duration::from_secs(3600), 1), 1);
+        assert!(store.get(&owed).is_some(), "a debt is the last thing in the store to be given up");
+
+        // Only when it is the sole thing between this process and its ceiling. That drop is logged at
+        // alert level, because it is the one path in the system that gives up on answering a dispatch
+        // we acked — and its journal entry survives, so a restart still answers it. Nothing else will.
+        assert_eq!(store.evict(t0 + Duration::from_secs(5), Duration::from_secs(3600), 0), 1);
+        assert!(store.get(&owed).is_none());
+        assert!(store.is_empty());
     }
 
     #[test]

@@ -40,6 +40,14 @@ enum Script {
     FailingThenOk(u32),
     AlwaysFailing,
     AlwaysStatus(u16),
+    /// Fail `fail_fast` times immediately, then **hold** every later attempt for `hold` without ever
+    /// answering — a Hull that has stopped talking rather than one that refuses.
+    ///
+    /// The only way to observe a delivery *while it is in flight*: every other script answers within
+    /// the same poll, so "a delivery is running right now" is a state a test could otherwise never
+    /// catch, and the guard against starting a second one for the same job would be asserted against
+    /// a window that never opens.
+    FailingThenStalling { fail_fast: u32, hold: Duration },
 }
 
 pub struct ScriptedTransport {
@@ -57,6 +65,14 @@ impl ScriptedTransport {
     }
     pub fn always_status(status: u16) -> Self {
         ScriptedTransport { script: Script::AlwaysStatus(status), attempts: AtomicU32::new(0), seen: Mutex::new(Vec::new()) }
+    }
+    /// Fail `n` times fast — enough to spend a short retry budget — then stop answering altogether.
+    pub fn failing_then_stalling(n: u32, hold: Duration) -> Self {
+        ScriptedTransport {
+            script: Script::FailingThenStalling { fail_fast: n, hold },
+            attempts: AtomicU32::new(0),
+            seen: Mutex::new(Vec::new()),
+        }
     }
     pub fn ok() -> Self {
         Self::failing_then_ok(0)
@@ -80,6 +96,14 @@ impl CallbackTransport for ScriptedTransport {
                     Err(TransportError::Send("connection refused".into()))
                 }
                 Script::AlwaysStatus(s) => Ok(CallbackResponse { status: s }),
+                Script::FailingThenStalling { fail_fast, hold } => {
+                    // Counted and recorded *before* the hold, so a test can see the attempt begin —
+                    // which is the whole point of this script.
+                    if n > fail_fast {
+                        tokio::time::sleep(hold).await;
+                    }
+                    Err(TransportError::Send("connection refused".into()))
+                }
             }
         })
     }

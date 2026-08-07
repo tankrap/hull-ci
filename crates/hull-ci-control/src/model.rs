@@ -63,6 +63,21 @@ impl JobState {
         self.has_verdict()
     }
 
+    /// Hull has **not** confirmed hearing this job's answer.
+    ///
+    /// True in every state except [`Reported`](JobState::Reported), the live ones included, because
+    /// this is the in-memory spelling of exactly the condition under which the write-ahead journal
+    /// keeps an entry (see [`crate::journal`]): the entry is written at accept and dropped only when a
+    /// delivery lands. The two readings have to agree. A debt the journal still holds but that memory
+    /// has already forgotten cannot be retried by this process at all — nothing in it can see the
+    /// entry — and spec §10 gives no second chance, since Hull never polls us and clears its in-flight
+    /// set only in the callback handler. The tree then stays wedged until a human forces a rerun.
+    ///
+    /// Used by [`JobStore::evict`](crate::store::JobStore::evict) to decide what retention may drop.
+    pub fn owes_a_verdict(self) -> bool {
+        !matches!(self, JobState::Reported)
+    }
+
     pub fn as_str(self) -> &'static str {
         match self {
             JobState::Queued => "queued",
@@ -371,6 +386,27 @@ pub struct Job {
     /// deployment looks stuck (design D§11.1). `report_attempts` remains the *settled* count — this
     /// is the live one, and they answer different questions.
     pub delivery: Option<crate::callback::DeliveryProgress>,
+    /// A delivery attempt owns this job's verdict **right now**.
+    ///
+    /// The claim that keeps two senders off one job (see `Control::claim_delivery`). Taken and
+    /// released under the store lock, so the check and the take are one step: a verdict delivered
+    /// twice is harmless by spec §9, but two senders racing on the same job also race on
+    /// `report_attempts`, on the `Reported` transition, and on the journal entry one of them is about
+    /// to forget while the other is still trying.
+    ///
+    /// **Not** [`delivery`](Self::delivery), which is observability: that field is published by the
+    /// sender's progress sink and is therefore `None` for the whole window between a delivery being
+    /// decided on and its first attempt beginning. A guard reading it would have a hole exactly one
+    /// task-spawn wide — which is precisely the moment the redelivery drain runs, since both are
+    /// started from an arriving dispatch.
+    pub delivering: bool,
+    /// When a delivery for this job was last claimed or released — the clock the redelivery cooldown
+    /// runs against (see `ControlConfig::redeliver_interval`).
+    ///
+    /// Stamped at both ends of a delivery, so the cooldown measures the gap *between* runs rather than
+    /// between their starts: a run against an unreachable Hull spends the whole retry budget, and a
+    /// cooldown measured from its start would already have expired by the time that run gave up.
+    pub last_delivery_at: Option<Instant>,
     /// When this job first reached a terminal state, for retention (see [`JobStore::evict`]).
     ///
     /// `None` while the job is live, which is what makes eviction safe by construction: there is no
@@ -415,8 +451,30 @@ impl Job {
             report_attempts: 0,
             callback_urls,
             delivery: None,
+            delivering: false,
+            last_delivery_at: None,
             settled_at: None,
         }
+    }
+
+    /// A verdict Hull never received, that nothing is currently retrying, and that has been left
+    /// alone long enough to be worth another go.
+    ///
+    /// The predicate the redelivery drain selects on *and* re-checks under the lock it takes the
+    /// claim with (`Control::drain_undelivered`), written once so the two cannot drift apart. Each
+    /// clause prevents a different failure:
+    ///
+    /// * `ReportFailed` only — a job still delivering has not failed yet, and a `Reported` one has
+    ///   nothing owing. Re-sending either would be traffic Hull did not need.
+    /// * `!delivering` — a second sender for a job that already has one is the double-send this claim
+    ///   exists to stop. During a *redelivery* the state stays `ReportFailed` the whole time, so the
+    ///   state clause alone would not catch it.
+    /// * the cooldown — a burst of dispatches is a burst of drains, and without this each one would
+    ///   be another retry against a Hull that is, by hypothesis, still down.
+    pub fn awaits_redelivery(&self, now: Instant, cooldown: Duration) -> bool {
+        self.state == JobState::ReportFailed
+            && !self.delivering
+            && self.last_delivery_at.is_none_or(|t| now.saturating_duration_since(t) >= cooldown)
     }
 
     /// The idempotency key of spec §9 / design D§4.1: `(repo, tree_id)`.

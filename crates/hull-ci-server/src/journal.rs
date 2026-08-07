@@ -225,6 +225,12 @@ impl Journal for FileJournal {
 /// A failure to deliver **keeps** the entry and does not stop startup. The runner has jobs to serve,
 /// and an entry that survives is one the next start will try again; refusing to boot because Hull is
 /// unreachable would take the runner down for the duration of Hull's outage.
+///
+/// This pass is not the only retry, and must not be read as one. Once the runner is serving,
+/// `hull_ci_control::Control::drain_undelivered` retries a parked verdict whenever a later dispatch
+/// arrives, so an unreachable Hull that comes back does not need a restart to be told what happened.
+/// What is left to *this* pass is the debt the running process cannot see: a job it crashed on, and a
+/// job its bounded store had to give up.
 pub async fn recover(
     journal: &dyn Journal,
     transport: &dyn CallbackTransport,

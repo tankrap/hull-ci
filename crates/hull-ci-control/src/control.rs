@@ -77,6 +77,20 @@ pub struct ControlConfig {
     /// Hard ceiling on jobs held in memory. Settled jobs are evicted oldest-first to meet it; live
     /// jobs never are, so this can be exceeded by a burst of concurrent work rather than by history.
     pub max_jobs: usize,
+    /// How many parked verdicts one [`accept`](Control::accept) may hand back to the callback sender
+    /// (see `Control::drain_undelivered`).
+    ///
+    /// A ceiling on the *burst*, not on the rate: a thousand jobs parked against a Hull that is still
+    /// down must not become a thousand simultaneous POSTs the moment one dispatch arrives. The
+    /// per-job [`redeliver_interval`](Self::redeliver_interval) is what bounds the sustained rate.
+    pub redeliver_max_per_accept: usize,
+    /// The shortest gap between two redelivery runs **for the same job**.
+    ///
+    /// Dispatches arrive at machine rates; without this, one busy repo would turn every parked
+    /// verdict into a retry per dispatch. Measured from the end of the previous run
+    /// ([`Job::last_delivery_at`](crate::model::Job::last_delivery_at)), so a run that spends its
+    /// whole retry budget is followed by a real pause rather than an immediate re-run.
+    pub redeliver_interval: Duration,
     /// How the fleet is divided between tenants: weights, plan quotas, and priority classes
     /// (design D§4.5). See [`crate::fairshare`].
     pub fair_share: FairShare,
@@ -100,6 +114,15 @@ impl Default for ControlConfig {
             // its own delivery is still being attempted.
             job_retention: Duration::from_secs(60 * 60),
             max_jobs: 10_000,
+            // Two, not one: after Hull comes back the parked set has to *shrink*, and a drain of one
+            // per dispatch can only keep pace with the dispatch rate rather than eat into a backlog.
+            // Two, not twenty: each one is a full retry run against a Hull that may still be down.
+            redeliver_max_per_accept: 2,
+            // A minute. Long enough that a burst of dispatches cannot become a burst of retries
+            // against an unwell Hull, and far shorter than the alternative it replaces — which was a
+            // process restart. Comfortably under the default retry budget too, so the pause between
+            // runs is never the thing that dominates recovery time.
+            redeliver_interval: Duration::from_secs(60),
             fair_share: FairShare::default(),
             memo: MemoConfig::default(),
         }
@@ -301,14 +324,140 @@ impl Control {
             }
             Admit::Finished { .. } => {
                 // Cheap, and it heals a lost callback (design D§4.1).
-                tracing::info!(%job_id, %repo, %tree_id, "duplicate dispatch for a finished job — re-reporting");
-                let ctrl = Arc::clone(self);
-                let id = job_id.clone();
-                tokio::spawn(async move { ctrl.report(&id).await });
+                //
+                // Behind the claim like every other sender. Losing it means a delivery for this job
+                // is already in flight, which is not a reason to start a second one: the URL this
+                // dispatch just attached is picked up by the run that is already going, because
+                // `report` re-reads the destination set before it finishes.
+                if self.claim_delivery(&job_id, Instant::now()) {
+                    tracing::info!(%job_id, %repo, %tree_id, "duplicate dispatch for a finished job — re-reporting");
+                    let ctrl = Arc::clone(self);
+                    let id = job_id.clone();
+                    tokio::spawn(async move { ctrl.report(&id).await });
+                } else {
+                    tracing::info!(
+                        %job_id, %repo, %tree_id,
+                        "duplicate dispatch for a finished job — a delivery is already in flight and will carry it"
+                    );
+                }
             }
         }
 
+        // **Amortized redelivery**, in the same spirit as the eviction pressure above and for the
+        // same reason: a dispatch arriving is cheap, honest evidence that this process is alive and
+        // that time has passed, so it is where parked verdicts get another go — no background task to
+        // own, supervise and shut down. Spawns; never waits (see `drain_undelivered`).
+        self.drain_undelivered(&job_id);
+
         Ok(Accepted { job_id, duplicate: admit.is_duplicate() })
+    }
+
+    /// Hand a few verdicts Hull never received back to the callback sender.
+    ///
+    /// The gap this closes. Delivery retries on a [`RetryPolicy`] and then gives up, parking the job
+    /// in [`JobState::ReportFailed`] with its journal entry deliberately retained — and until now that
+    /// entry was retried *only at the next process start*
+    /// (`hull_ci_server::journal::recover`). So the one failure the outbox was built for — Hull
+    /// unreachable for longer than the retry budget — was the one it could not fix on its own: Hull
+    /// comes back, this runner is still up, still healthy, still holding the computed verdict, and
+    /// never tries again. Spec §10 means the tree stays wedged for as long as that lasts, because Hull
+    /// neither polls us nor times the job out, and an ordinary re-check comes back `Pending`.
+    ///
+    /// Four properties, each pinned by a test:
+    ///
+    /// * **Only parked jobs.** [`Job::awaits_redelivery`] is the whole predicate, and it is re-checked
+    ///   under the lock that takes the claim rather than trusted from the scan above it.
+    /// * **One sender per job.** The claim is the thing that makes that true; the scan is only a
+    ///   suggestion, and a job someone else claimed in between is skipped.
+    /// * **Bounded and rate-limited**, by `redeliver_max_per_accept` and `redeliver_interval`. A burst
+    ///   of dispatches during an outage must not become a burst of retries against a Hull that is
+    ///   still down.
+    /// * **Never on the ack path.** Each retry is spawned, exactly as `accept` spawns `drive` and the
+    ///   `Admit::Finished` re-report. Spec §5 makes the ack mean *accepted*, and it has to stay fast.
+    ///
+    /// The job this dispatch was *about* is excluded: `accept`'s own branches above already own it,
+    /// and driving it from here as well would be the double-send one level up from the claim.
+    ///
+    /// Oldest debt first, so a steady trickle of dispatches works through a backlog instead of
+    /// re-serving whichever job the hash map happened to yield first.
+    fn drain_undelivered(self: &Arc<Self>, just_admitted: &str) {
+        let now = Instant::now();
+        let interval = self.config.redeliver_interval;
+        let mut due: Vec<(Instant, JobId)> = self.with_jobs(|jobs| {
+            jobs.filter(|job| job.id != just_admitted && job.awaits_redelivery(now, interval))
+                .map(|job| (job.last_delivery_at.unwrap_or(job.created_at), job.id.clone()))
+                .collect()
+        });
+        due.sort_by_key(|(last, _)| *last);
+
+        for (_, job_id) in due.into_iter().take(self.config.redeliver_max_per_accept) {
+            // The scan ran under a lock this call has since dropped, so everything it decided is
+            // re-decided here, atomically, before a task exists.
+            if !self.claim_delivery_if_parked(&job_id, now) {
+                continue;
+            }
+            tracing::info!(
+                %job_id,
+                "retrying a verdict Hull never received (spec §10: silence wedges the tree)"
+            );
+            let ctrl = Arc::clone(self);
+            tokio::spawn(async move { ctrl.report(&job_id).await });
+        }
+    }
+
+    /// Take the exclusive right to deliver this job's verdict, or answer `false` if a delivery
+    /// already holds it.
+    ///
+    /// Check and take in one step, under the store lock, because a claim with a gap in it is not a
+    /// claim: `accept` and the drain both start their senders from an arriving dispatch, so the gap
+    /// would be sampled by the very thing it is meant to exclude. [`Control::report`] releases it on
+    /// every exit path.
+    ///
+    /// A missing job answers `false`: it was evicted or rolled back, and there is nothing to deliver.
+    ///
+    /// The residual, stated plainly: a claim is released by the task that took it, so a delivery task
+    /// that is dropped without running — a runtime shutting down mid-spawn — leaks the claim, and that
+    /// job gets no further retries *in this process*. Its journal entry is untouched, so the next
+    /// start still answers it. Nothing worse than the behaviour that existed before this drain.
+    fn claim_delivery(&self, job_id: &str, now: Instant) -> bool {
+        self.with_job_mut(job_id, |job| {
+            if job.delivering {
+                return false;
+            }
+            job.delivering = true;
+            job.last_delivery_at = Some(now);
+            true
+        })
+        .unwrap_or(false)
+    }
+
+    /// [`Control::claim_delivery`], but only for a job that is genuinely parked and off its cooldown.
+    ///
+    /// Separate from the unconditional claim because the callers differ in kind: `finish` and the
+    /// `Admit::Finished` re-report own a verdict outright and are *entitled* to send it, while the
+    /// drain is speculative and must not touch a job that is mid-delivery, already answered, or
+    /// retried a moment ago. Sharing [`Job::awaits_redelivery`] with the scan keeps the two readings
+    /// of "parked" from drifting.
+    fn claim_delivery_if_parked(&self, job_id: &str, now: Instant) -> bool {
+        let interval = self.config.redeliver_interval;
+        self.with_job_mut(job_id, |job| {
+            if !job.awaits_redelivery(now, interval) {
+                return false;
+            }
+            job.delivering = true;
+            job.last_delivery_at = Some(now);
+            true
+        })
+        .unwrap_or(false)
+    }
+
+    /// Give the claim back, and start the cooldown from *now* rather than from when delivery began.
+    fn release_delivery(&self, job_id: &str) {
+        let now = Instant::now();
+        self.with_job_mut(job_id, |job| {
+            job.delivering = false;
+            job.last_delivery_at = Some(now);
+        });
     }
 
     /// Write the journal entry for `job_id` from the job record as it stands right now.
@@ -1020,55 +1169,94 @@ impl Control {
             // verdict exists. Delivery is bookkeeping about telling someone, and bookkeeping must
             // never hold a slot.
             self.retire(job_id);
-            self.report(job_id).await;
+            // Behind the claim like every other sender. It cannot normally be refused — the drain
+            // only ever claims a `ReportFailed` job and this one has just decided — but a duplicate
+            // dispatch that raced this verdict may already have taken it, in which case that sender
+            // delivers exactly the same thing and a second run would be pure duplicate traffic.
+            if self.claim_delivery(job_id, Instant::now()) {
+                self.report(job_id).await;
+            } else {
+                tracing::debug!(%job_id, "a delivery for this verdict is already in flight");
+            }
         }
     }
 
     /// Deliver (or re-deliver) the recorded verdict. Safe to call more than once — spec §9 makes a
     /// duplicate callback explicitly a re-affirmation.
+    ///
+    /// **The caller must hold the delivery claim** ([`Control::claim_delivery`]); this releases it on
+    /// every exit path. The claim is taken by the caller rather than here because every caller starts
+    /// this on a spawned task, and a claim taken inside the task would be taken one scheduling gap
+    /// too late — which is exactly when the next dispatch, and with it the next drain, arrives.
     async fn report(&self, job_id: &str) {
-        // One verdict, but possibly several places that asked for it: work is deduplicated by
-        // (repo, tree_id), delivery is not (see `Job::callback_urls`).
-        let Some(Some(reqs)) = self.with_job(job_id, |job| {
-            job.verdict.clone().map(|verdict| {
-                job.callback_urls
-                    .iter()
-                    .map(|url| CallbackRequest {
-                        // Verbatim (spec §5).
-                        url: url.clone(),
-                        secret: self.config.secret.clone(),
-                        verdict: verdict.clone(),
-                        job_id: job.id.clone(),
-                    })
-                    .collect::<Vec<_>>()
-            })
-        }) else {
-            return;
-        };
-
         // Every destination is attempted, and one unreachable Hull must not suppress the others; the
         // job counts as reported if *any* delivery landed, and parked only if they all failed.
+        let mut attempted: Vec<String> = Vec::new();
         let mut attempts_total = 0;
         let mut any_delivered = false;
-        for req in &reqs {
-            // Publish each attempt into the job record as it happens, so a stuck delivery is visible
-            // while it is stuck rather than only in the post-mortem (D§11.1).
-            let jobs = &self.jobs;
-            let id = job_id.to_string();
-            let sink = move |p: DeliveryProgress| {
-                if let Ok(mut store) = jobs.lock() {
-                    if let Some(job) = store.get_mut(&id) {
-                        job.delivery = Some(p);
+
+        // One verdict, but possibly several places that asked for it: work is deduplicated by
+        // (repo, tree_id), delivery is not (see `Job::callback_urls`).
+        //
+        // Re-read between passes rather than snapshotted once, because a duplicate dispatch attaches
+        // its `callback_url` to a job that may already be mid-delivery, and that dispatch is acked on
+        // the strength of the delivery in flight (see the `Admit::Finished` branch of `accept`). A
+        // single snapshot would leave a URL that arrived a moment too late waiting forever on an
+        // answer delivered somewhere else — a change that hangs unverified, which is the same wedge
+        // one level down. Terminates: the URL set is finite and de-duplicated.
+        loop {
+            let Some(Some(reqs)) = self.with_job(job_id, |job| {
+                job.verdict.clone().map(|verdict| {
+                    job.callback_urls
+                        .iter()
+                        .filter(|url| !attempted.iter().any(|done| done == *url))
+                        .map(|url| CallbackRequest {
+                            // Verbatim (spec §5).
+                            url: url.clone(),
+                            secret: self.config.secret.clone(),
+                            verdict: verdict.clone(),
+                            job_id: job.id.clone(),
+                        })
+                        .collect::<Vec<_>>()
+                })
+            }) else {
+                break;
+            };
+            if reqs.is_empty() {
+                break;
+            }
+
+            for req in &reqs {
+                attempted.push(req.url.clone());
+                // Publish each attempt into the job record as it happens, so a stuck delivery is
+                // visible while it is stuck rather than only in the post-mortem (D§11.1).
+                let jobs = &self.jobs;
+                let id = job_id.to_string();
+                let sink = move |p: DeliveryProgress| {
+                    if let Ok(mut store) = jobs.lock() {
+                        if let Some(job) = store.get_mut(&id) {
+                            job.delivery = Some(p);
+                        }
                     }
-                }
-            };
-            let outcome =
-                deliver_reporting(&*self.deps.transport, req, &self.config.retry, &sink).await;
-            attempts_total += match &outcome {
-                Delivery::Delivered { attempts, .. } | Delivery::Parked { attempts, .. } => *attempts,
-            };
-            any_delivered |= outcome.is_delivered();
+                };
+                let outcome =
+                    deliver_reporting(&*self.deps.transport, req, &self.config.retry, &sink).await;
+                attempts_total += match &outcome {
+                    Delivery::Delivered { attempts, .. } | Delivery::Parked { attempts, .. } => {
+                        *attempts
+                    }
+                };
+                any_delivered |= outcome.is_delivered();
+            }
         }
+
+        if attempted.is_empty() {
+            // The job was evicted or rolled back under us, or never had a verdict. Nothing was sent,
+            // so nothing about its state is ours to change — but the claim is still ours to give back.
+            self.release_delivery(job_id);
+            return;
+        }
+
         // Delivery is over, one way or the other; `report_attempts` below is the settled record.
         self.with_job_mut(job_id, |job| job.delivery = None);
         let outcome_delivered = any_delivered;
@@ -1089,14 +1277,23 @@ impl Control {
             // this an outbox rather than a crash log. A verdict that was computed but never delivered
             // leaves Hull exactly as wedged as one that was never computed — its in-flight set is only
             // cleared by the callback handler (spec §10: "Hull does not poll you") — so the entry has
-            // to outlive the failed delivery and be retried on the next start. Forgetting here on both
-            // outcomes would mean the journal only survived crashes and quietly dropped every job that
-            // exhausted its retry budget against an unreachable Hull, which is the *likelier* failure.
+            // to outlive the failed delivery. Forgetting here on both outcomes would mean the journal
+            // only survived crashes and quietly dropped every job that exhausted its retry budget
+            // against an unreachable Hull, which is the *likelier* failure.
+            //
+            // What retries the kept entry: `Control::drain_undelivered`, on the next dispatch, for as
+            // long as this process lives; and `hull_ci_server::journal::recover` at the next start,
+            // for a debt this process no longer remembers.
             self.deps.journal.forget(job_id);
             // The driver is done with this job; drop its waker so a long-lived process does not
             // accumulate one per job it has ever seen.
             self.wakers.lock().unwrap_or_else(|e| e.into_inner()).remove(job_id);
         }
+
+        // **Last**, after the state above has settled. Releasing first would expose a job that is
+        // about to become `Reported` while it still reads `ReportFailed`, and the next dispatch's
+        // drain would claim and re-send a verdict Hull already has.
+        self.release_delivery(job_id);
     }
 }
 
@@ -2678,5 +2875,336 @@ mod journal_tests {
         journal.forget(&owed[0].job_id);
         assert!(journal.outstanding().unwrap().is_empty());
         drop(restarted);
+    }
+}
+
+/// **The in-process drain**: verdicts Hull never received get another go while this process is alive.
+///
+/// The gap these pin, stated once. Delivery retries on a [`RetryPolicy`] and then parks the job in
+/// [`JobState::ReportFailed`], keeping its journal entry — but that entry used to be retried *only at
+/// the next process start*. So the likeliest failure of all, Hull unreachable for longer than the
+/// retry budget, was the one the outbox could not fix by itself: Hull comes back, this runner is still
+/// up and still holding the computed verdict, and never tries again. Spec §10 leaves the tree wedged
+/// for the duration, because Hull neither polls us nor times the job out and an ordinary re-check
+/// answers `Pending`.
+#[cfg(test)]
+mod redelivery_tests {
+    use super::*;
+    use crate::journal::{Journal, MemJournal};
+    use crate::testing::{
+        dispatch, fast_config, harness_full, stays_false, step_report, wait_until, Harness, NodeMode,
+        OkFetcher, ScriptedTransport, StaticPlanner,
+    };
+    use hull_ci_proto::{Status, StepOutcome};
+
+    /// A control plane whose fleet accepts, over a caller-chosen transport and journal.
+    fn over(
+        config: ControlConfig,
+        transport: Arc<ScriptedTransport>,
+        journal: Arc<dyn Journal>,
+    ) -> Harness {
+        harness_full(
+            config,
+            Arc::new(OkFetcher),
+            Arc::new(StaticPlanner::steps(1)),
+            NodeMode::Accept,
+            transport,
+            journal,
+        )
+    }
+
+    /// [`over`] with a journal nobody inspects.
+    fn plain(config: ControlConfig, transport: Arc<ScriptedTransport>) -> Harness {
+        over(config, transport, Arc::new(MemJournal::default()))
+    }
+
+    /// Accept `tree`, pass its one step, and wait for the delivery to fail — a job parked in
+    /// `report_failed` holding a real verdict Hull never got. The state everything below starts from.
+    async fn park(h: &Harness, tree: &str) -> JobId {
+        let accepted = h.control.accept(dispatch("t/r", tree)).unwrap();
+        let job_id = accepted.job_id;
+
+        let ctrl = Arc::clone(&h.control);
+        let id = job_id.clone();
+        assert!(
+            wait_until(move || ctrl.with_job(&id, |j| j.steps.len() == 1).unwrap_or(false)).await,
+            "the step never reached the fleet"
+        );
+        let step = h.control.with_job(&job_id, |j| j.steps[0].id.clone()).unwrap();
+        h.control
+            .record_step_report(&step_report(&job_id, &step, StepOutcome::Passed, "ok"), "node-test")
+            .expect("the lease holder is believed");
+
+        let ctrl = Arc::clone(&h.control);
+        let id = job_id.clone();
+        assert!(
+            wait_until(move || ctrl.job_state(&id) == Some(JobState::ReportFailed)).await,
+            "the job should be parked with an undelivered verdict"
+        );
+        job_id
+    }
+
+    /// Accept work that never finishes, so a dispatch can be used purely as the *signal* the drain
+    /// runs on without its own job producing a verdict — and therefore any callback traffic — of its
+    /// own.
+    fn dispatch_only(h: &Harness, tree: &str) {
+        h.control.accept(dispatch("t/r", tree)).unwrap();
+    }
+
+    /// Make a minute pass for one job, which no test can do by waiting.
+    ///
+    /// The cooldown is deliberately long enough (a minute by default) that a test cannot sleep
+    /// through it, so the clock is moved instead of the test. Reaching into the record is the point:
+    /// the *only* thing altered is when the last delivery happened.
+    fn age_out_cooldown(ctrl: &Control, job_id: &str) {
+        let then = Instant::now()
+            .checked_sub(ctrl.config().redeliver_interval + Duration::from_secs(1))
+            .expect("the machine has been up for longer than one cooldown");
+        ctrl.with_job_mut(job_id, |job| job.last_delivery_at = Some(then))
+            .expect("the job is still held");
+    }
+
+    /// How many times the transport was handed this job's verdict.
+    fn sent_for(h: &Harness, job_id: &str) -> usize {
+        h.transport.seen().into_iter().filter(|r| r.job_id == job_id).count()
+    }
+
+    #[tokio::test]
+    async fn a_parked_verdict_is_retried_by_the_next_dispatch_and_lands_once_hull_returns() {
+        // The whole feature in one test. `fast_config`'s budget is three attempts, so the first three
+        // posts are the initial delivery failing; the fourth is the drain's, and it is the one that
+        // unwedges the tree.
+        let journal = Arc::new(MemJournal::default());
+        let transport = Arc::new(ScriptedTransport::failing_then_ok(3));
+        let h = over(fast_config(), Arc::clone(&transport), Arc::clone(&journal) as Arc<dyn Journal>);
+
+        let parked = park(&h, "tree1").await;
+        assert_eq!(transport.attempts(), 3, "the whole budget was spent, and Hull got nothing");
+        assert!(
+            journal.outstanding().unwrap().iter().any(|e| e.job_id == parked),
+            "the debt is recorded: an undelivered verdict is still owed"
+        );
+
+        // Time passes; a dispatch for unrelated work arrives. That is the entire trigger.
+        age_out_cooldown(&h.control, &parked);
+        dispatch_only(&h, "tree2");
+
+        let ctrl = Arc::clone(&h.control);
+        let id = parked.clone();
+        assert!(
+            wait_until(move || ctrl.job_state(&id) == Some(JobState::Reported)).await,
+            "the parked verdict was never retried — only a restart would have answered it"
+        );
+
+        let landed = h.transport.seen().pop().expect("something was sent");
+        assert_eq!(landed.job_id, parked, "and it was the parked job's own verdict");
+        assert_eq!(landed.verdict.status, Status::Green, "the verdict it computed, not an error");
+        assert_eq!(
+            landed.url, "https://hull.example/api/repos/t/r/change/21ea/ci-result",
+            "spec §5: the callback_url verbatim, on a retry as on the first attempt"
+        );
+        assert!(
+            !journal.outstanding().unwrap().iter().any(|e| e.job_id == parked),
+            "the debt is paid, so nothing is left for the next start to re-send"
+        );
+    }
+
+        /// The claim itself, exercised directly — the race the filter cannot cover.
+    ///
+    /// `a_job_that_is_already_delivering_is_not_sent_a_second_time` proves the drain *scan* skips a
+    /// job that is delivering, and that is the common path. It is not this one: the scan and the
+    /// spawn are separate steps, and between them `finish`, an `Admit::Finished` re-report, or a
+    /// drain running on another accept can start delivering the same job. Only the claim closes
+    /// that window, because only the claim tests and sets under one hold of the store lock.
+    ///
+    /// Verified: deleting the `if job.delivering { return false }` from `claim_delivery` leaves
+    /// every other test in this crate passing, so without this the atomic half of the guard is
+    /// unpinned and a future tidy-up would take it for redundant with the filter.
+    #[tokio::test]
+    async fn only_one_claimant_can_hold_a_delivery_at_a_time() {
+        let transport = Arc::new(ScriptedTransport::failing_then_stalling(3, Duration::from_secs(3600)));
+        let h = plain(fast_config(), Arc::clone(&transport));
+        let parked = park(&h, "tree1").await;
+        age_out_cooldown(&h.control, &parked);
+
+        let now = Instant::now();
+        assert!(h.control.claim_delivery(&parked, now), "an unclaimed job is claimable");
+        assert!(!h.control.claim_delivery(&parked, now), "a second claimant must lose");
+        // The parked variant guards the same field, so it must lose to a held claim too — otherwise
+        // a drain could start a sender for a job `finish` is already delivering.
+        assert!(
+            !h.control.claim_delivery_if_parked(&parked, now),
+            "the drain's claim must also lose to a claim already held"
+        );
+
+        h.control.release_delivery(&parked);
+        age_out_cooldown(&h.control, &parked);
+        assert!(
+            h.control.claim_delivery_if_parked(&parked, Instant::now()),
+            "and releasing it makes the job claimable again, or a failed delivery would park forever"
+        );
+    }
+
+#[tokio::test]
+    async fn a_job_that_is_already_delivering_is_not_sent_a_second_time() {
+        // A redelivery leaves the job in `report_failed` for its whole duration — that is the state
+        // it retries *from* — so the state check alone does not exclude it and the claim is what
+        // does. The cooldown is stepped out of the way on purpose: with it left in place this test
+        // would pass whether or not the claim existed.
+        let transport = Arc::new(ScriptedTransport::failing_then_stalling(3, Duration::from_secs(3600)));
+        let h = plain(fast_config(), Arc::clone(&transport));
+
+        let parked = park(&h, "tree1").await;
+        age_out_cooldown(&h.control, &parked);
+        dispatch_only(&h, "tree2");
+
+        let t = Arc::clone(&transport);
+        assert!(
+            wait_until(move || t.attempts() == 4).await,
+            "the drain should have started a retry, which is now stuck in the transport"
+        );
+        assert!(
+            h.control.with_job(&parked, |j| j.delivering).unwrap(),
+            "and the job is claimed while that retry is in flight"
+        );
+
+        // Even with the cooldown expired *again*, a second dispatch must not start a second sender.
+        age_out_cooldown(&h.control, &parked);
+        dispatch_only(&h, "tree3");
+
+        let t = Arc::clone(&transport);
+        assert!(
+            stays_false(move || t.attempts() > 4).await,
+            "a second delivery was started for a job that was already delivering"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_delivered_verdict_is_never_re_sent_by_the_drain() {
+        // `Reported` means Hull has it. Re-sending would be traffic nobody needs, against the one
+        // endpoint whose availability the whole system depends on — and it would do it on every
+        // dispatch, forever, because a delivered job never leaves that state.
+        let h = plain(fast_config(), Arc::new(ScriptedTransport::ok()));
+
+        let accepted = h.control.accept(dispatch("t/r", "tree1")).unwrap();
+        let ctrl = Arc::clone(&h.control);
+        let id = accepted.job_id.clone();
+        assert!(wait_until(move || ctrl.with_job(&id, |j| j.steps.len() == 1).unwrap_or(false)).await);
+        let step = h.control.with_job(&accepted.job_id, |j| j.steps[0].id.clone()).unwrap();
+        h.control
+            .record_step_report(
+                &step_report(&accepted.job_id, &step, StepOutcome::Passed, "ok"),
+                "node-test",
+            )
+            .unwrap();
+        let ctrl = Arc::clone(&h.control);
+        let id = accepted.job_id.clone();
+        assert!(wait_until(move || ctrl.job_state(&id) == Some(JobState::Reported)).await);
+        assert_eq!(sent_for(&h, &accepted.job_id), 1);
+
+        age_out_cooldown(&h.control, &accepted.job_id);
+        dispatch_only(&h, "tree2");
+        dispatch_only(&h, "tree3");
+
+        let t = Arc::clone(&h.transport);
+        let id = accepted.job_id.clone();
+        assert!(
+            stays_false(move || t.seen().iter().filter(|r| r.job_id == id).count() > 1).await,
+            "a job Hull has already heard about was re-sent"
+        );
+        assert_eq!(sent_for(&h, &accepted.job_id), 1);
+    }
+
+    #[tokio::test]
+    async fn a_burst_of_dispatches_is_not_a_burst_of_retries_for_the_same_job() {
+        // The rate limit, in both directions. Dispatches arrive at machine rates; without a cooldown
+        // every one of them would be another retry against a Hull that is, by hypothesis, still down.
+        let transport = Arc::new(ScriptedTransport::always_failing());
+        let h = plain(fast_config(), Arc::clone(&transport));
+
+        let parked = park(&h, "tree1").await;
+        assert_eq!(transport.attempts(), 3, "the initial delivery spent the budget");
+
+        // Five dispatches, back to back, immediately after the delivery gave up.
+        for tree in ["tree2", "tree3", "tree4", "tree5", "tree6"] {
+            dispatch_only(&h, tree);
+        }
+        let t = Arc::clone(&transport);
+        assert!(
+            stays_false(move || t.attempts() > 3).await,
+            "a job retried a moment ago was retried again by every dispatch in the burst"
+        );
+
+        // And the cooldown expires rather than parking the job forever: one more dispatch, one more
+        // run of the budget, and no more than one however many dispatches follow it.
+        age_out_cooldown(&h.control, &parked);
+        for tree in ["tree7", "tree8", "tree9"] {
+            dispatch_only(&h, tree);
+        }
+        let t = Arc::clone(&transport);
+        assert!(wait_until(move || t.attempts() == 6).await, "the cooldown never expired");
+        let t = Arc::clone(&transport);
+        assert!(stays_false(move || t.attempts() > 6).await, "one run, not three");
+    }
+
+    #[tokio::test]
+    async fn one_dispatch_retries_at_most_the_configured_number_of_jobs() {
+        // The burst cap. A thousand jobs parked against a Hull that is still down must not become a
+        // thousand simultaneous POSTs the moment one dispatch arrives.
+        let transport = Arc::new(ScriptedTransport::always_failing());
+        let h = plain(fast_config(), Arc::clone(&transport));
+        assert_eq!(h.control.config().redeliver_max_per_accept, 2, "the cap this test is written to");
+
+        let parked: Vec<JobId> = {
+            let mut ids = Vec::new();
+            for tree in ["tree1", "tree2", "tree3"] {
+                ids.push(park(&h, tree).await);
+            }
+            ids
+        };
+        assert_eq!(transport.attempts(), 9, "three jobs, three attempts each, nothing retried yet");
+        for id in &parked {
+            age_out_cooldown(&h.control, id);
+        }
+
+        // One dispatch. Three jobs are due; two may go.
+        dispatch_only(&h, "tree4");
+        let t = Arc::clone(&transport);
+        assert!(wait_until(move || t.attempts() >= 15).await, "two runs of the budget should follow");
+        let t = Arc::clone(&transport);
+        assert!(stays_false(move || t.attempts() > 15).await, "and no more than two");
+
+        let retried = parked.iter().filter(|id| sent_for(&h, id) > 3).count();
+        assert_eq!(retried, 2, "exactly two distinct jobs were retried, not three");
+        // The third is not forgotten, only deferred: it is still parked, still owed, and first in
+        // line the next time a dispatch arrives.
+        let waiting = parked.iter().find(|id| sent_for(&h, id) == 3).unwrap();
+        assert_eq!(h.control.job_state(waiting), Some(JobState::ReportFailed));
+    }
+
+    #[tokio::test]
+    async fn the_ack_never_waits_on_a_redelivery() {
+        // Spec §5 makes a 2xx mean *accepted*, and design D§4.1 makes the ack fast on purpose: Hull
+        // tells the user "dispatched" on the strength of it. A drain that delivered inline would put
+        // a whole retry budget — up to an hour against an unreachable Hull — in front of every
+        // dispatch that happened to arrive while a job was parked.
+        let transport = Arc::new(ScriptedTransport::failing_then_stalling(3, Duration::from_secs(3600)));
+        let h = plain(fast_config(), Arc::clone(&transport));
+
+        let parked = park(&h, "tree1").await;
+        age_out_cooldown(&h.control, &parked);
+
+        let started = Instant::now();
+        h.control.accept(dispatch("t/r", "tree2")).unwrap();
+        let took = started.elapsed();
+
+        // The retry this dispatch started is genuinely stuck — an hour of it is still outstanding —
+        // and the ack came back anyway.
+        let t = Arc::clone(&transport);
+        assert!(wait_until(move || t.attempts() == 4).await, "the drain did start a retry");
+        assert!(
+            took < Duration::from_millis(250),
+            "the ack waited {took:?} on a delivery that is still in flight"
+        );
     }
 }
