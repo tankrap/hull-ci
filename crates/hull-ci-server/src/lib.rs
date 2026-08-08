@@ -344,6 +344,11 @@ async fn choose_backend(
                 network,
                 runner_id: config.node_id.clone(),
                 pool: warm_pool(config),
+                // The composition root is the only place that knows what `HULL_CI_IMAGE` resolved
+                // to, and a create failure cannot give the right advice without it: "build it
+                // locally" and "pull it from a registry" are opposite instructions, and D§6 has
+                // pipelines naming their own images, so both kinds reach that message in normal use.
+                default_image: Some(config.image.clone()),
                 ..ContainerConfig::default()
             })
             .await?)
