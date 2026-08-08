@@ -102,8 +102,18 @@ admin grant rather than a string a pipeline can claim.
   btrfs/XFS), so materializing costs metadata rather than bytes, and a filesystem that cannot clone —
   or a store root and work root on different filesystems — falls back to a byte copy rather than
   failing the job. The clone is emphatically **not** a hard link: a job writes, and a second name for
-  a file whose path is a content address would corrupt that tree for every later job. Still to come:
-  the internal content store with within-tenant dedup, affinity scheduling, warm pools.
+  a file whose path is a content address would corrupt that tree for every later job.
+  **Within-tenant content dedup** is in: each of a tenant's files is stored once, and every tree of
+  that tenant that holds it is a hard link to that single copy, so a second commit costs the files it
+  actually changed rather than a second whole checkout. Two trees overlapping by 90% measure **1.10x**
+  of one tree's bytes, where storing both whole is 2.00x. Here a hard link is right for the same
+  reason it is wrong in a workspace: a stored tree's path *is* a content address and nothing ever
+  writes to one. A blob is keyed on `(content, mode)` and never on content alone — a hard link shares
+  an inode and an inode carries the mode, so a content-only key would flip the executable bit of a
+  file whose executable bit keel *addresses*, and that tree would stop hashing to the id it is filed
+  under. Cross-tenant sharing stays impossible rather than merely off: the blob store lives inside the
+  tenant scope, so identical bytes in two tenants are two inodes. Still to come: affinity scheduling,
+  warm pools.
 - **M5 — scale-out.** Multi-replica control, autoscaling with cache-aware drain, sharding by history.
   Mostly not here, and **state is still in memory**, which is why there is no horizontal scaling: the
   fair-share clocks and the job store are process-local. What *is* here is the part a restart made
@@ -130,6 +140,14 @@ Kept here rather than in a tracker, because a runner's honest limits belong next
   a node that crashes and does not come back leaves a job's process running with its workspace still
   mounted, and no other node will clean it up, because the label is deliberately scoped so one
   runner cannot reap another's.
+- **Nothing ever reclaims disk in the content store.** There is no reaper, no retention policy and
+  no size ceiling: a tree that is fetched is a tree that is kept, and blobs outlive the trees that
+  referenced them because nothing removes either. Content dedup lowers the growth rate a long way
+  and does not change its shape, and it adds one new species of garbage — a blob whose tree was
+  never published, because a commit failed between dedup and the rename. This is a real operational
+  gap and it is written here rather than implied away by the word "cache". Reclamation, when it is
+  built, needs no index: a blob with `st_nlink == 1` is referenced by no tree, which is a property
+  of the layout rather than a promise that anything calls it.
 - **Revocation reaches a credential the package proxy already holds, but not one already on the
   wire.** The proxy re-asserts the job's capability with the broker before every use, so a revoke or
   a crypto-shred stops the *next* package request and destroys the decrypted copy; an upstream

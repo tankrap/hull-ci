@@ -486,6 +486,96 @@ mod tests {
             }
         }
 
+        /// The same independence property, against the store as it actually is since M4.
+        ///
+        /// `hull-ci-fetch`'s content store now shares one inode between every tree of a tenant that
+        /// holds a given file (design D§4.2). That is safe *because* of this module — a stored tree
+        /// is only ever read — but it raises the stakes on it enormously: before, a job that reached
+        /// back into the store corrupted the one tree it was built from; now the same write would
+        /// corrupt **every tree sharing that blob**, including trees for repositories the job's
+        /// author has never touched, and each of them would keep passing `has()` while no longer
+        /// hashing to the address it is filed under.
+        ///
+        /// So the fixtures above, which build a "store" by hand with `fs::write` and therefore have
+        /// `nlink == 1` on both sides, no longer describe the real input. This one uses the real
+        /// [`hull_ci_fetch::ContentStore`], asserts up front that the two trees genuinely do share
+        /// an inode (a fixture that stopped sharing would make everything below vacuous), and then
+        /// checks the *second* tree — the one nobody materialized — after each mutation.
+        #[test]
+        fn a_write_in_one_workspace_cannot_reach_a_second_tree_that_shares_the_blob() {
+            use hull_ci_fetch::ContentStore;
+
+            // Two syntactically valid keel addresses. Their value is irrelevant here — the store
+            // files them where it is told; what is under test is what the bytes underneath do.
+            const TREE_A: &str = "aaaa0000000000000000000000000000000000000000000000000000000000a1";
+            const TREE_B: &str = "bbbb0000000000000000000000000000000000000000000000000000000000b2";
+
+            for &mechanism in &[CLONE, COPY] {
+                let label = if mechanism { "clone" } else { "copy" };
+                let root = tempfile::tempdir().unwrap();
+                let store = ContentStore::new(root.path());
+
+                // Same tenant, same `run.sh`, one file apiece that differs: exactly the "two commits
+                // that touch one file" shape the whole feature exists for.
+                let commit = |tree_id: &str, unique: &str| {
+                    let staged = store.stage("acme").unwrap();
+                    fs::write(staged.path().join("run.sh"), ORIGINAL).unwrap();
+                    fs::set_permissions(
+                        staged.path().join("run.sh"),
+                        fs::Permissions::from_mode(ORIGINAL_MODE),
+                    )
+                    .unwrap();
+                    fs::write(staged.path().join(unique), unique).unwrap();
+                    store.commit("acme", tree_id, staged).unwrap()
+                };
+                let (a, b) = (commit(TREE_A, "only-a"), commit(TREE_B, "only-b"));
+                let (in_a, in_b) = (a.path.join("run.sh"), b.path.join("run.sh"));
+
+                let (ma, mb) = (fs::metadata(&in_a).unwrap(), fs::metadata(&in_b).unwrap());
+                assert_eq!(
+                    (ma.ino(), ma.dev()),
+                    (mb.ino(), mb.dev()),
+                    "[{label}] the two trees do not share an inode, so this test proves nothing"
+                );
+                assert_eq!(ma.nlink(), 3, "[{label}] the blob plus one entry in each tree");
+
+                for (case, mutate) in mutations() {
+                    let work = tempfile::tempdir().unwrap();
+                    let ws = work.path().join("ws");
+                    materialize_with(&a.path, &ws, mechanism).unwrap();
+                    let target = ws.join("run.sh");
+                    assert_eq!(
+                        fs::metadata(&target).unwrap().nlink(),
+                        1,
+                        "[{case}/{label}] the workspace file is a second name for the shared blob"
+                    );
+
+                    mutate(&target);
+
+                    // Both stored trees, not just the one the workspace came from. The second is the
+                    // one a link-shaped bug would ruin invisibly: nothing in this job ever named it.
+                    for (side, p) in [("materialized-from", &in_a), ("bystander", &in_b)] {
+                        let meta = fs::symlink_metadata(p).unwrap();
+                        assert_eq!(
+                            fs::read(p).unwrap(),
+                            ORIGINAL,
+                            "[{case}/{label}] the {side} tree no longer hashes to its address"
+                        );
+                        assert_eq!(
+                            meta.permissions().mode() & 0o7777,
+                            ORIGINAL_MODE,
+                            "[{case}/{label}] the {side} tree's exec bit changed; keel addresses it"
+                        );
+                        assert_eq!(
+                            meta.nlink(),
+                            3,
+                            "[{case}/{label}] the {side} tree's sharing was disturbed by a job"
+                        );
+                    }
+                }
+            }
+        }
+
         #[test]
         fn a_symlink_is_copied_as_a_link_never_followed() {
             // Not merely "still a symlink": also that it did not go through the clone. `clonefile(2)`
