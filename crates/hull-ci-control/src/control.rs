@@ -212,6 +212,15 @@ pub struct Control {
     queue: Mutex<FairQueue>,
     /// Where the broker put each running job's tree, so any driver can build an [`Assignment`] for a
     /// step the scheduler granted — including one belonging to a job it is not itself driving.
+    ///
+    /// **This map is also what keeps those trees from being reclaimed.** A
+    /// [`VerifiedTree`](crate::seams::VerifiedTree) may carry an opaque keep-alive from its producer,
+    /// and holding the value is the control plane's entire half of that contract — see the field's
+    /// own documentation. The entry is written before the first step is `pending` and removed in
+    /// [`Control::retire`], which spans every moment a step of this job can materialize from the
+    /// path, including the whole queue wait. Dropping an entry earlier than `retire` is not a
+    /// compile error and would pass every test on an idle machine; it would delete a queued job's
+    /// tree under load.
     trees: Mutex<HashMap<JobId, VerifiedTree>>,
     /// One waker per live job, so a step report wakes its driver instead of the driver polling.
     wakers: Mutex<HashMap<JobId, Arc<Notify>>>,
@@ -1047,6 +1056,11 @@ impl Control {
     /// record is evicted an hour later would quietly shrink every plan.
     fn retire(&self, job_id: &str) {
         let now = Instant::now();
+        // Dropping the last control-plane reference to this job's tree, and with it the producer's
+        // keep-alive (see the `trees` field). Safe here and nowhere earlier: the driver has finished,
+        // so no further step of this job will be granted — and a step already handed to the fleet
+        // holds its own clone of the tree, because `NodeSink::assign` runs the placement on a task
+        // that outlives this call.
         self.trees.lock().unwrap_or_else(|e| e.into_inner()).remove(job_id);
         self.lock_queue().forget_job(job_id, now);
         self.pump(None);

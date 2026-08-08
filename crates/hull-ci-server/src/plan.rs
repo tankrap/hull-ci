@@ -88,7 +88,7 @@ mod tests {
     use std::path::PathBuf;
 
     fn tree(path: PathBuf) -> VerifiedTree {
-        VerifiedTree { tree_id: "t".into(), path, cached: false }
+        VerifiedTree { tree_id: "t".into(), path, cached: false, keep_alive: None }
     }
 
     #[tokio::test]

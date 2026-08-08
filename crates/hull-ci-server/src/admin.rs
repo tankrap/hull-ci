@@ -533,7 +533,7 @@ mod tests {
                 if fail {
                     Err(FetchError::Failed("the stub refuses".into()))
                 } else {
-                    Ok(VerifiedTree { tree_id, path, cached: false })
+                    Ok(VerifiedTree { tree_id, path, cached: false, keep_alive: None })
                 }
             })
         }

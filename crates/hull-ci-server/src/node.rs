@@ -198,7 +198,7 @@ impl NodeSink for InProcessFleet {
             control,
             node_id: node_id.clone(),
             assignment: assignment.clone(),
-            tree_path: tree.path.clone(),
+            tree: tree.clone(),
             workspace: self.workspace_path(assignment),
             capability,
         };
@@ -229,7 +229,21 @@ struct Run {
     control: Arc<Control>,
     node_id: String,
     assignment: Assignment,
-    tree_path: PathBuf,
+    /// The whole [`VerifiedTree`], not just its `path`.
+    ///
+    /// The path is the only field this run reads, so carrying the path alone is the obvious shape —
+    /// and it is the one that silently drops the producer's keep-alive
+    /// (`hull_ci_control::seams::VerifiedTree::keep_alive`), leaving the tree unprotected for
+    /// precisely the window this run occupies. Carrying the value means the guard cannot be lost
+    /// without also losing the path, which turns "remember to clone the keep-alive too" from a rule
+    /// somebody has to follow into a thing that does not compile.
+    ///
+    /// It matters here more than anywhere else because this run **outlives its caller**: `execute` is
+    /// spawned, so it materializes after `assign` has returned, and can still be materializing after
+    /// the driver has retired the job and dropped the control plane's copy. `cancel` does not close
+    /// that either — an abort takes effect at an await point and cannot stop work already running on
+    /// a blocking thread.
+    tree: VerifiedTree,
     workspace: PathBuf,
     /// This placement's capability, if one was minted. Travels with the run rather than on the
     /// [`Assignment`] — a bearer credential does not belong on the value that is serialized and
@@ -258,8 +272,13 @@ impl Run {
     }
 
     async fn materialize(&self) -> Result<(), String> {
-        let (tree, workspace) = (self.tree_path.clone(), self.workspace.clone());
-        match tokio::task::spawn_blocking(move || crate::workspace::materialize(&tree, &workspace)).await {
+        // The whole tree moves into the closure, guard and all. This is the **last read of the
+        // store's copy in the system**, and the one place an abort cannot reach: `spawn_blocking`
+        // work already running cannot be cancelled, so a step killed by fail-fast or by the job
+        // clock can still be walking the tree after everything that scheduled it has gone. Owning
+        // the `VerifiedTree` here makes the protection last exactly as long as the read.
+        let (tree, workspace) = (self.tree.clone(), self.workspace.clone());
+        match tokio::task::spawn_blocking(move || crate::workspace::materialize(&tree.path, &workspace)).await {
             Ok(Ok(report)) => {
                 // Logged rather than ignored because it is the only way an operator learns that a
                 // deployment is byte-copying every tree — the symptom is otherwise "the runner is
@@ -363,7 +382,7 @@ mod tests {
     }
 
     fn tree(path: PathBuf) -> VerifiedTree {
-        VerifiedTree { tree_id: "tree1".into(), path, cached: false }
+        VerifiedTree { tree_id: "tree1".into(), path, cached: false, keep_alive: None }
     }
 
     #[tokio::test]

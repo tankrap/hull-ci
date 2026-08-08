@@ -32,7 +32,10 @@
 //! is the broker's alone. A consumer that rebuilt the path from a convention would be a second
 //! source of truth for it, and the first thing that convention would do is drift.
 
+use std::any::Any;
+use std::fmt;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use hull_ci_proto::{Assignment, AuthorClass};
 
@@ -60,7 +63,17 @@ pub struct FetchRequest {
 /// content at its own content address, and the next job to take a store hit would run code that no
 /// longer matches the address it was verified against — the one guarantee the whole fetch path exists
 /// to provide.
-#[derive(Debug, Clone)]
+///
+/// # The value has a lifetime, and the control plane owns it
+///
+/// `path` is only valid for as long as whoever produced it says it is. A content store that never
+/// reclaims makes that distinction invisible; one that does makes it the difference between a job
+/// running and a job failing at its first step on a path that verified minutes earlier. So a producer
+/// may attach a [`keep_alive`](Self::keep_alive) and the control plane's obligation is exactly one
+/// thing: **hold the `VerifiedTree` for as long as any step of this job may still materialize from
+/// `path`.** Dropping it earlier is not a compile error and will not fail a test on a quiet machine;
+/// it fails under a backlog, on the day the queue is deepest.
+#[derive(Clone)]
 pub struct VerifiedTree {
     /// Normalized `tree_id`, as the store keys it.
     pub tree_id: String,
@@ -69,6 +82,42 @@ pub struct VerifiedTree {
     /// True when the tree was already in the store, so no fetch, extract or verify happened now.
     /// Informational: a hit is as verified as a miss, because the address is what was verified.
     pub cached: bool,
+    /// An **opaque** keep-alive from whoever produced this tree: while it lives, `path` stays valid.
+    ///
+    /// Typed as `Arc<dyn Any + Send + Sync>` on purpose, and the opacity is the design rather than
+    /// laziness. The producer of a tree is `hull-ci-fetch`, whose store protects a tree in use with
+    /// an RAII pin; this crate must not name that type, because the whole reason these seams are
+    /// traits is that the control plane and the broker are separate crates that have to evolve
+    /// without a compile-time cycle (see the module docs). `Any + Send + Sync` is a shape, not a
+    /// dependency: nothing here downcasts it, inspects it, or has any behaviour that varies with what
+    /// is inside. The only thing this crate does with it is *not drop it*.
+    ///
+    /// `Option`, so a test double is not made to invent one. Every fake fetcher in this repository
+    /// passes `None`, which is correct rather than a shortcut: a fake reports a path nothing opens,
+    /// so there is nothing to keep alive, and a field that forced a value would have made a dozen
+    /// stubs construct a meaningless token to satisfy a struct literal.
+    ///
+    /// A `Clone` of a `VerifiedTree` shares the keep-alive rather than taking a second, so the tree
+    /// is protected until the last clone goes — which is what makes [`Control`]'s per-job copy and
+    /// the per-step copies handed to the fleet add up to one lifetime rather than several.
+    ///
+    /// [`Control`]: crate::control::Control
+    pub keep_alive: Option<Arc<dyn Any + Send + Sync>>,
+}
+
+/// Hand-written because `dyn Any` is not `Debug`, and because the useful thing to print about a
+/// keep-alive is not what it is — this crate deliberately cannot know — but *whether there is one*.
+/// That single bit is what distinguishes a tree whose path is protected from one that only looks
+/// like it, and it is the first thing anybody debugging a vanished tree will want in a log line.
+impl fmt::Debug for VerifiedTree {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("VerifiedTree")
+            .field("tree_id", &self.tree_id)
+            .field("path", &self.path)
+            .field("cached", &self.cached)
+            .field("keep_alive", &if self.keep_alive.is_some() { "held" } else { "none" })
+            .finish()
+    }
 }
 
 #[derive(Debug, thiserror::Error)]

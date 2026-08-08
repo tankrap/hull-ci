@@ -632,7 +632,7 @@ mod tests {
                     Ok(VerifiedTree {
                         tree_id,
                         path: std::path::PathBuf::from("/nonexistent/control-plane-never-opens-this"),
-                        cached: false,
+                        cached: false, keep_alive: None
                     })
                 })
             }

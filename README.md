@@ -112,8 +112,10 @@ admin grant rather than a string a pipeline can claim.
   an inode and an inode carries the mode, so a content-only key would flip the executable bit of a
   file whose executable bit keel *addresses*, and that tree would stop hashing to the id it is filed
   under. Cross-tenant sharing stays impossible rather than merely off: the blob store lives inside the
-  tenant scope, so identical bytes in two tenants are two inodes. Still to come: affinity scheduling,
-  warm pools.
+  tenant scope, so identical bytes in two tenants are two inodes. **Reclamation** is built —
+  retention over recorded use for trees, `st_nlink == 1` for blobs, and a pin carried from the store
+  through the fetch seam to the last read so a queued job never loses its tree — but nothing calls it
+  yet, so the store still grows; see the known gaps. Still to come: affinity scheduling, warm pools.
 - **M5 — scale-out.** Multi-replica control, autoscaling with cache-aware drain, sharding by history.
   Mostly not here, and **state is still in memory**, which is why there is no horizontal scaling: the
   fair-share clocks and the job store are process-local. What *is* here is the part a restart made
@@ -140,14 +142,36 @@ Kept here rather than in a tracker, because a runner's honest limits belong next
   a node that crashes and does not come back leaves a job's process running with its workspace still
   mounted, and no other node will clean it up, because the label is deliberately scoped so one
   runner cannot reap another's.
-- **Nothing ever reclaims disk in the content store.** There is no reaper, no retention policy and
-  no size ceiling: a tree that is fetched is a tree that is kept, and blobs outlive the trees that
-  referenced them because nothing removes either. Content dedup lowers the growth rate a long way
-  and does not change its shape, and it adds one new species of garbage — a blob whose tree was
-  never published, because a commit failed between dedup and the rename. This is a real operational
-  gap and it is written here rather than implied away by the word "cache". Reclamation, when it is
-  built, needs no index: a blob with `st_nlink == 1` is referenced by no tree, which is a property
-  of the layout rather than a promise that anything calls it.
+- **The content store can now reclaim disk, and nothing calls it.** `ContentStore::reclaim` is
+  built: trees go once their last recorded *use* is older than the policy's retention, and then any
+  blob with `st_nlink == 1` goes too, because one name means no tree references it — a property of
+  the layout, so there is no index to build or to get wrong. "Last used" is a stamp the store writes
+  at every cache hit, not the filesystem's `atime`, which `relatime`/`noatime` make either a no-op
+  or a reaper that deletes the hottest trees. What it did is reported (trees and blobs removed,
+  bytes actually returned, and what was skipped and why) because a reclaimer that silently reclaims
+  nothing leaves a store that is perfectly correct and still full.
+
+  **What is missing is the caller: nothing invokes `reclaim`** — no timer, no background task, no
+  size ceiling — so the store still grows without bound. When it runs, and against what policy, is a
+  composition-root decision, and it is the only thing left between here and a bounded runner.
+
+  A tree that is *in use* is safe, which is what makes the mechanism safe to switch on. A job can sit
+  queued between its fetch and its first step, and "retention > queue wait" is a comparison nothing
+  enforces, so a tree in use is protected by an explicit RAII pin rather than by a generous
+  retention. The pin travels into the control plane's `VerifiedTree` as an **opaque** keep-alive — no
+  `hull-ci-fetch` type crosses the seam; the control plane holds an `Arc<dyn Any + Send + Sync>` it
+  never inspects and whose only contract is not to drop it — is held for the whole life of the job,
+  and is owned by each placement's run down to the blocking materialize that actually reads the tree
+  (an abort cannot stop blocking work, so that read can outlive its job). The pin is in-memory and
+  per-process: a statement about this runner, not about a second process sweeping the same root.
+  Smaller and separately: a `staging/` or `reclaiming/` directory orphaned by a `SIGKILL`
+  mid-operation is still reclaimed by nothing.
+
+  One residual is not closable and is stated rather than argued away: a blob can gain a link between
+  the sweep's `stat` and its unlink. The sweep narrows the window — it renames a candidate out of
+  circulation, re-checks it, and links it back if a commit won — and a commit whose blob vanishes
+  retries as the creator, so what is left costs *dedup* on one file, never data: the commit's tree
+  entry is a second name for the same inode, so the bytes and the tree survive intact.
 - **Revocation reaches a credential the package proxy already holds, but not one already on the
   wire.** The proxy re-asserts the job's capability with the broker before every use, so a revoke or
   a crypto-shred stops the *next* package request and destroys the decrypted copy; an upstream
