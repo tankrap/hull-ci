@@ -122,6 +122,18 @@ pub struct NodeConfig {
     pub node_id: String,
     pub labels: Vec<String>,
     /// Executor slots — D§7.1: "one slot per CPU group (default 2 cores + 4 GB)".
+    ///
+    /// How many steps this node may run at once. It is not enforced by a semaphore here — the
+    /// scheduler is told the number (`FairShare::fleet_slots`) and does not select past it, and
+    /// [`NodeAgent::state`] reports it on every heartbeat so that stays true as the roster grows
+    /// (D§5.1). What this node keeps is the *accounting*: `slots_free` moves with each run.
+    ///
+    /// **The `Default` is `1`, and a deployment is not supposed to keep it.** A library type cannot
+    /// see the host it will run on, and one slot is the only count that is safe on every host. The
+    /// composition root reads `HULL_CI_NODE_SLOTS` and sets the real number — see
+    /// `hull_ci_server::config::default_node_slots`, which derives it from this host's CPU groups.
+    /// Leaving `1` in place is what makes design D§6.5's parallel branches run serially however the
+    /// pipeline is written, so it is a default to override, not a default to ship.
     pub slots_total: u32,
     pub limits: ResourceLimits,
     pub output_caps: OutputCaps,
@@ -137,6 +149,8 @@ impl Default for NodeConfig {
         NodeConfig {
             node_id: "node-0".into(),
             labels: Vec::new(),
+            // The safe-on-any-host count, not a sizing decision. See the field's doc: the
+            // composition root replaces it with one derived from the operator's machine.
             slots_total: 1,
             limits: ResourceLimits::default(),
             output_caps: OutputCaps::default(),
