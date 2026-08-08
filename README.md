@@ -293,8 +293,22 @@ HULL_CI_RECLAIM_RETENTION_DAYS=14 # how long an unused tree is kept. Shorter fre
 cargo run -p hull-ci-server
 ```
 
-Point Hull's `ci-config` at `POST http://<host>/hull`. Full variable reference in the crate's docs
+Point Hull's `ci-config` at `POST http://<host>/hull` — the path is `/hull`, and the server logs the
+route it bound at startup. Full variable reference in the crate's docs
 (`cargo doc -p hull-ci-server --open`).
+
+**`HULL_CI_WORK_ROOT` must be a directory your container runtime is allowed to bind-mount.** It is
+the only host path that ever enters a sandbox: the store is read by the server and never mounted, so
+it can live anywhere. On Docker Desktop for Mac that means the work root has to sit under a path in
+Settings → Resources → File sharing — which does **not** necessarily include `/Users`, even though it
+is the default. Get this wrong and the runtime refuses the mount at *create*, so every job comes back
+`errored` with `container create failed` while a plain `docker run` with no volume works fine and the
+image, the network and the daemon all look healthy. Two lines that tell you in seconds:
+
+```bash
+mkdir -p "$HULL_CI_WORK_ROOT" && docker run --rm -v "$HULL_CI_WORK_ROOT:/w" hull-ci/m1:latest true \
+  && echo "work root is mountable"
+```
 
 **M1 refuses rather than degrades.** No sandbox backend in this milestone can contain untrusted code
 (`BackendCapabilities::admits_untrusted()` is `false` for all of them), so work from an author who is
