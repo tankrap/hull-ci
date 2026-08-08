@@ -354,6 +354,7 @@ async fn choose_backend(
             Ok(hull_ci_node::detect_backend(ContainerConfig {
                 network,
                 runner_id: config.node_id.clone(),
+                pool: warm_pool(config),
                 ..ContainerConfig::default()
             })
             .await?)
@@ -363,6 +364,49 @@ async fn choose_backend(
         }
         SandboxChoice::LocalProcess => Ok(Arc::new(LocalProcessBackend::new_for_development_only())),
     }
+}
+
+/// This deployment's warm sandbox pool (design D§6.4), announced.
+///
+/// Announced for the reason reclamation is (`crate::fetch::reclaim`): what an operator must be able
+/// to tell apart is *"the pool is on and every job is hitting it"* from *"the pool is on and has
+/// never warmed a single member"*, and from the outside — jobs that work, at some latency nobody is
+/// measuring — those are the same picture. This line is the first half; `hull_ci_node::PoolStats` is
+/// the second.
+///
+/// **The root is inside the work root, and that is not cosmetic.** Claiming a member moves the job's
+/// workspace into the member's mount directory, and `rename(2)` refuses to cross filesystems — so a
+/// pool root somewhere else is a pool that warms perfectly and never hits. Deriving it from
+/// `HULL_CI_WORK_ROOT` makes the two share a filesystem by construction rather than by an operator
+/// remembering to line up two paths.
+fn warm_pool(config: &Config) -> hull_ci_node::PoolConfig {
+    let default = hull_ci_node::PoolConfig::default();
+    let pool = hull_ci_node::PoolConfig {
+        depth: config.pool_depth,
+        total: config.pool_total,
+        root: config.work_root.join("pool"),
+        ..default
+    };
+    if !pool.enabled() {
+        tracing::info!(
+            "warm sandbox pools are OFF (HULL_CI_POOL_DEPTH=0): every job creates and boots its own \
+             container, which design D§6.4 puts at ~200 ms against ~40 ms warm. Nothing about a \
+             job's isolation changes either way."
+        );
+        return pool;
+    }
+    tracing::info!(
+        depth = pool.depth,
+        total = pool.total,
+        root = %pool.root.display(),
+        idle = %pool.idle_argv.join(" "),
+        "warm sandbox pools on: this node pre-creates sandboxes per hot configuration. Each is handed \
+         to exactly one job and destroyed afterwards — pre-boot, not reuse (D§6.4, §14.1). A member \
+         is only ever given to a job whose image, network posture, limits and privilege settings are \
+         identical to the ones it was created with. A key with nothing warm falls back to a cold \
+         create; no job ever waits for a refill."
+    );
+    pool
 }
 
 /// Say, at startup and in one place, exactly which §14 controls this configuration does **not**
@@ -496,6 +540,30 @@ mod tests {
             ..Config::default()
         };
         (dir, config)
+    }
+
+    #[test]
+    fn the_warm_pool_lives_inside_the_work_root_so_a_claim_can_rename_into_it() {
+        // Not cosmetic. Claiming a member moves the job's workspace into the member's mount
+        // directory, and `rename(2)` refuses to cross filesystems — so a pool root anywhere else is a
+        // pool that warms members perfectly and hits none of them, which from the outside is
+        // indistinguishable from no pool at all. Deriving the path from `HULL_CI_WORK_ROOT` makes the
+        // two share a filesystem by construction rather than by an operator lining up two settings.
+        let (_dir, mut config) = dirs();
+        config.pool_depth = 2;
+        let pool = warm_pool(&config);
+        assert!(pool.enabled());
+        assert_eq!(pool.depth, 2);
+        assert!(
+            pool.root.starts_with(&config.work_root),
+            "the pool root must be under the work root, not {}",
+            pool.root.display()
+        );
+
+        // …and the default is a pool that does not exist, so a deployment that configured nothing
+        // gets no idle containers holding its memory (D§6.4).
+        let (_dir, config) = dirs();
+        assert!(!warm_pool(&config).enabled());
     }
 
     #[tokio::test]

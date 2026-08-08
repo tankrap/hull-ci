@@ -17,6 +17,10 @@
 //! - [`container`] — M1's bring-up backend (`IsolationTier::Container`): single-use, non-root,
 //!   read-only rootfs, tmpfs `/tmp`, all caps dropped, `no-new-privileges`, seccomp, cgroup limits,
 //!   `--network none`. What it can enforce is **probed at runtime**, not assumed.
+//! - [`pool`] — D§6.4's warm sandbox pools: a few containers per hot configuration, created before
+//!   any job wants them, each handed to **exactly one** job and destroyed afterwards. Pre-boot, not
+//!   reuse — see that module for why §14.1 is untouched, and for the key that makes handing a job a
+//!   sandbox built for a different network posture unrepresentable rather than merely unlikely.
 //! - [`local`] — a host subprocess for development. Reports ~nothing and is documented
 //!   untrusted-input-forbidden.
 //! - [`capture`] — the §14.4 output cap (50 MB / 500k lines, truncate-with-marker, keep the tail).
@@ -125,6 +129,16 @@
 //! The reaper is scoped by an exact `hull-ci.runner=<id>` label match and never removes another
 //! runner's containers, so several nodes may share one daemon. See [`ContainerConfig::runner_id`]
 //! for the identity contract that makes that true.
+//!
+//! **Warm pool members are covered by the same three mechanisms, and they need to be.** A member is
+//! a container with a host directory bind-mounted into it that is *deliberately* idle, so mechanism
+//! (2) — AutoRemove on exit — can never fire for one: it does not exit. That leaves (1), and it is
+//! the reason [`pool`] creates every member through [`container::create_argv`] rather than through
+//! an argv of its own: the runner label is written by the same function that writes it for a job
+//! container, so a member cannot be created without one. A `SIGKILL` therefore leaves idle members
+//! running until the next node start, exactly as it leaves a job's container running, and the same
+//! sweep collects both. [`ContainerBackend::drain_pool`] is the clean-shutdown courtesy, on the same
+//! terms as `Drop`: it covers the case where the node survives, and nothing else.
 
 pub mod agent;
 pub mod capture;
@@ -134,6 +148,7 @@ pub mod detect;
 pub mod env;
 pub mod local;
 pub mod packages;
+pub mod pool;
 pub mod process;
 pub mod sandbox;
 pub mod secrets;
@@ -148,6 +163,7 @@ pub use controls::EnforcedControls;
 pub use detect::{detect_test_command, DetectedCommand, Detection};
 pub use local::LocalProcessBackend;
 pub use packages::PackageAccess;
+pub use pool::{PoolConfig, PoolKey, PoolMember, PoolStats, SandboxPool};
 pub use sandbox::{
     ExecOutcome, ExecRequest, ExecStatus, Lifecycle, ResourceLimits, SandboxBackend, SandboxError,
     SandboxInstance, SandboxSpec,
