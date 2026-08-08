@@ -124,7 +124,7 @@ impl Fetcher for OkFetcher {
             Ok(VerifiedTree {
                 tree_id: req.tree_id.clone(),
                 path: std::path::PathBuf::from("/nonexistent/control-plane-never-opens-this"),
-                cached: false,
+                cached: false, keep_alive: None
             })
         })
     }
@@ -146,7 +146,7 @@ impl Fetcher for HangingFetcher {
             Ok(VerifiedTree {
                 tree_id: req.tree_id.clone(),
                 path: std::path::PathBuf::from("/nonexistent/control-plane-never-opens-this"),
-                cached: false,
+                cached: false, keep_alive: None
             })
         })
     }
@@ -160,7 +160,7 @@ impl Fetcher for WrongTreeFetcher {
             Ok(VerifiedTree {
                 tree_id: "some-other-tree".into(),
                 path: std::path::PathBuf::from("/nonexistent/control-plane-never-opens-this"),
-                cached: true,
+                cached: true, keep_alive: None
             })
         })
     }
@@ -249,7 +249,7 @@ impl Fetcher for DirFetcher {
                 .0
                 .get(&req.tree_id)
                 .ok_or_else(|| FetchError::Failed(format!("no such tree {}", req.tree_id)))?;
-            Ok(VerifiedTree { tree_id: req.tree_id.clone(), path: path.clone(), cached: false })
+            Ok(VerifiedTree { tree_id: req.tree_id.clone(), path: path.clone(), cached: false, keep_alive: None })
         })
     }
 }

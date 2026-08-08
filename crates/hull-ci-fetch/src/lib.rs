@@ -55,7 +55,7 @@ use hull_ci_proto::{sanitize_summary, Dispatch, Reason, Verdict, SUMMARY_MAX_CHA
 
 pub use digest::{DigestError, DigestLimits, GlobDigest, GlobError, TreeDigester, TreeIndex};
 pub use extract::{ExtractError, Extracted, Rejection};
-pub use store::{ContentStore, DedupReport, StoreError, StoredTree};
+pub use store::{ContentStore, DedupReport, ReclaimPolicy, ReclaimReport, StoreError, StoredTree, TreePin};
 pub use verify::{KeelTreeVerifier, TreeVerifier, VerifyError};
 
 /// Bounds on an archive we have not seen yet.
@@ -248,7 +248,11 @@ impl FetchBroker {
     ) -> Result<StoredTree, FetchError> {
         let tree_id = verify::normalize_tree_id(tree_id).map_err(|e| FetchError::BadTreeId(e.to_string()))?;
 
-        if self.store.has(tenant, &tree_id) {
+        // `open`, not `has`: this is *the* cache hit in the system, so it is the place the store's
+        // retention clock has to learn that the tree is still wanted (a tree fetched once and hit
+        // daily for a year must never look a year stale), and the place a claim against reclamation
+        // has to be taken. `has` is a probe and does neither — see `ContentStore::open`.
+        if let Some(pin) = self.store.open(tenant, &tree_id) {
             tracing::debug!(tenant, tree_id, "tree already in the content store — no fetch");
             return Ok(StoredTree {
                 tree_id: tree_id.clone(),
@@ -258,6 +262,7 @@ impl FetchBroker {
                 // is deliberately not a zeroed report, because "shared nothing" and "did nothing"
                 // are the two states a dedup layer must never blur.
                 dedup: None,
+                pin,
             });
         }
 
@@ -524,6 +529,57 @@ mod tests {
             fetch_token: None,
         };
         assert!(matches!(broker.ensure(&dispatch).await, Err(FetchError::BadTreeId(_))));
+    }
+
+    /// The store's retention clock only works if the runner's *actual* cache hit feeds it, so this
+    /// asserts on `ensure_tree` — the function `BrokerFetcher` calls — rather than on the store
+    /// method underneath it.
+    ///
+    /// The failure it exists to catch is a broker that goes back to `has()` + `tree_path()`: that is
+    /// a hit the store never learns about, and a tree that is hit every hour would then be reaped as
+    /// though it had not been touched since the day it was fetched. It is the same shape as trusting
+    /// `atime` on a `noatime` mount — correct-looking, and wrong in the direction that deletes the
+    /// most valuable trees first.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_brokers_own_cache_hit_is_what_keeps_a_tree_alive() {
+        use std::time::{Duration, SystemTime};
+
+        const WEEK: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+        let (_d, broker) = broker();
+        let (archive, hot) = sample_archive();
+        broker.ingest("acme", &hot, &archive[..]).unwrap();
+
+        // A second tree, same age, that nobody will ask for again: the control that proves the sweep
+        // ran at all. Without it an `ensure_tree` that reclaims nothing passes.
+        let cold = "cd".repeat(32);
+        let staged = broker.store().stage("acme").unwrap();
+        std::fs::write(staged.path().join("a"), b"never wanted again").unwrap();
+        broker.store().commit("acme", &cold, staged).unwrap();
+
+        // Both look like they have not been wanted for a month.
+        let month_ago = SystemTime::now() - 30 * Duration::from_secs(86_400);
+        for id in [hot.as_str(), cold.as_str()] {
+            broker.store().set_last_used("acme", id, month_ago);
+        }
+
+        // One hit through the path a dispatch takes. `source_url` points nowhere, so a fetch would
+        // fail the test — this is a store hit and nothing else.
+        let stored = broker
+            .ensure_tree("acme", &hot, "http://127.0.0.1:1/never-dialed", None)
+            .await
+            .expect("the tree is in the store");
+        assert!(stored.cached);
+        // The pin the hit handed back is dropped here; the *record of the use* is what has to last.
+        drop(stored);
+
+        let report = broker
+            .store()
+            .reclaim("acme", &ReclaimPolicy { tree_retention: WEEK, now: SystemTime::now() })
+            .unwrap();
+        assert_eq!(report.trees_removed, 1, "the sweep has to have done something");
+        assert!(broker.store().has("acme", &hot), "a tree the broker served an hour ago is not stale");
+        assert!(!broker.store().has("acme", &cold), "and one nobody asked for is");
     }
 
     #[test]

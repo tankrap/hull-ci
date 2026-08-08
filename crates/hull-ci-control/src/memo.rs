@@ -659,7 +659,7 @@ mod tests {
     }
 
     fn tree(id: &str) -> VerifiedTree {
-        VerifiedTree { tree_id: id.into(), path: PathBuf::from("/nonexistent"), cached: false }
+        VerifiedTree { tree_id: id.into(), path: PathBuf::from("/nonexistent"), cached: false, keep_alive: None }
     }
 
     fn ctx(tenant: &str) -> JobKeyContext {
