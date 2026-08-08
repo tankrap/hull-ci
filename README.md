@@ -278,6 +278,10 @@ HULL_CI_SECRET=…                  # spec §8 — checked on dispatch, echoed o
 HULL_CI_TRUSTED_TENANTS=acme      # whose authors count as members; empty means nobody, so nothing runs
 HULL_CI_SANDBOX=container         # the default. `local` additionally needs HULL_CI_ALLOW_UNSANDBOXED=1
 
+# Sized from this host if you say nothing, because "unconfigured" must not mean "no parallelism".
+HULL_CI_NODE_SLOTS=4              # steps this node runs at once (design §7.1). Default: one slot per CPU
+                                  # group of 2 cores, floored at 1, capped at 8. `0` refuses to start
+
 # Optional, all off by default — each turns on a subsystem, none degrades if misconfigured.
 HULL_CI_ADMIN_TOKEN=…             # read-only operator panel on /admin; unset means the route does not exist
 HULL_CI_MEMO=on                   # step memo (design §6.1): steps declaring `inputs` may resolve from a previous run
@@ -296,6 +300,15 @@ cargo run -p hull-ci-server
 Point Hull's `ci-config` at `POST http://<host>/hull` — the path is `/hull`, and the server logs the
 route it bound at startup. Full variable reference in the crate's docs
 (`cargo doc -p hull-ci-server --open`).
+
+**`HULL_CI_NODE_SLOTS` and `HULL_CI_POOL_TOTAL` bound different containers and add up on the same
+host.** A slot is a sandbox *running a step*; a pool member is one sitting *idle*, pre-created. A
+claim moves a member out of the pool and into a slot, so the worst case a host has to hold is
+`node_slots + pool_total` containers, each with its configured memory (4 GB by default) — not the
+larger of the two. Nothing refuses a combination that does not fit, because only you can see the RAM
+budget it has to fit into; both numbers are printed at startup so the arithmetic is in front of you.
+Setting the pool smaller than the slot count is a supported trade and not a mistake: at full
+occupancy the extra concurrent starts are cold, never queued.
 
 **Hull and hull-ci share the `HULL_CI_*` prefix, and two of those names mean different things on
 each side.** Hull reads `HULL_CI_MEMO` as the *path* to its tree-memo JSON (default

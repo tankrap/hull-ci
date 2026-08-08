@@ -609,10 +609,18 @@ mod tests {
         }
     }
 
+    /// The slot count the fixture node is built with.
+    ///
+    /// Deliberately **not** `NodeConfig::default()`'s. The panel's job is to report the capacity this
+    /// node was configured with (`HULL_CI_NODE_SLOTS`, see `hull_ci_server::config`), and a fixture
+    /// that took the default would let a hard-coded `1` in the JSON pass every assertion here. Three
+    /// is a number nothing else in this file produces.
+    const SLOTS: u32 = 3;
+
     fn state(control: Arc<Control>) -> Arc<AdminState> {
         let backend = Arc::new(hull_ci_node::LocalProcessBackend::new_for_development_only());
         let agent = hull_ci_node::NodeAgent::new(
-            hull_ci_node::NodeConfig { node_id: "node-test".into(), ..Default::default() },
+            hull_ci_node::NodeConfig { node_id: "node-test".into(), slots_total: SLOTS, ..Default::default() },
             backend.clone(),
         );
         let fleet = InProcessFleet::new(agent, std::env::temp_dir().join("hull-ci-admin-test"));
@@ -760,6 +768,10 @@ mod tests {
         assert_eq!(node["backend"], "local-process");
         assert_eq!(node["tier"], "container");
         assert_eq!(node["admits_untrusted"], false, "no M1 backend admits an outsider");
+        // The roster's capacity columns are what a scheduler-side reader plans against (D§5.1), so
+        // they have to be this node's numbers rather than the type's defaults.
+        assert_eq!(node["slots_total"], SLOTS);
+        assert_eq!(node["slots_free"], SLOTS);
 
         // The most valuable field on the panel: each unmet clause is listed by name and in the
         // spec's own words, rather than summarized as "not hardened".
@@ -953,7 +965,10 @@ mod tests {
         assert_eq!(v["jobs"]["by_state"]["running"], 1);
         assert_eq!(v["steps"]["running"], 1);
         assert_eq!(v["tenants_with_work"], 1);
-        assert_eq!(v["slots"]["total"], 1);
+        // The node's configured capacity, not a constant: an operator reading "1 slot free of 1" on a
+        // node they gave four slots would conclude their runner is full when it is idle.
+        assert_eq!(v["slots"]["total"], SLOTS);
+        assert_eq!(v["slots"]["free"], SLOTS, "nothing has reached this fixture's node, so none are taken");
         assert_eq!(
             v["unmet_clause_count"], unmet_here(),
             "the banner's number, and the same one /admin/nodes lists by name"

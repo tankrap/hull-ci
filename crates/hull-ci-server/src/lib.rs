@@ -172,8 +172,16 @@ pub async fn assemble(config: &Config) -> Result<Runner, StartupError> {
     // policy is read here, in the one place that reads an operator's configuration, and announced
     // there — see `fetch::reclaim`.
     let broker = FetchBroker::new(ContentStore::new(&config.store_root))?.with_reclaim(fetch::reclaim(config));
+    // `slots_total` is named here rather than left to `NodeConfig::default()` — which is `1`, the
+    // conservative default a library type has to have when it cannot see the host it will run on.
+    // This is the one place that reads an operator's configuration, so it is the one place that can
+    // know the real number (design D§7.1's executor slots; see `config::default_node_slots`).
     let mut agent = NodeAgent::new(
-        NodeConfig { node_id: config.node_id.clone(), ..NodeConfig::default() },
+        NodeConfig {
+            node_id: config.node_id.clone(),
+            slots_total: config.node_slots,
+            ..NodeConfig::default()
+        },
         backend,
     );
     if let Some(access) = packages.as_ref().and_then(|p| p.access()) {
@@ -198,26 +206,7 @@ pub async fn assemble(config: &Config) -> Result<Runner, StartupError> {
         None => InProcessFleet::new(agent, config.work_root.clone()),
     };
 
-    // Tell the scheduler how big the fleet actually is (design D§11.1). Without this it holds
-    // per-tenant quotas and no notion of total capacity, so it can only *offer* work in fair order
-    // and take the fleet's refusal for an answer: fair ordering is real, fair allocation is not. The
-    // composition root is the only place that knows both numbers, so it is the only place that can
-    // reconcile them.
-    let node_slots = usize::try_from(NodeConfig::default().slots_total).unwrap_or(1).max(1);
-    let mut fair_share = FairShare { fleet_slots: Some(node_slots), ..FairShare::default() };
-
-    // A quota larger than the fleet is not a quota. The default plan permitted more concurrent steps
-    // than this deployment can run, which means the number an operator reads constrains nothing —
-    // worse than no number, because someone will read it and believe it. Clamp the policy ceiling to
-    // the physical one rather than the reverse: policy should never promise more than physics.
-    if fair_share.default_plan.max_running_steps > node_slots {
-        tracing::info!(
-            plan_cap = fair_share.default_plan.max_running_steps,
-            node_slots,
-            "default per-tenant concurrency exceeded fleet capacity; clamped to the fleet"
-        );
-        fair_share.default_plan.max_running_steps = node_slots;
-    }
+    let fair_share = fleet_capacity(config.node_slots, FairShare::default());
 
     let control_config = ControlConfig {
         secret: config.secret.clone(),
@@ -366,6 +355,55 @@ async fn choose_backend(
     }
 }
 
+/// Tell the scheduler how big the fleet actually is (design D§11.1), and announce it.
+///
+/// Without `fleet_slots` the scheduler holds per-tenant quotas and no notion of total capacity, so it
+/// can only *offer* work in fair order and take the fleet's refusal for an answer: fair ordering is
+/// real, fair allocation is not. The composition root is the only place that knows both the node's
+/// slot count and the policy plan, so it is the only place that can reconcile them.
+///
+/// # The clamp, and why raising the slots does not defeat it
+///
+/// **A quota larger than the fleet is not a quota.** A default plan permitting more concurrent steps
+/// than the deployment can run means the number an operator reads constrains nothing — worse than no
+/// number, because someone will read it and believe it. So the *policy* ceiling is clamped to the
+/// *physical* one and never the reverse: policy should never promise more than physics.
+///
+/// Making the slot count configurable does not weaken that. The clamp is a comparison between two
+/// live numbers, not a statement about the old default of `1`: with `HULL_CI_NODE_SLOTS` at or above
+/// the plan's 16 the comparison simply does not fire, and the moment an operator sets fewer slots
+/// than the plan permits — which is most deployments, since the derived default is 1–8 — it fires
+/// exactly as before. What changed is that a deployment can now be on the other side of it, which is
+/// the side D§6.5's parallel branches need.
+///
+/// A parameter rather than a read of [`FairShare::default`] inside, so the rule can be tested at both
+/// sides of that comparison without a `Config` or a running node.
+fn fleet_capacity(node_slots: u32, mut fair_share: FairShare) -> FairShare {
+    // `HULL_CI_NODE_SLOTS=0` is refused at parse time ([`config::node_slots`]), but `Config`'s fields
+    // are public — the end-to-end suite builds one directly rather than mutating the process
+    // environment — so a zero can still arrive here. A fleet advertised as zero-capacity schedules
+    // *nothing*, silently and forever, which is the one outcome worse than being slow.
+    let node_slots = usize::try_from(node_slots).unwrap_or(usize::MAX).max(1);
+
+    tracing::info!(
+        node_slots,
+        "node executor slots (HULL_CI_NODE_SLOTS): this node runs at most this many steps at once. \
+         Each one is a live sandbox holding its configured CPU and memory for the length of a step \
+         (design D§7.1), so this number times the per-job memory is what a busy node wants resident."
+    );
+
+    fair_share.fleet_slots = Some(node_slots);
+    if fair_share.default_plan.max_running_steps > node_slots {
+        tracing::info!(
+            plan_cap = fair_share.default_plan.max_running_steps,
+            node_slots,
+            "default per-tenant concurrency exceeded fleet capacity; clamped to the fleet"
+        );
+        fair_share.default_plan.max_running_steps = node_slots;
+    }
+    fair_share
+}
+
 /// This deployment's warm sandbox pool (design D§6.4), announced.
 ///
 /// Announced for the reason reclamation is (`crate::fetch::reclaim`): what an operator must be able
@@ -379,6 +417,31 @@ async fn choose_backend(
 /// pool root somewhere else is a pool that warms perfectly and never hits. Deriving it from
 /// `HULL_CI_WORK_ROOT` makes the two share a filesystem by construction rather than by an operator
 /// remembering to line up two paths.
+///
+/// # `HULL_CI_POOL_TOTAL` and `HULL_CI_NODE_SLOTS` count different containers, and both cost memory
+///
+/// The two numbers are independent and are **deliberately not coupled here**, but they add up on the
+/// same host, so an operator who reads one without the other will size their box wrong:
+///
+/// * `HULL_CI_NODE_SLOTS` bounds sandboxes that are **running a step** — each holds its configured
+///   memory (4 GB by default) for the length of that step.
+/// * `HULL_CI_POOL_TOTAL` bounds sandboxes that are **idle, pre-created and holding memory anyway**,
+///   across all keys. `SandboxPool::claim` *removes* a member as it hands it over, so a claimed
+///   member stops being one of these and becomes one of the above.
+///
+/// Worst case resident is therefore `node_slots + pool_total` containers, not the larger of the two.
+/// On the defaults that is a handful; raising slots on a host already carrying a deep pool is how a
+/// node ends up over-committed, and the OOM killer's answer to that is an `errored` verdict on
+/// whichever step was unluckiest — a flake, not a configuration error. **Nothing in this process
+/// refuses that combination**, because only the operator can see the RAM budget it has to fit in
+/// (the same reasoning D§6.4 gives for not deriving pool depth), so it is announced instead.
+///
+/// The other direction wastes nothing and starves nobody, but it is worth saying out loud: with
+/// `pool_total` below `node_slots`, a node running flat out has more concurrent starts than the pool
+/// can ever have members for, so at least `node_slots - pool_total` of them are cold *by
+/// construction* — and since refill is amortized one member per teardown, the hit rate is worst
+/// exactly when the fleet is busiest. That is a latency trade, never a correctness one: a miss is a
+/// cold create, never a queue.
 fn warm_pool(config: &Config) -> hull_ci_node::PoolConfig {
     let default = hull_ci_node::PoolConfig::default();
     let pool = hull_ci_node::PoolConfig {
@@ -405,6 +468,18 @@ fn warm_pool(config: &Config) -> hull_ci_node::PoolConfig {
          is only ever given to a job whose image, network posture, limits and privilege settings are \
          identical to the ones it was created with. A key with nothing warm falls back to a cold \
          create; no job ever waits for a refill."
+    );
+    // The one line that puts the two independent bounds next to each other. An operator sizing a host
+    // from `HULL_CI_POOL_TOTAL` alone under-counts by a whole fleet's worth of running sandboxes, and
+    // one from `HULL_CI_NODE_SLOTS` alone under-counts by the pool — see this function's docs.
+    tracing::info!(
+        node_slots = config.node_slots,
+        pool_total = pool.total,
+        peak_containers = u64::from(config.node_slots) + pool.total as u64,
+        "warm pool and executor slots are bounded separately and add up on this host: at peak this \
+         node holds up to `node_slots` sandboxes running a step plus `pool_total` idle ones, each \
+         holding its configured memory. A pool smaller than the slot count is a supported trade — \
+         the extra concurrent starts are cold, never queued."
     );
     pool
 }
@@ -637,6 +712,78 @@ mod tests {
         );
     }
 
+    /// The operator's slot count has to arrive at **both** things that can act on it, and one line
+    /// each in [`assemble`] is the whole of those two journeys.
+    ///
+    /// Worth asserting on the assembled runner rather than on a `NodeConfig` built here, for the
+    /// reason the reclamation test above gives: a number parsed, logged and then dropped leaves a
+    /// runner that reads back as configured and behaves exactly as it did before. The two ends are
+    /// different failures, too. Lost on the way to the **node** and the heartbeat under-reports this
+    /// node's capacity, so D§5.1's roster would place against a fleet size that is not real. Lost on
+    /// the way to the **scheduler** and `fleet_slots` stays at the old default, so the fleet is idle
+    /// while steps sit `ready` and nothing anywhere says why.
+    #[tokio::test]
+    async fn the_operators_slot_count_reaches_the_node_and_the_scheduler() {
+        let (_d, mut config) = dirs();
+        config.sandbox = SandboxChoice::LocalProcess;
+        config.allow_unsandboxed = true;
+        config.node_slots = 3;
+
+        let runner = assemble(&config).await.unwrap();
+        let state = runner.fleet.agent().state();
+        assert_eq!(state.slots_total, 3, "the node must heartbeat the configured capacity, not a default");
+        assert_eq!(state.slots_free, 3, "and start with all of them free");
+        assert_eq!(
+            runner.control.config().fair_share.fleet_slots,
+            Some(3),
+            "the scheduler must be told the same number, or it schedules against a fleet that is not this one"
+        );
+    }
+
+    /// The clamp of `fleet_capacity` still fires — through the whole composition root, not just in
+    /// the function — when an operator asks for fewer slots than the default plan permits.
+    ///
+    /// This is the property that making slots configurable could most easily have destroyed: raising
+    /// the default so the comparison stops firing on *this* machine reads exactly like the clamp
+    /// working, right up until someone sets a small number and finds their per-tenant quota promising
+    /// 16 concurrent steps on a fleet of two.
+    #[tokio::test]
+    async fn the_policy_clamp_still_fires_on_a_fleet_smaller_than_the_plan() {
+        let (_d, mut config) = dirs();
+        config.sandbox = SandboxChoice::LocalProcess;
+        config.allow_unsandboxed = true;
+        config.node_slots = 2;
+
+        let runner = assemble(&config).await.unwrap();
+        let fair = &runner.control.config().fair_share;
+        assert_eq!(fair.fleet_slots, Some(2));
+        assert_eq!(
+            fair.default_plan.max_running_steps, 2,
+            "a quota larger than the fleet is not a quota: policy must not promise more than physics"
+        );
+    }
+
+    /// The reconciliation rule itself, at both sides of the comparison and at the edge.
+    #[test]
+    fn a_fleet_bigger_than_the_plan_is_not_clamped_and_does_not_raise_the_quota() {
+        let plan_cap = FairShare::default().default_plan.max_running_steps;
+
+        let roomy = fleet_capacity(64, FairShare::default());
+        assert_eq!(roomy.fleet_slots, Some(64), "the scheduler is told the fleet's real size");
+        assert_eq!(
+            roomy.default_plan.max_running_steps, plan_cap,
+            "the clamp lowers a promise to fit physics; it must never raise one to fill it"
+        );
+
+        // The edge: equal is not "exceeds", so nothing moves.
+        let exact = fleet_capacity(plan_cap as u32, FairShare::default());
+        assert_eq!(exact.default_plan.max_running_steps, plan_cap);
+
+        // Zero cannot come from the environment (`config::node_slots` refuses it) but can from a
+        // hand-built `Config`, and a fleet of zero schedules nothing at all, forever and silently.
+        assert_eq!(fleet_capacity(0, FairShare::default()).fleet_slots, Some(1));
+    }
+
     /// GET a path on an assembled runner's router, optionally presenting the admin token.
     async fn get(config: &Config, path: &str, token: Option<&str>) -> axum::http::StatusCode {
         use tower::ServiceExt;
@@ -675,5 +822,313 @@ mod tests {
         assert_eq!(get(&config, "/admin/jobs", None).await, StatusCode::UNAUTHORIZED);
         assert_eq!(get(&config, "/admin/jobs", Some("wrong")).await, StatusCode::UNAUTHORIZED);
         assert_eq!(get(&config, "/admin/jobs", Some("t0ken")).await, StatusCode::OK);
+    }
+}
+
+/// What the slot count *does*, rather than where it is stored.
+///
+/// The wiring tests above prove the number arrives; they would all still pass on a deployment that
+/// ran every step one after another, because "configured for four" and "runs four at once" are
+/// different claims and only the second one is design D§6.5's. So these tests assert **overlap** —
+/// two steps of one job in flight at the same time, and the same two refusing to overlap on a
+/// one-slot fleet.
+///
+/// **Nothing here is asserted on wall clock**, deliberately: this repository already has one flaky
+/// timing test and does not need a second. Two devices replace it. The stub node *never reports*, so
+/// a step stays in flight until a test answers for it and "both are in flight" is a fact about
+/// recorded state rather than about how fast the machine is; and the real-sandbox case makes the two
+/// steps **rendezvous**, so each one can only exit `0` if the other was genuinely running beside it —
+/// a proof by deadlock-or-pass rather than by stopwatch.
+///
+/// The control plane's own fakes are `#[cfg(test)]`-private to its crate (as [`crate::admin`]'s tests
+/// note), so the seams are stubbed again here: enough to get real steps through a real driver, and
+/// nothing more.
+#[cfg(test)]
+mod concurrency_tests {
+    use super::*;
+
+    use std::sync::Mutex;
+    use std::time::Duration;
+
+    use hull_ci_control::callback::{
+        BoxFuture, CallbackRequest, CallbackResponse, CallbackTransport, TransportError,
+    };
+    use hull_ci_control::model::{StepSpec, StepState};
+    use hull_ci_control::seams::{
+        FetchError, FetchRequest, Fetcher, Membership, NodeError, NodeSink, PlanError, Planner,
+        VerifiedTree,
+    };
+    use hull_ci_control::{ControlConfig, Deps};
+    use hull_ci_node::{LocalProcessBackend, NodeConfig};
+    use hull_ci_proto::{Assignment, AuthorClass, Dispatch, StepOutcome, StepReport};
+
+    const NODE: &str = "node-slots-test";
+    const TENANT: &str = "acme";
+
+    /// Reports a tree at a path that really exists, because the node under test materializes it.
+    struct DirFetcher {
+        path: std::path::PathBuf,
+    }
+
+    impl Fetcher for DirFetcher {
+        fn fetch<'a>(&'a self, req: &'a FetchRequest) -> BoxFuture<'a, Result<VerifiedTree, FetchError>> {
+            let (path, tree_id) = (self.path.clone(), req.tree_id.clone());
+            Box::pin(async move { Ok(VerifiedTree { tree_id, path, cached: false, keep_alive: None }) })
+        }
+    }
+
+    /// Steps with **no `needs` edges**, so every one of them is ready at once and capacity is the
+    /// only thing left that can decide whether they overlap. That is the whole fixture: a planner
+    /// that emitted a chain would prove nothing about slots.
+    struct ParallelPlanner {
+        steps: Vec<StepSpec>,
+    }
+
+    impl Planner for ParallelPlanner {
+        fn plan<'a>(&'a self, _t: &'a VerifiedTree) -> BoxFuture<'a, Result<Vec<StepSpec>, PlanError>> {
+            let steps = self.steps.clone();
+            Box::pin(async move { Ok(steps) })
+        }
+    }
+
+    /// Accepts every assignment, records it, and **never reports**.
+    ///
+    /// The silence is the instrument. A step this node holds stays in flight until the test records a
+    /// report on its behalf, so "two steps were in flight together" is read off recorded state at a
+    /// moment the test chose, instead of being inferred from two timestamps being close.
+    #[derive(Default)]
+    struct RecordingNode {
+        assigned: Mutex<Vec<(String, String)>>,
+    }
+
+    impl RecordingNode {
+        fn assigned(&self) -> Vec<(String, String)> {
+            self.assigned.lock().unwrap().clone()
+        }
+    }
+
+    impl NodeSink for RecordingNode {
+        fn assign(&self, a: &Assignment, _t: &VerifiedTree) -> Result<String, NodeError> {
+            self.assigned.lock().unwrap().push((a.step_id.clone(), a.step_name.clone()));
+            Ok(NODE.into())
+        }
+        fn cancel(&self, _job_id: &str, _step_id: &str) {}
+    }
+
+    struct SilentTransport;
+
+    impl CallbackTransport for SilentTransport {
+        fn post<'a>(&'a self, _r: &'a CallbackRequest) -> BoxFuture<'a, Result<CallbackResponse, TransportError>> {
+            Box::pin(async { Ok(CallbackResponse { status: 200 }) })
+        }
+    }
+
+    struct Everyone;
+
+    impl Membership for Everyone {
+        fn classify(&self, _repo: &str, _author: &str) -> AuthorClass {
+            AuthorClass::Member
+        }
+    }
+
+    fn dispatch() -> Dispatch {
+        Dispatch {
+            repo: format!("{TENANT}/widget"),
+            change: "c0ffee".into(),
+            tree_id: "tree1".into(),
+            intent: "two independent steps".into(),
+            author: "someone".into(),
+            source_url: "https://hull.example/tree/tree1/tar".into(),
+            callback_url: "https://hull.example/ci-result".into(),
+            fetch_token: None,
+        }
+    }
+
+    /// A control plane sized for `node_slots`, wired to the seams a capacity test needs.
+    ///
+    /// The `FairShare` comes from [`fleet_capacity`] — the same function `assemble` calls — rather
+    /// than from a hand-set `fleet_slots`, so what these tests exercise is the composition root's
+    /// reconciliation and not a second copy of it.
+    fn control_with(
+        node_slots: u32,
+        tree: std::path::PathBuf,
+        steps: Vec<StepSpec>,
+        node: Arc<dyn NodeSink>,
+    ) -> Arc<Control> {
+        let config = ControlConfig {
+            fair_share: fleet_capacity(node_slots, FairShare::default()),
+            ..ControlConfig::default()
+        };
+        let deps = Deps {
+            fetcher: Arc::new(DirFetcher { path: tree }),
+            planner: Arc::new(ParallelPlanner { steps }),
+            node,
+            transport: Arc::new(SilentTransport),
+            membership: Arc::new(Everyone),
+            journal: Arc::new(hull_ci_control::NoJournal),
+        };
+        Control::new(config, deps)
+    }
+
+    /// Two steps that need nothing and can therefore both be ready at once.
+    fn two_steps() -> Vec<StepSpec> {
+        vec![
+            StepSpec::new("left", vec!["/bin/true".into()], "n/a"),
+            StepSpec::new("right", vec!["/bin/true".into()], "n/a"),
+        ]
+    }
+
+    /// Poll until a condition holds, or give up.
+    ///
+    /// The budget is a **bound on giving up**, not a measurement: every assertion below is about
+    /// which states were observed, and a generous budget only decides how long a genuine failure
+    /// takes to be reported. Two seconds against work that finishes in tens of milliseconds.
+    async fn wait_until(f: impl FnMut() -> bool) -> bool {
+        wait_up_to(400, f).await
+    }
+
+    async fn wait_up_to(rounds: usize, mut f: impl FnMut() -> bool) -> bool {
+        for _ in 0..rounds {
+            if f() {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        false
+    }
+
+    fn passed(job_id: &str, step_id: &str) -> StepReport {
+        StepReport {
+            job_id: job_id.into(),
+            step_id: step_id.into(),
+            outcome: StepOutcome::Passed,
+            reason: None,
+            exit_code: Some(0),
+            log_key: None,
+            detail: String::new(),
+        }
+    }
+
+    /// How many of this job's steps are occupying the fleet right now.
+    fn in_flight(control: &Control) -> usize {
+        control.snapshot_jobs()[0]
+            .steps
+            .iter()
+            .filter(|s| matches!(s.state, StepState::Leased | StepState::Running))
+            .count()
+    }
+
+    #[tokio::test]
+    async fn two_independent_steps_are_in_flight_together_when_the_slots_allow() {
+        // D§6.5's promise, as a fact about state: with two slots, both branches of a fan-out are on
+        // the fleet at the same instant. Neither has reported, so this is not "one finished quickly
+        // and the other started" — it is two steps held simultaneously.
+        let dir = tempfile::tempdir().unwrap();
+        let node = Arc::new(RecordingNode::default());
+        let control = control_with(2, dir.path().to_path_buf(), two_steps(), Arc::clone(&node) as Arc<dyn NodeSink>);
+        control.accept(dispatch()).unwrap();
+
+        let n = Arc::clone(&node);
+        assert!(wait_until(move || n.assigned().len() == 2).await, "both steps must be placed");
+        assert_eq!(in_flight(&control), 2, "and held at the same time, not one after the other");
+        assert_eq!(control.queue_depth(TENANT).running, 2, "the tenant is using both slots");
+    }
+
+    #[tokio::test]
+    async fn one_slot_holds_the_second_step_until_the_first_has_answered() {
+        // The other half, and the one that would have caught a `fleet_slots` left at a default: a
+        // one-slot fleet must place exactly one of the two ready steps, and place the second only
+        // once the first has given its slot back. The assertion is on *ordering* — what is placed
+        // before and after a report this test controls — never on how long anything took.
+        let dir = tempfile::tempdir().unwrap();
+        let node = Arc::new(RecordingNode::default());
+        let control = control_with(1, dir.path().to_path_buf(), two_steps(), Arc::clone(&node) as Arc<dyn NodeSink>);
+        let job = control.accept(dispatch()).unwrap().job_id;
+
+        let n = Arc::clone(&node);
+        assert!(wait_until(move || n.assigned().len() == 1).await, "the first step is placed");
+
+        let n = Arc::clone(&node);
+        assert!(
+            !wait_until(move || n.assigned().len() > 1).await,
+            "a one-slot fleet must not hold two steps at once, however long it is given"
+        );
+        assert_eq!(in_flight(&control), 1);
+
+        // The slot comes back, and only then does the second step go out.
+        let first = node.assigned()[0].0.clone();
+        control.record_step_report(&passed(&job, &first), NODE).unwrap();
+
+        let n = Arc::clone(&node);
+        assert!(
+            wait_until(move || n.assigned().len() == 2).await,
+            "the second step must be placed once the first releases its slot"
+        );
+        let names: Vec<String> = node.assigned().into_iter().map(|(_, name)| name).collect();
+        assert_eq!(names.len(), 2, "each step is placed exactly once: {names:?}");
+    }
+
+    #[tokio::test]
+    async fn two_steps_really_run_at_the_same_time_on_the_node() {
+        // The end of the wire: the real [`InProcessFleet`] over the real local backend, running two
+        // real processes. The two steps **rendezvous** — each creates its own file and blocks until
+        // it sees the other's — so a `passed` from both is only reachable if the node genuinely had
+        // two steps executing simultaneously. Run serially they cannot both pass: the first would
+        // block on a file the second cannot create until the first is done, and the step clock below
+        // ends it as `errored`.
+        //
+        // A rendezvous rather than a stopwatch on purpose. "Both finished within N ms of each other"
+        // is a machine-speed assertion; "both observed each other" is a causal one.
+        let work = tempfile::tempdir().unwrap();
+        let tree = tempfile::tempdir().unwrap();
+        let meet = tempfile::tempdir().unwrap();
+        let meet = meet.path().display().to_string();
+
+        let rendezvous = |mine: &str, theirs: &str| {
+            StepSpec {
+                // A short clock so the serial case fails as a bounded `errored` rather than by
+                // hanging: nothing waits on this in the passing case.
+                timeout: Some(Duration::from_secs(20)),
+                ..StepSpec::new(
+                    mine,
+                    vec![
+                        "/bin/sh".into(),
+                        "-c".into(),
+                        format!("touch {meet}/{mine}; while [ ! -f {meet}/{theirs} ]; do sleep 0.05; done"),
+                    ],
+                    "n/a",
+                )
+            }
+        };
+
+        let agent = NodeAgent::new(
+            NodeConfig { node_id: NODE.into(), slots_total: 2, ..NodeConfig::default() },
+            Arc::new(LocalProcessBackend::new_for_development_only()),
+        );
+        let fleet = InProcessFleet::new(agent, work.path().to_path_buf());
+        let control = control_with(
+            2,
+            tree.path().to_path_buf(),
+            vec![rendezvous("left", "right"), rendezvous("right", "left")],
+            Arc::clone(&fleet) as Arc<dyn NodeSink>,
+        );
+        fleet.attach(&control);
+        control.accept(dispatch()).unwrap();
+
+        // A longer budget than the other two tests use, because this one waits on two real processes
+        // through a real workspace materialization rather than on a stub. It is still only a bound on
+        // how long a failure takes to report: the passing path here is tens of milliseconds.
+        let ctrl = Arc::clone(&control);
+        let met = wait_up_to(1200, move || {
+            let steps = &ctrl.snapshot_jobs()[0].steps;
+            steps.len() == 2 && steps.iter().all(|s| s.state.is_terminal())
+        })
+        .await;
+        let states: Vec<StepState> = control.snapshot_jobs()[0].steps.iter().map(|s| s.state).collect();
+        assert!(met, "neither step ever finished; states were {states:?}");
+        assert!(
+            states.iter().all(|s| *s == StepState::Passed),
+            "each step only exits 0 if it saw the other running beside it; states were {states:?}"
+        );
     }
 }

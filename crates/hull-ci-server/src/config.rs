@@ -15,6 +15,7 @@
 //! | `HULL_CI_ALLOW_UNSANDBOXED` | unset | required to start with `HULL_CI_SANDBOX=local` |
 //! | `HULL_CI_TRUSTED_TENANTS` | *empty* | tenants whose authors count as members (design D§1); `*` for all |
 //! | `HULL_CI_NODE_ID` | `node-0` | this node's id, as it appears in leases and log keys |
+//! | `HULL_CI_NODE_SLOTS` | *derived from the host's cores*, 1–8 | how many steps this node runs **at once** (design D§7.1); see [`default_node_slots`] |
 //! | `HULL_CI_IMAGE` | `hull-ci/m1:latest` | image the planner names for its step |
 //! | `HULL_CI_DETAILS_BASE_URL` | *none* | base for the verdict's `details_url` (design G4) |
 //! | `HULL_CI_ADMIN_TOKEN` | *none* | bearer token for the read-only operator panel; **unset disables it entirely** |
@@ -135,6 +136,26 @@ pub struct Config {
     pub node_id: String,
     /// Image the planner names for its step. Ignored by the local backend, which has no images.
     pub image: String,
+    /// How many steps this node runs **at once** — design D§7.1's executor slots.
+    ///
+    /// This is the number that decides whether parallelism exists at all. The control plane's
+    /// scheduler is told it as `FairShare::fleet_slots` and will not select more steps than the fleet
+    /// can hold, so a runner configured with one slot runs a pipeline's independent branches strictly
+    /// one after another however the pipeline is written — design D§6.5's "a 4-step pipeline with one
+    /// dependency edge is 2 steps deep in wall clock, not 4" is simply false on such a deployment,
+    /// and nothing in a verdict says so.
+    ///
+    /// **Not free, which is why it is not just "lots".** A slot is one concurrent sandbox holding
+    /// [`ResourceLimits`](hull_ci_node::ResourceLimits)' memory (4 GB by default) and CPU for as long
+    /// as a step runs, so this number multiplied by that one is the memory a busy node wants. See
+    /// [`default_node_slots`] for what the unconfigured deployment gets and why.
+    ///
+    /// **Zero is not a setting** — see [`node_slots`]. Unlike [`Self::pool_depth`], where `0` means
+    /// "no pre-created containers" and every job simply starts cold, a node with no slots is a runner
+    /// that accepts dispatches and runs nothing: spec §10 has Hull neither polling nor timing a job
+    /// out, so every tree it accepts wedges until a human forces a rerun. The way to run nothing is
+    /// to not start the process.
+    pub node_slots: u32,
     pub details_base_url: Option<String>,
     pub timeouts: Timeouts,
     /// Bearer token for the operator panel ([`crate::admin`]).
@@ -234,6 +255,10 @@ impl Default for Config {
             trusted: TrustedTenants::none(),
             node_id: "node-0".into(),
             image: "hull-ci/m1:latest".into(),
+            // Derived from the host, and it must stay in step with `from_env`'s default for the
+            // reason the journal switch does: two spellings of one default is how a setting comes to
+            // mean different things depending on which door you came in through.
+            node_slots: default_node_slots(),
             details_base_url: None,
             timeouts: Timeouts::default(),
             // Off. See the field's doc: an operator surface that shows every tenant's jobs is opt-in.
@@ -289,6 +314,7 @@ impl Config {
             trusted: var("HULL_CI_TRUSTED_TENANTS").map(|v| TrustedTenants::parse(&v)).unwrap_or(d.trusted),
             node_id: var("HULL_CI_NODE_ID").unwrap_or(d.node_id),
             image: var("HULL_CI_IMAGE").unwrap_or(d.image),
+            node_slots: node_slots(var("HULL_CI_NODE_SLOTS").as_deref())?,
             details_base_url: var("HULL_CI_DETAILS_BASE_URL"),
             timeouts: d.timeouts,
             // `var` treats an empty value as unset, which matters more here than anywhere else:
@@ -344,6 +370,97 @@ fn whole_number(name: &'static str, raw: Option<&str>, default: usize) -> Result
         var: name,
         detail: format!("expected a whole number, got `{raw}`"),
     })
+}
+
+/// The most slots this file will derive on its own. An operator who wants more says the number.
+///
+/// Eight slots is 32 GB of guest memory resident when the node is busy
+/// ([`ResourceLimits`](hull_ci_node::ResourceLimits) defaults to 4 GB a job), and **memory, not
+/// cores, is what a runner runs out of** — design D§6.4 sizes the warm pool the same way, as
+/// `free_RAM / guest_RAM_per_job`, precisely because this process cannot see the operator's RAM
+/// budget. Deriving further up a 64- or 128-core host would be this file sizing a machine it can
+/// only see one dimension of, and being wrong there costs the OOM killer taking whichever step was
+/// unluckiest — which arrives as a flaky `errored` verdict, not as a configuration error.
+const MAX_DERIVED_NODE_SLOTS: u32 = 8;
+
+/// How many steps run at once when nobody said. Design D§7.1's slot, sized by this host.
+///
+/// **Why this is derived and not a constant.** D§7.1 defines the unit — "one slot per CPU group
+/// (default 2 cores + 4 GB)" — so the honest default is *how many of those groups this host has*,
+/// and the group size is read from [`ResourceLimits::default`](hull_ci_node::ResourceLimits) rather
+/// than restated here: the two numbers describe one thing, and a second spelling of `2` is how they
+/// come apart the first time somebody tunes one.
+///
+/// **Why not `1`.** It was `1`, and it made a milestone unreachable rather than conservative: D§6.5
+/// ships parallel DAG branches and fan-out, and one slot runs them serially whatever the pipeline
+/// says. The evidence was in the startup log of every boot — the default plan permits 16 concurrent
+/// steps per tenant and the composition root clamped it to `node_slots=1` on the way past, i.e. the
+/// rest of the system was already asking for capacity this default refused to have.
+///
+/// **Why not "as many as there are cores".** A slot is a *concurrent sandbox*, holding its memory
+/// and CPU for the length of a step; oversubscribing cores would also oversubscribe RAM, and see
+/// [`MAX_DERIVED_NODE_SLOTS`] for what that costs. Dividing by the slot's own CPU share is the
+/// derivation that keeps the promise the slot shape makes.
+///
+/// **A one-core machine still works.** The floor is 1, so a single-core host (and a two-core one)
+/// gets exactly the behaviour it had before this was configurable.
+///
+/// **When the host will not say.** [`std::thread::available_parallelism`] fails on a platform that
+/// does not report it, and on a container whose cgroup limits are unreadable; there is no number to
+/// guess at then, so this falls back to `1` — slow, and correct. Guessing high would put a sandbox
+/// per imaginary core on a host that may have one. The effective value is logged at startup either
+/// way (see `hull_ci_server::assemble`), which is where a `1` on a large box announces itself.
+fn default_node_slots() -> u32 {
+    slots_for_cores(std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1))
+}
+
+/// [`default_node_slots`]' arithmetic, as a function of a core count — so the rule can be tested at
+/// one core, at a hundred, and at the value a failed [`std::thread::available_parallelism`] produces,
+/// on whatever machine happens to be running the suite. A test that could only assert what *this*
+/// host derives would assert nothing.
+fn slots_for_cores(cores: usize) -> u32 {
+    // `max(1.0)` so a future edit to the slot's CPU share cannot divide by zero into a slot count of
+    // infinity; the clamp below would catch it, but not before the cast.
+    let per_slot = hull_ci_node::ResourceLimits::default().cpus.max(1.0);
+    let derived = (cores as f32 / per_slot).floor().max(1.0);
+    (derived as u32).clamp(1, MAX_DERIVED_NODE_SLOTS)
+}
+
+/// How many steps this node runs at once. `HULL_CI_NODE_SLOTS`, as a function of the raw value.
+///
+/// A named rule rather than an expression inside `from_env`, for the reason [`journal_enabled`] is
+/// one: `from_env` reads the real process environment, so testing a rule written inline there means
+/// mutating global state from a test — racy under a parallel harness, and `unsafe` besides.
+///
+/// **Zero refuses to start**, which is the one place this differs from [`whole_number`]. `0` is a
+/// legitimate pool depth — no pre-created containers, every job starts cold — but a node with zero
+/// slots accepts every dispatch and runs none of them, and spec §10 has Hull neither polling us nor
+/// timing a job out, so each of those trees stays in-flight until a human forces a rerun. There is no
+/// reading of `HULL_CI_NODE_SLOTS=0` that means something an operator wants; the way to run nothing
+/// is to not start the process.
+///
+/// Anything that is not a whole number refuses too — including a negative one, which `u32` rejects
+/// on its own — because a slot count silently defaulted after a typo is a runner whose concurrency
+/// is not what its configuration says, and the symptom is a fleet that is mysteriously slow rather
+/// than an error anybody can find.
+fn node_slots(raw: Option<&str>) -> Result<u32, ConfigError> {
+    let Some(raw) = raw else { return Ok(default_node_slots()) };
+    let slots: u32 = raw.trim().parse().map_err(|_| ConfigError::Value {
+        // An operator's own text out of this process's environment, never a byte from a dispatch, so
+        // echoing it is safe and is what makes the mistake findable.
+        var: "HULL_CI_NODE_SLOTS",
+        detail: format!("expected a whole number of slots, got `{raw}`"),
+    })?;
+    if slots == 0 {
+        return Err(ConfigError::Value {
+            var: "HULL_CI_NODE_SLOTS",
+            detail: "a node with no slots accepts dispatches and runs nothing, and spec §10 leaves \
+                     every such tree in-flight until a human forces a rerun. To run nothing, do not \
+                     start the runner"
+                .into(),
+        });
+    }
+    Ok(slots)
 }
 
 /// Is the write-ahead journal on? The `HULL_CI_JOURNAL` rule, as a function of the raw value.
@@ -538,6 +655,93 @@ mod journal_switch_tests {
         for raw in ["maybe", "onn", "disabled", "enabled", "y"] {
             let err = journal_enabled(Some(raw)).expect_err("{raw:?} must not be guessed at");
             assert!(err.to_string().contains("HULL_CI_JOURNAL"), "the error must name the variable");
+        }
+    }
+}
+
+/// The slot count, as a pure rule — see [`super::node_slots`] for why it is a function rather than
+/// an expression inside `from_env`.
+#[cfg(test)]
+mod node_slot_tests {
+    use super::{default_node_slots, node_slots, slots_for_cores, Config, MAX_DERIVED_NODE_SLOTS};
+
+    #[test]
+    fn an_operator_who_configures_nothing_gets_more_than_a_single_step_at_a_time() {
+        // The default that was `1` made design D§6.5 unreachable: parallel branches and fan-out ran
+        // serially however the pipeline was written, and the only evidence was a startup log saying
+        // the plan's 16 had been clamped to one. The derivation is CPU groups (D§7.1: "one slot per
+        // CPU group (default 2 cores + 4 GB)"), so on anything with four cores or more it is at least
+        // two — and this assertion is written so it still holds on a single-core box.
+        assert_eq!(slots_for_cores(4), 2, "four cores is two of D§7.1's 2-core slots");
+        assert_eq!(slots_for_cores(16), 8);
+        assert!(
+            slots_for_cores(8) > 1,
+            "an eight-core host must not run a fan-out one step at a time"
+        );
+    }
+
+    #[test]
+    fn a_machine_with_one_core_still_works_and_nothing_derives_past_the_cap() {
+        // The two ends of the derivation. Below: a floor of one, because a runner that cannot run a
+        // step is not a smaller runner, it is a broken one — and `0` is what plain division gives on
+        // a single-core host.
+        assert_eq!(slots_for_cores(1), 1);
+        assert_eq!(slots_for_cores(2), 1);
+        // `available_parallelism` failing is reported to this function as one core (see
+        // `default_node_slots`), and it must land on the old, safe behaviour rather than a guess.
+        assert_eq!(slots_for_cores(0), 1, "no answer from the host means one slot, never a guess");
+
+        // Above: memory is what a runner runs out of, and this file cannot see the operator's RAM.
+        assert_eq!(slots_for_cores(128), MAX_DERIVED_NODE_SLOTS);
+        assert_eq!(slots_for_cores(usize::MAX), MAX_DERIVED_NODE_SLOTS);
+        assert!(
+            (1..=MAX_DERIVED_NODE_SLOTS).contains(&default_node_slots()),
+            "whatever host this suite runs on, the derived default stays inside the bound"
+        );
+    }
+
+    #[test]
+    fn the_default_here_matches_the_default_a_config_is_built_with() {
+        // Two spellings of one default is how a setting comes to mean different things depending on
+        // which door you came in through — `Config::default()` for the end-to-end suite, `from_env`
+        // for the binary.
+        assert_eq!(Config::default().node_slots, node_slots(None).unwrap());
+    }
+
+    #[test]
+    fn an_operator_may_ask_for_more_than_this_file_would_ever_derive() {
+        // The cap bounds what is *guessed*, not what is *asked for*: someone who knows their box has
+        // 256 GB says so, and this must not quietly clamp them back to eight.
+        assert_eq!(node_slots(Some("2")).unwrap(), 2);
+        assert_eq!(node_slots(Some(" 16 ")).unwrap(), 16);
+        // …and 64 really is past what the derivation would ever produce, so that last line is the
+        // property and not a coincidence.
+        assert_eq!(node_slots(Some("64")).unwrap().min(MAX_DERIVED_NODE_SLOTS), MAX_DERIVED_NODE_SLOTS);
+    }
+
+    #[test]
+    fn zero_slots_refuses_to_start() {
+        // `0` is a legitimate `HULL_CI_POOL_DEPTH` — no pre-created containers, every job starts cold
+        // — and it is *not* a legitimate slot count. A node with no slots accepts dispatches and runs
+        // none of them, and spec §10 has Hull neither polling nor timing a job out, so every one of
+        // those trees stays in-flight until a human forces a rerun. Refusing at startup costs an
+        // error message; guessing costs a wedged repository.
+        let err = node_slots(Some("0")).expect_err("a fleet of zero must not start");
+        assert!(err.to_string().contains("HULL_CI_NODE_SLOTS"), "the error must name the variable: {err}");
+    }
+
+    #[test]
+    fn a_slot_count_that_is_not_a_number_refuses_to_start() {
+        // The rule the retention and the pool sizes follow, for the same reason: a count silently
+        // defaulted after a typo is a runner whose concurrency is not what its configuration says,
+        // and it announces itself as "the fleet feels slow" rather than as an error anyone can find.
+        // `-1` is in here because it is the plausible typo that a signed parse would have accepted.
+        for raw in ["", "on", "true", "-1", "1.5", "many", "4 slots", "1e3"] {
+            let err = node_slots(Some(raw)).expect_err("must not be guessed at");
+            assert!(
+                err.to_string().contains("HULL_CI_NODE_SLOTS"),
+                "the error must name the variable: {err}"
+            );
         }
     }
 }
