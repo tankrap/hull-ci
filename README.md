@@ -97,8 +97,13 @@ admin grant rather than a string a pipeline can claim.
   That is enforced in code, not remembered: the scheduler refuses to place untrusted work on a
   backend whose capabilities say it cannot contain it.
 - **M4 — the performance layer. Started.** The step memo (layer 2 of §6.1) is built and wired,
-  keyed on keel subtree digests, off by default behind `HULL_CI_MEMO=on`. Still to come: the internal
-  content store with within-tenant dedup, affinity scheduling, CoW workspaces, warm pools.
+  keyed on keel subtree digests, off by default behind `HULL_CI_MEMO=on`. **CoW workspaces** are in:
+  a step's workspace is a reflink clone of the store's tree (`clonefile` on APFS, `FICLONE` on
+  btrfs/XFS), so materializing costs metadata rather than bytes, and a filesystem that cannot clone —
+  or a store root and work root on different filesystems — falls back to a byte copy rather than
+  failing the job. The clone is emphatically **not** a hard link: a job writes, and a second name for
+  a file whose path is a content address would corrupt that tree for every later job. Still to come:
+  the internal content store with within-tenant dedup, affinity scheduling, warm pools.
 - **M5 — scale-out.** Multi-replica control, autoscaling with cache-aware drain, sharding by history.
   Mostly not here, and **state is still in memory**, which is why there is no horizontal scaling: the
   fair-share clocks and the job store are process-local. What *is* here is the part a restart made

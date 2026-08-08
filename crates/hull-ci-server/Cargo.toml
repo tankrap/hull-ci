@@ -34,6 +34,12 @@ tokio = { workspace = true, features = ["net"] }
 tracing.workspace = true
 tracing-subscriber.workspace = true
 axum.workspace = true
+# Copy-on-write workspace materialization (D§6.2): `clonefile(2)` on APFS, the `FICLONE` ioctl on
+# btrfs/XFS. A dependency rather than code here because both are `unsafe` FFI for a problem with one
+# obvious right answer, and this crate has no other reason to hold `libc`. MIT OR Apache-2.0. Only
+# the raw `reflink` call is used — the fallback to a byte copy is ours, in `workspace.rs`, so that no
+# clone failure can be fatal and the reason for one is recorded rather than swallowed.
+reflink-copy = "0.1.30"
 
 [dev-dependencies]
 tempfile.workspace = true

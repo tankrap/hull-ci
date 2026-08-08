@@ -260,7 +260,21 @@ impl Run {
     async fn materialize(&self) -> Result<(), String> {
         let (tree, workspace) = (self.tree_path.clone(), self.workspace.clone());
         match tokio::task::spawn_blocking(move || crate::workspace::materialize(&tree, &workspace)).await {
-            Ok(Ok(())) => Ok(()),
+            Ok(Ok(report)) => {
+                // Logged rather than ignored because it is the only way an operator learns that a
+                // deployment is byte-copying every tree — the symptom is otherwise "the runner is
+                // slow", with no hint that `HULL_CI_STORE_ROOT` and `HULL_CI_WORK_ROOT` are on two
+                // filesystems or that the store's filesystem has no reflink (see [`crate::workspace`]).
+                tracing::debug!(
+                    job = %self.assignment.job_id,
+                    step = %self.assignment.step_id,
+                    cloned = report.cloned,
+                    copied = report.copied,
+                    fallback_reason = report.fallback_reason.as_deref().unwrap_or("-"),
+                    "materialized the workspace"
+                );
+                Ok(())
+            }
             Ok(Err(e)) => Err(format!("could not materialize the workspace: {e}")),
             Err(e) => Err(format!("workspace materialization did not complete: {e}")),
         }
