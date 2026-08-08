@@ -297,6 +297,16 @@ Point Hull's `ci-config` at `POST http://<host>/hull` — the path is `/hull`, a
 route it bound at startup. Full variable reference in the crate's docs
 (`cargo doc -p hull-ci-server --open`).
 
+**Hull and hull-ci share the `HULL_CI_*` prefix, and two of those names mean different things on
+each side.** Hull reads `HULL_CI_MEMO` as the *path* to its tree-memo JSON (default
+`~/.hull/ci-memo.json`) while this runner reads it as `on`/`off`; Hull reads `HULL_CI_SANDBOX` as
+`on`/`off`/`enforce` while this runner reads it as `container`/`local`. Only `HULL_CI_SECRET` means
+the same thing to both, and is meant to match. So exporting this runner's settings into a shell that
+later starts `hull-server` misconfigures Hull — `HULL_CI_MEMO=on` makes it load its memo from a file
+literally named `on`, which loses memoization without erroring. Keep the runner's environment in its
+own process (a systemd unit, a `docker run --env-file`, or a start script that sources its own file)
+rather than in a shell profile both share.
+
 **`HULL_CI_WORK_ROOT` must be a directory your container runtime is allowed to bind-mount.** It is
 the only host path that ever enters a sandbox: the store is read by the server and never mounted, so
 it can live anywhere. On Docker Desktop for Mac that means the work root has to sit under a path in
