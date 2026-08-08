@@ -294,6 +294,11 @@ impl PoolKey {
     /// same field read twice.
     fn container_config(&self, control_timeout: Duration) -> ContainerConfig {
         ContainerConfig {
+            // Deliberately not part of `PoolKey`: it changes no property of the container, only the
+            // wording of a create failure, so keying on it would split the pool into buckets that
+            // are physically identical. A member's create errors are the pool's own to log, and the
+            // `None` message names both possibilities rather than asserting the wrong one.
+            default_image: None,
             runtime: self.runtime.clone(),
             network: self.network_mode(),
             user: self.user.clone(),

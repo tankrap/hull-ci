@@ -317,6 +317,20 @@ pub struct ContainerConfig {
     ///
     /// Defaults to [`DEFAULT_RUNNER_ID`].
     pub runner_id: String,
+    /// The image this deployment configured as its default (`HULL_CI_IMAGE`), when it told us.
+    ///
+    /// Carried for exactly one purpose: [`create_failure`] has to tell an operator whose image would
+    /// not start *which kind* of image it was, and the two answers point in opposite directions. The
+    /// default image is built locally and published to no registry, so a pull can never succeed and
+    /// `docker login` is a dead end. An image a pipeline named (`image("rust:1.83")` in
+    /// `.hull/ci.star`, design D§6) is the reverse: pulling is the fix, and against a private
+    /// registry `docker login` is the fix. Handing the second case the first case's advice sends the
+    /// reader off to build a Rust toolchain out of this repository's alpine `Dockerfile`.
+    ///
+    /// `None` means "nobody said", and the message then claims nothing about provenance rather than
+    /// guessing. A node embedded in a test or another binary has no deployment default to compare
+    /// against, and a confident wrong answer costs more than an honest silence.
+    pub default_image: Option<String>,
     /// Warm sandbox pooling (D§6.4, [`crate::pool`]).
     ///
     /// **Off by default.** A pool member is a container holding its configured memory resident before
@@ -335,6 +349,11 @@ impl Default for ContainerConfig {
             seccomp_profile: None,
             control_timeout: Duration::from_secs(60),
             runner_id: DEFAULT_RUNNER_ID.into(),
+            // Not `hull-ci/m1:latest`: the default here would be a *claim* about what this
+            // deployment configured, and this crate is not the one that reads `HULL_CI_IMAGE`.
+            // The composition root sets it; anyone else gets a message that stays quiet about
+            // provenance rather than one that asserts the wrong half.
+            default_image: None,
             pool: PoolConfig::default(),
         }
     }
@@ -1507,6 +1526,7 @@ impl SandboxInstance for ContainerInstance {
                     if status != ExecStatus::Exited(0) {
                         return Err(SandboxError::Runtime(create_failure(
                             &self.spec.image,
+                            self.config.default_image.as_deref(),
                             status,
                             &out,
                         )));
@@ -4287,19 +4307,47 @@ probe_done=1
 /// missing image gets a sentence in front of it, because it is the one failure that is *certain* on
 /// a fresh deployment and the runtime's phrasing points the wrong way. Docker answers "pull access
 /// denied ... repository does not exist or may require 'docker login'", which reads as a credentials
-/// problem. For the default image it is not one: `hull-ci/m1` is built locally and published to no
-/// registry, so no login will ever produce it, and an operator who takes the runtime at its word
-/// goes looking for a registry secret that does not exist.
+/// problem.
+///
+/// **Whose image it is decides the advice, and the two answers are opposites.** Design D§6 has a
+/// pipeline name its own image (`image("rust:1.83")` in `.hull/ci.star`) precisely so the default one
+/// does not grow a toolchain per language, so both kinds reach this function in normal use:
+///
+/// * The **deployment's default** (`HULL_CI_IMAGE`) is built locally and published to no registry
+///   (D§7.2). A pull can never produce it and `docker login` is a dead end, so the fix is to build
+///   it and the message has to say so before the runtime's misleading text.
+/// * An image a **pipeline** named is the reverse. Pulling *is* the fix; against a private registry
+///   `docker login` *is* the fix. Telling that reader to `docker build -t rust:1.83 images/m1` sends
+///   them to build a Rust toolchain out of this repository's alpine `Dockerfile`, and telling them
+///   `docker login` will not help contradicts the one thing that would have worked.
+///
+/// When `default_image` is `None` nobody has said which kind this is, so the message describes both
+/// possibilities instead of asserting one. Confidently wrong is the failure being avoided here; the
+/// whole reason this function exists is that the runtime is already confidently wrong.
 ///
 /// The verdict summary is truncated to one line (§7), so the actionable half has to come first —
 /// which is the other reason not to let the runtime's text lead.
-fn create_failure(image: &str, status: ExecStatus, out: &str) -> String {
+fn create_failure(image: &str, default_image: Option<&str>, status: ExecStatus, out: &str) -> String {
     if looks_like_missing_image(out) {
-        return format!(
-            "sandbox image `{image}` is not present locally and cannot be pulled - build it with \
-             `docker build -t {image} images/m1`. This image is built locally by design and is \
-             published to no registry, so `docker login` will not help. Runtime said: {out}"
-        );
+        let advice = match default_image {
+            Some(d) if d == image => format!(
+                "build it with `docker build -t {image} images/m1`. This is the runner's default \
+                 image, built locally by design and published to no registry, so `docker login` \
+                 will not help"
+            ),
+            Some(_) => format!(
+                "this image was named by the pipeline, not by the runner, so it has to come from a \
+                 registry this host can reach: check the tag, then pre-pull it with \
+                 `docker pull {image}` (and `docker login` first if it is private)"
+            ),
+            None => format!(
+                "if `{image}` is this runner's own default image it is built locally and no login \
+                 will produce it (`docker build -t {image} images/m1`); if a pipeline named it, it \
+                 has to come from a registry this host can reach - check the tag, `docker pull \
+                 {image}`, and `docker login` if it is private"
+            ),
+        };
+        return format!("sandbox image `{image}` is not present locally and cannot be pulled - {advice}. Runtime said: {out}");
     }
     format!("container create failed ({status:?}): {out}")
 }
@@ -4330,12 +4378,55 @@ mod create_failure_tests {
 
     #[test]
     fn a_missing_image_is_explained_before_the_runtime_is_quoted() {
-        let msg = create_failure("hull-ci/m1:latest", ExecStatus::Exited(1), DOCKER_MISSING);
+        let msg = create_failure("hull-ci/m1:latest", Some("hull-ci/m1:latest"), ExecStatus::Exited(1), DOCKER_MISSING);
         let hint = msg.find("build it with").expect("the fix must be stated");
         let quote = msg.find("Runtime said").expect("the runtime's own text must survive");
         assert!(hint < quote, "the actionable half must come first: a summary is truncated");
         assert!(msg.contains("docker build -t hull-ci/m1:latest images/m1"));
         assert!(msg.contains("`docker login` will not help"), "the misleading advice is answered");
+    }
+
+        /// A pipeline's image is not the runner's image, and the fixes are opposites.
+    ///
+    /// D§6 has a pipeline name its own (`image("rust:1.83")`) so the default one does not grow a
+    /// toolchain per language, so this is the ordinary case, not an exotic one. Before this
+    /// distinction existed the message told that reader to run
+    /// `docker build -t rust:1.83 images/m1` — build a Rust toolchain from this repo's alpine
+    /// `Dockerfile` — and that `docker login` would not help, which is the exact opposite of the
+    /// truth for a private registry. Both existing tests passed, because both asked about the
+    /// default image.
+    #[test]
+    fn a_pipelines_image_is_not_told_to_build_itself_from_this_repo() {
+        let msg = create_failure("rust:1.83", Some("hull-ci/m1:latest"), ExecStatus::Exited(1), DOCKER_MISSING);
+        assert!(msg.contains("named by the pipeline"), "{msg}");
+        assert!(msg.contains("docker pull rust:1.83"), "pulling is the fix here: {msg}");
+        assert!(!msg.contains("images/m1"), "sends the reader to build a toolchain from alpine: {msg}");
+        assert!(
+            !msg.contains("`docker login` will not help"),
+            "against a private registry a login is exactly what helps: {msg}"
+        );
+        assert!(msg.contains(DOCKER_MISSING), "the runtime's own text is still the ground truth");
+    }
+
+    /// The runner's own default keeps the advice that was right for it all along.
+    #[test]
+    fn the_runners_own_default_image_is_still_told_to_build_locally() {
+        let msg = create_failure("hull-ci/m1:latest", Some("hull-ci/m1:latest"), ExecStatus::Exited(1), DOCKER_MISSING);
+        assert!(msg.contains("docker build -t hull-ci/m1:latest images/m1"), "{msg}");
+        assert!(msg.contains("`docker login` will not help"), "{msg}");
+    }
+
+    /// Told nothing, claim nothing — name both fixes rather than assert the wrong one.
+    ///
+    /// A node embedded in a test or another binary has no deployment default to compare against.
+    /// The whole reason this function exists is that the runtime is already confidently wrong, so
+    /// replacing its wrong certainty with ours would be no gain.
+    #[test]
+    fn with_no_configured_default_the_message_names_both_possibilities() {
+        let msg = create_failure("rust:1.83", None, ExecStatus::Exited(1), DOCKER_MISSING);
+        assert!(msg.contains("docker pull rust:1.83"), "{msg}");
+        assert!(msg.contains("images/m1"), "{msg}");
+        assert!(!msg.contains("named by the pipeline"), "that is a claim it cannot make: {msg}");
     }
 
     #[test]
@@ -4347,7 +4438,7 @@ mod create_failure_tests {
             "docker: Error response from daemon: no space left on device",
             "Cannot connect to the Docker daemon at unix:///var/run/docker.sock",
         ] {
-            let msg = create_failure("hull-ci/m1:latest", ExecStatus::Exited(125), out);
+            let msg = create_failure("hull-ci/m1:latest", Some("hull-ci/m1:latest"), ExecStatus::Exited(125), out);
             assert!(msg.starts_with("container create failed"), "{out} was rewritten: {msg}");
             assert!(msg.contains(out));
         }
