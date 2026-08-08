@@ -193,7 +193,14 @@ fn walk(dir: &Path, depth: u32, max_depth: u32, retain: Retain) -> Result<IndexD
 /// hash so a 256 MiB file in the tree does not become a 256 MiB allocation in the broker. The
 /// equivalence is asserted in the tests below rather than assumed — this is the one place we touch
 /// keel's encoding by hand, and it is exactly one constant plus the raw content.
-fn blob_id(path: &Path) -> Result<ObjectId, VerifyError> {
+///
+/// `pub(crate)` because [`crate::store`] keys its blob store on exactly this value. That is not an
+/// optimization but the correctness argument for sharing an inode between two trees: the pair
+/// (`blob_id`, [`file_mode`]) is precisely the pair keel's `TreeEntry` records, so two entries with
+/// the same pair are indistinguishable to every tree address in the system, and giving them one
+/// inode cannot change any of those addresses. A second, store-local notion of "same content" would
+/// break that argument the moment it disagreed with this one by a bit.
+pub(crate) fn blob_id(path: &Path) -> Result<ObjectId, VerifyError> {
     let mut file = fs::File::open(path).map_err(io_err)?;
     let mut hasher = blake3::Hasher::new();
     hasher.update(&[KIND_BLOB]);
@@ -201,8 +208,13 @@ fn blob_id(path: &Path) -> Result<ObjectId, VerifyError> {
     Ok(ObjectId(*hasher.finalize().as_bytes()))
 }
 
+/// The keel mode a regular file is recorded under: `MODE_EXEC` if any execute bit is set, else
+/// `MODE_FILE`. keel has no third answer, which is why the store can key a blob on one bit.
+///
+/// `pub(crate)` for [`crate::store`] — see [`blob_id`] for why both halves of a blob's key must come
+/// from here rather than from a second reading of the mode.
 #[cfg(unix)]
-fn file_mode(md: &fs::Metadata) -> u32 {
+pub(crate) fn file_mode(md: &fs::Metadata) -> u32 {
     use std::os::unix::fs::PermissionsExt;
     if md.permissions().mode() & 0o111 != 0 {
         MODE_EXEC
@@ -212,7 +224,7 @@ fn file_mode(md: &fs::Metadata) -> u32 {
 }
 
 #[cfg(not(unix))]
-fn file_mode(_md: &fs::Metadata) -> u32 {
+pub(crate) fn file_mode(_md: &fs::Metadata) -> u32 {
     MODE_FILE
 }
 

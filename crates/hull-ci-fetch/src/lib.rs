@@ -14,8 +14,10 @@
 //!   makes it required, because every downstream cache — Hull's verdict memo, our step memo, node
 //!   tree affinity — is keyed by `tree_id` and is only sound if the bytes we ran really are that
 //!   tree. It is done with keel's own encoder, not a local re-implementation.
-//! * **The store is tenant-scoped** ([`store`]). Cross-tenant dedup is impossible by construction,
-//!   not disabled by a flag (design D§4.2/D7).
+//! * **The store is tenant-scoped, and deduplicated within a tenant** ([`store`]). Each of a
+//!   tenant's files is stored once and shared by hard link between the trees that hold it, which is
+//!   safe exactly because a stored tree is never written to. Cross-tenant dedup remains impossible
+//!   by construction, not disabled by a flag (design D§4.2/D7).
 //! * **The broker holds no CI secret and no cloud role.** The only credential it ever touches is
 //!   [`Dispatch::fetch_token`], which is consumed here, marked sensitive on the wire, never logged,
 //!   and never propagated to a node or a sandbox (spec §14.2).
@@ -53,7 +55,7 @@ use hull_ci_proto::{sanitize_summary, Dispatch, Reason, Verdict, SUMMARY_MAX_CHA
 
 pub use digest::{DigestError, DigestLimits, GlobDigest, GlobError, TreeDigester, TreeIndex};
 pub use extract::{ExtractError, Extracted, Rejection};
-pub use store::{ContentStore, StoreError, StoredTree};
+pub use store::{ContentStore, DedupReport, StoreError, StoredTree};
 pub use verify::{KeelTreeVerifier, TreeVerifier, VerifyError};
 
 /// Bounds on an archive we have not seen yet.
@@ -248,7 +250,15 @@ impl FetchBroker {
 
         if self.store.has(tenant, &tree_id) {
             tracing::debug!(tenant, tree_id, "tree already in the content store — no fetch");
-            return Ok(StoredTree { tree_id: tree_id.clone(), path: self.store.tree_path(tenant, &tree_id), cached: true });
+            return Ok(StoredTree {
+                tree_id: tree_id.clone(),
+                path: self.store.tree_path(tenant, &tree_id),
+                cached: true,
+                // Nothing was published, so nothing was deduplicated. See `StoredTree::dedup`: this
+                // is deliberately not a zeroed report, because "shared nothing" and "did nothing"
+                // are the two states a dedup layer must never blur.
+                dedup: None,
+            });
         }
 
         let budget = self.limits.budget;
@@ -357,6 +367,10 @@ impl FetchBroker {
         self.verifier.verify(staged.path(), &tree_id)?;
 
         let stored = self.store.commit(tenant, &tree_id, staged)?;
+        // The dedup counts are logged because a dedup layer's characteristic failure is to stop
+        // deduplicating while every tree stays correct — invisible in every other signal this
+        // process emits. `reused` falling to zero across a fleet is the symptom.
+        let dedup = stored.dedup.clone().unwrap_or_default();
         tracing::info!(
             tenant,
             tree_id = %stored.tree_id,
@@ -364,6 +378,10 @@ impl FetchBroker {
             dirs = stats.dirs,
             symlinks = stats.symlinks,
             bytes = stats.bytes,
+            blobs_created = dedup.blobs_created,
+            blobs_reused = dedup.blobs_reused,
+            unshared = dedup.unshared,
+            unshared_reason = dedup.unshared_reason.as_deref().unwrap_or(""),
             "verified tree stored"
         );
         Ok(stored)
