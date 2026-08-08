@@ -232,18 +232,35 @@
 //! arbitrates: exactly one caller can rename a given tree or blob away, so a tree is counted removed
 //! exactly once no matter how many sweeps are running.
 //!
-//! ## What still has to happen for any of this to run
+//! ## What calls this, and what is left over
 //!
-//! One thing: **nothing calls [`reclaim`](ContentStore::reclaim).** There is no timer, no background
-//! task and no size ceiling wired to it, so the store still grows without bound. When it gets
-//! called, and against what policy, is a composition-root decision; this module is the mechanism,
-//! and — since the pin now reaches the last read — a mechanism that is safe to switch on.
+//! [`reclaim`](ContentStore::reclaim) is called by [`FetchBroker`], from the one place this store
+//! grows: **a commit that publishes a tree**. There is no timer and no background task — the pressure
+//! is amortized onto the event that causes it, exactly as `hull_ci_control::Control::accept` applies
+//! the job store's eviction and the outbox's drain, and for the same reason: a commit arriving is
+//! cheap, honest evidence that this process is alive, that time has passed, and that the thing being
+//! bounded just got bigger. Nothing about it has to be owned, supervised or shut down.
 //!
-//! Two smaller things are still not reclaimed by anything, and are named here rather than implied
-//! away: a `staging/` directory orphaned by a `SIGKILL` between `stage()` and `commit()`, and a
-//! `reclaiming/` scratch directory orphaned the same way. Both are bounded by how often the process
-//! is killed mid-operation rather than by how long it runs, which is why they are a different and
-//! much smaller problem than the one above.
+//! Three properties of that caller are what make having one safe, and they live there rather than
+//! here because they are policy: at most one sweep per tenant per cooldown (a sharded fan-out
+//! publishes many trees at once, and a walk per commit is the burst this module's cost cannot
+//! absorb); the walk runs on a blocking worker rather than on the fetch that triggered it, so no job
+//! waits on housekeeping; and a sweep that fails is logged and dropped, never returned to a job. On
+//! by default, with a fortnight's retention — `HULL_CI_RECLAIM`, `HULL_CI_RECLAIM_RETENTION_DAYS`.
+//!
+//! What that leaves, named rather than implied away:
+//!
+//! * **A store that stops growing stops being swept.** The trigger is a commit, so a runner that goes
+//!   idle keeps whatever it was holding until the next tree is published. That is the shape of an
+//!   amortized control rather than a hole in one — an idle store is bounded by exactly what it
+//!   already holds, and what reclamation exists to prevent is unbounded *growth*.
+//! * **The pin is process-local**, so all of this is a statement about one runner and not about a
+//!   second process sweeping the same root — see above, and the lock file that day would need.
+//! * **The commit/sweep race** costs dedup on one file and never data — see above.
+//! * **A `staging/` directory orphaned by a `SIGKILL`** between `stage()` and `commit()`, and a
+//!   `reclaiming/` scratch directory orphaned the same way, are still reclaimed by nothing. Both are
+//!   bounded by how often the process is killed mid-operation rather than by how long it runs, which
+//!   is why they are a different and much smaller problem than the one the caller closes.
 //!
 //! [`FetchBroker`]: crate::FetchBroker
 
@@ -1687,9 +1704,10 @@ mod tests {
             assert!(!path.exists());
             assert!(!store.has("acme", TREE), "a crash during dedup leaves no tree at all");
 
-            // The cost of that crash: two orphaned blobs, which stay until something calls
-            // `reclaim` (nothing does yet — see the module docs and the README's known gaps). A
-            // later commit of the same content re-links them rather than duplicating them.
+            // The cost of that crash: two orphaned blobs, which stay until a sweep takes them —
+            // `st_nlink == 1` makes them recognisable with no index, and the next commit that
+            // publishes a tree for this tenant is what triggers one. A later commit of the same
+            // content re-links them rather than duplicating them.
             assert_eq!(blobs(&store, "acme").len(), 2);
             let t = commit_tree(&store, "acme", TREE, &[("a", b"one", false), ("b", b"two", false)]);
             assert_eq!(t.dedup.unwrap().blobs_reused, 2, "the orphans are reused, not duplicated");

@@ -14,7 +14,45 @@ use std::sync::Arc;
 
 use hull_ci_control::callback::BoxFuture;
 use hull_ci_control::seams::{FetchError, FetchRequest, Fetcher, VerifiedTree};
-use hull_ci_fetch::{FetchBroker, FetchError as BrokerError, VerifyError};
+use hull_ci_fetch::{FetchBroker, FetchError as BrokerError, ReclaimConfig, VerifyError};
+
+use crate::config::Config;
+
+/// The content store's reclamation policy for this deployment, announced.
+///
+/// Announced rather than merely applied, for the reason the journal and the memo announce
+/// themselves: what an operator has to be able to tell apart is *"the sweep ran and everything is
+/// still referenced"* from *"nothing has ever swept"*, and from the outside — a disk that is not
+/// shrinking — those are the same picture. The startup line is the first half of that (this runner
+/// will sweep, this often, keeping this long); `FetchBroker`'s per-sweep `info` line is the second.
+///
+/// The **cooldown is not an operator setting** and is left at [`ReclaimConfig`]'s default. It is a
+/// rate limit on our own housekeeping rather than a policy about anyone's data: an operator whose
+/// store is too large wants a shorter retention, and one whose runner is too busy does not want a
+/// reaper walking more often. Exposing it would offer a dial whose only useful setting is the one
+/// already chosen.
+pub fn reclaim(config: &Config) -> ReclaimConfig {
+    let default = ReclaimConfig::default();
+    if !config.reclaim {
+        tracing::warn!(
+            "content store reclamation is OFF (HULL_CI_RECLAIM=off): every tree this runner fetches \
+             is kept forever. Nothing else here bounds the store, and a full disk fails every job on \
+             this host, not just the one that filled it."
+        );
+        return ReclaimConfig { enabled: false, ..default };
+    }
+
+    let reclaim = ReclaimConfig { enabled: true, tree_retention: config.reclaim_retention, ..default };
+    tracing::info!(
+        retention_days = reclaim.tree_retention.as_secs() / (24 * 60 * 60),
+        cooldown_secs = reclaim.cooldown.as_secs(),
+        "content store reclamation on: a tree unused for the retention is removed, and then any blob \
+         no tree names. Swept when a commit grows the store, at most once per tenant per cooldown. A \
+         reclaimed tree is re-fetched on the next dispatch that wants it (spec §6) — the cost of \
+         reclaiming too much is a cache miss."
+    );
+    reclaim
+}
 
 /// Adapts [`FetchBroker`] to the control plane's [`Fetcher`] seam.
 pub struct BrokerFetcher {

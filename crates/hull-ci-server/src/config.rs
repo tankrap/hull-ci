@@ -21,7 +21,9 @@
 //! | `HULL_CI_SECRETS` | `off` | `off` \| `dev` — the tenant secret broker (design D§7.4) |
 //! | `HULL_CI_DEV_SECRETS` | *none* | `tenant/NAME=value,…` seed for `HULL_CI_SECRETS=dev`; **dev only** |
 //! | `HULL_CI_PROXY` | `off` | `off` \| `on` — the package proxy (spec §14.3); see [`hull_ci_proxy::config`] for the rest of the `HULL_CI_PROXY_*` family |
-//! | `HULL_CI_JOURNAL` | **`on`** | `on` \| `off` — the write-ahead journal under `HULL_CI_STORE_ROOT/journal` ([`crate::journal`]). The one switch here that defaults **on**: off means a restart strands every in-flight job |
+//! | `HULL_CI_JOURNAL` | **`on`** | `on` \| `off` — the write-ahead journal under `HULL_CI_STORE_ROOT/journal` ([`crate::journal`]). One of two switches here that default **on**: off means a restart strands every in-flight job |
+//! | `HULL_CI_RECLAIM` | **`on`** | `on` \| `off` — content-store reclamation, amortized over commits ([`crate::fetch::reclaim`]). The other default-**on** switch: off means the store grows until the disk does not |
+//! | `HULL_CI_RECLAIM_RETENTION_DAYS` | `14` | how long a stored tree survives after its last *use*. Longer keeps more cache hits and more disk |
 //!
 //! `HULL_CI_SECRET` deserves its own note: spec §8 makes configuring one a SHOULD, and this process
 //! treats a missing one as a loud warning rather than a refusal, because a loopback bring-up run
@@ -30,6 +32,7 @@
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use hull_ci_control::Timeouts;
 
@@ -173,6 +176,25 @@ pub struct Config {
     /// journal directory has to be writable, on storage that outlives the process, or **every**
     /// dispatch is refused with a 503 rather than acked and lost.
     pub journal: bool,
+    /// Whether the content store collects its own garbage (design D§4.2, [`hull_ci_fetch::ReclaimConfig`]).
+    ///
+    /// **On by default**, which it shares with only [`Self::journal`], and for a related reason: what
+    /// it prevents is not a missing feature but a runner that eventually stops working. Every fetch
+    /// that misses adds a tree and never removes one, so an unswept store is bounded by nothing but
+    /// the disk — and a full disk fails *every* job on the box, as `errored`, which spec §7 does not
+    /// memoize, so Hull keeps re-dispatching into it.
+    ///
+    /// Turning it off is the operator saying they will bound the store some other way. The cost of on
+    /// is a directory walk per tenant per cooldown, on a blocking worker, off the path to any verdict.
+    pub reclaim: bool,
+    /// How long a stored tree survives after its last **use** (not its commit — see
+    /// [`hull_ci_fetch::ReclaimPolicy::tree_retention`]).
+    ///
+    /// The one number an operator genuinely has to size, because it is the trade between disk and
+    /// cache hits, and only they know their disk. The cooldown between sweeps is deliberately *not*
+    /// configurable: it is a rate limit on our own housekeeping rather than a policy, and an operator
+    /// whose store is too big wants a shorter retention, never a busier reaper.
+    pub reclaim_retention: Duration,
 }
 
 impl Default for Config {
@@ -209,6 +231,13 @@ impl Default for Config {
             // is how a switch comes to mean different things depending on which door you came in
             // through, and this one decides whether a dispatch is ever answered.
             journal: true,
+            // On, for the same reason and with the same obligation to stay in step. See the field.
+            reclaim: true,
+            // A fortnight, which is `hull_ci_fetch::ReclaimConfig`'s own default and is justified
+            // there. Named again here rather than reached for through that type, because this is the
+            // number an operator reads back out of their configuration and it should not depend on a
+            // default two crates away.
+            reclaim_retention: Duration::from_secs(14 * 24 * 60 * 60),
         }
     }
 }
@@ -266,6 +295,11 @@ impl Config {
             // rather than degrade. The cost of on is one small fsync per dispatch, into a store root
             // this process already requires and already writes.
             journal: journal_enabled(var("HULL_CI_JOURNAL").as_deref())?,
+            // On unless explicitly turned off, like the journal above and unlike everything else
+            // here. A deployment that configures nothing gets a store that stays bounded; see the
+            // field's doc for why the two ways of being wrong about this are not symmetrical.
+            reclaim: reclaim_enabled(var("HULL_CI_RECLAIM").as_deref())?,
+            reclaim_retention: reclaim_retention(var("HULL_CI_RECLAIM_RETENTION_DAYS").as_deref())?,
         })
     }
 }
@@ -300,6 +334,60 @@ fn journal_enabled(raw: Option<&str>) -> Result<bool, ConfigError> {
             }),
         },
     }
+}
+
+/// Is content-store reclamation on? The `HULL_CI_RECLAIM` rule, as a function of the raw value.
+///
+/// A named predicate for the reason [`journal_enabled`] is one: `from_env` reads the real process
+/// environment, so the only way to test a rule written inline there is to mutate global state from a
+/// test — racy under a parallel harness, and `unsafe` besides.
+///
+/// The rule is deliberately identical to the journal's, spelled out rather than shared, because the
+/// two switches are independent settings that happen to agree today: unset means **on**, `off` and
+/// its synonyms mean off, and **anything else refuses to start**. That last clause is the one that
+/// matters here. Reading an unrecognised value as *on* ignores an operator trying to turn reclamation
+/// off — perhaps because they bound the store some other way and do not want a reaper touching it —
+/// and reading it as *off* lets a typo silently disarm the only thing keeping the disk from filling,
+/// which is the failure the default exists to prevent. Neither is worth guessing at.
+fn reclaim_enabled(raw: Option<&str>) -> Result<bool, ConfigError> {
+    match raw.map(|v| v.trim().to_ascii_lowercase()) {
+        None => Ok(true),
+        Some(v) => match v.as_str() {
+            "1" | "true" | "yes" | "on" => Ok(true),
+            "0" | "false" | "no" | "off" => Ok(false),
+            other => Err(ConfigError::Value {
+                var: "HULL_CI_RECLAIM",
+                detail: format!("expected `on` or `off`, got `{other}`"),
+            }),
+        },
+    }
+}
+
+/// How long a tree survives its last use. `HULL_CI_RECLAIM_RETENTION_DAYS`, as a function of the raw
+/// value.
+///
+/// **Days, not seconds**, because the unit is where this kind of variable goes wrong: an operator who
+/// means a fortnight and types `14` into a seconds-valued variable gets a store that keeps nothing,
+/// and finds out as a fleet-wide collapse in cache hits rather than as an error. Days makes the
+/// plausible typo — an order of magnitude — cost disk instead of every hit.
+///
+/// Zero is accepted and means "reclaim every tree the moment nothing holds it". It is a legitimate
+/// setting for a disk-starved runner, it loses no data (the tree is re-fetched from `source_url`),
+/// and refusing it would be this file inventing a policy the operator did not ask for. The chosen
+/// value is logged at startup, which is where a mistyped `0` announces itself.
+///
+/// Anything that is not a number refuses to start, exactly as an unrecognised switch value does: a
+/// retention silently defaulted after a typo is a runner whose disk behaviour is not what its
+/// configuration says.
+fn reclaim_retention(raw: Option<&str>) -> Result<Duration, ConfigError> {
+    let Some(raw) = raw else { return Ok(Config::default().reclaim_retention) };
+    let days: u32 = raw.trim().parse().map_err(|_| ConfigError::Value {
+        var: "HULL_CI_RECLAIM_RETENTION_DAYS",
+        // The raw value is an operator's own text from this process's environment, never a byte from
+        // a dispatch, so echoing it is safe and is what makes the mistake findable.
+        detail: format!("expected a whole number of days, got `{raw}`"),
+    })?;
+    Ok(Duration::from_secs(u64::from(days) * 24 * 60 * 60))
 }
 
 /// A set variable that is empty or whitespace reads as unset. `HULL_CI_SECRET=` is a mistake, and
@@ -408,6 +496,72 @@ mod journal_switch_tests {
         for raw in ["maybe", "onn", "disabled", "enabled", "y"] {
             let err = journal_enabled(Some(raw)).expect_err("{raw:?} must not be guessed at");
             assert!(err.to_string().contains("HULL_CI_JOURNAL"), "the error must name the variable");
+        }
+    }
+}
+
+/// The reclamation switch and its retention, as pure rules — see [`super::reclaim_enabled`] for why
+/// they are functions rather than expressions inside `from_env`.
+#[cfg(test)]
+mod reclaim_switch_tests {
+    use super::{reclaim_enabled, reclaim_retention, Config};
+    use std::time::Duration;
+
+    const DAY: u64 = 24 * 60 * 60;
+
+    #[test]
+    fn an_operator_who_configures_nothing_gets_a_bounded_store() {
+        assert!(
+            reclaim_enabled(None).unwrap(),
+            "doing nothing must not be how a runner fills its disk and fails every job on it"
+        );
+        assert_eq!(
+            reclaim_retention(None).unwrap(),
+            Duration::from_secs(14 * DAY),
+            "a fortnight: long enough that a repo built weekly survives a holiday, short enough to bound the store"
+        );
+    }
+
+    #[test]
+    fn the_default_here_matches_the_default_a_config_is_built_with() {
+        // Two spellings of one default is how a switch comes to mean different things depending on
+        // which door you came in through — `Config::default()` for the end-to-end suite, `from_env`
+        // for the binary.
+        let d = Config::default();
+        assert_eq!(d.reclaim, reclaim_enabled(None).unwrap());
+        assert_eq!(d.reclaim_retention, reclaim_retention(None).unwrap());
+    }
+
+    #[test]
+    fn off_is_the_one_spelling_that_stops_the_store_being_swept() {
+        for raw in ["off", "0", "false", "no", "OFF", "False"] {
+            assert!(!reclaim_enabled(Some(raw)).unwrap(), "{raw:?} should turn reclamation off");
+        }
+        for raw in ["on", "1", "true", "yes", "ON"] {
+            assert!(reclaim_enabled(Some(raw)).unwrap(), "{raw:?} should leave reclamation on");
+        }
+    }
+
+    #[test]
+    fn a_value_nobody_recognises_refuses_to_start() {
+        for raw in ["maybe", "onn", "disabled", "enabled", "y"] {
+            let err = reclaim_enabled(Some(raw)).expect_err("must not be guessed at");
+            assert!(err.to_string().contains("HULL_CI_RECLAIM"), "the error must name the variable");
+        }
+    }
+
+    #[test]
+    fn a_retention_is_days_and_refuses_anything_that_is_not_a_number() {
+        assert_eq!(reclaim_retention(Some("1")).unwrap(), Duration::from_secs(DAY));
+        assert_eq!(reclaim_retention(Some(" 30 ")).unwrap(), Duration::from_secs(30 * DAY));
+        // Accepted, and it means what it says: nothing survives a sweep it is not pinned through.
+        // Not data loss — the tree is re-fetched — so this is the operator's call to make.
+        assert_eq!(reclaim_retention(Some("0")).unwrap(), Duration::ZERO);
+
+        for raw in ["", "14d", "two weeks", "-1", "1.5", "1e3"] {
+            let err = reclaim_retention(Some(raw)).expect_err("{raw:?} must not silently become a default");
+            let msg = err.to_string();
+            assert!(msg.contains("HULL_CI_RECLAIM_RETENTION_DAYS"), "the error must name the variable: {msg}");
         }
     }
 }

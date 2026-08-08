@@ -120,6 +120,14 @@ pub struct Runner {
     pub control: Arc<Control>,
     pub router: Router,
     pub fleet: Arc<InProcessFleet>,
+    /// The assembled fetch seam, and through it the broker and its content store.
+    ///
+    /// Exposed for the same reason `control` and `fleet` are: the properties worth asserting about a
+    /// broker are properties of the *assembled* one. The store's reclamation policy in particular is
+    /// wired by exactly one line here, and a line that quietly stops being called leaves a runner
+    /// whose store grows forever while every test about the store still passes — the store is simply
+    /// correct and full.
+    pub fetch: Arc<BrokerFetcher>,
     /// The secret broker and this node's enrolled identity, or `None` in `HULL_CI_SECRETS=off`.
     ///
     /// Exposed for the same reason `control` is: the end-to-end suite has to store a tenant secret
@@ -159,7 +167,11 @@ pub async fn assemble(config: &Config) -> Result<Runner, StartupError> {
     prepare_dir("content store", &config.store_root)?;
     prepare_dir("workspace root", &config.work_root)?;
 
-    let broker = FetchBroker::new(ContentStore::new(&config.store_root))?;
+    // The broker owns the store, so it is also what bounds it: a commit that publishes a tree is
+    // where reclamation is amortized from (design D§4.2's GC, which until now had no caller). The
+    // policy is read here, in the one place that reads an operator's configuration, and announced
+    // there — see `fetch::reclaim`.
+    let broker = FetchBroker::new(ContentStore::new(&config.store_root))?.with_reclaim(fetch::reclaim(config));
     let mut agent = NodeAgent::new(
         NodeConfig { node_id: config.node_id.clone(), ..NodeConfig::default() },
         backend,
@@ -239,8 +251,9 @@ pub async fn assemble(config: &Config) -> Result<Runner, StartupError> {
     // Written out in full rather than as overrides on `Deps::default()`: the defaults are the
     // *unwired* seams, which fail loudly by design, and a field forgotten here should be a compile
     // error rather than a runner that reports `errored` on every job because its planner is a stub.
+    let fetch = Arc::new(BrokerFetcher::new(broker));
     let deps = Deps {
-        fetcher: Arc::new(BrokerFetcher::new(broker)),
+        fetcher: Arc::clone(&fetch) as Arc<dyn hull_ci_control::seams::Fetcher>,
         // The planner is told whether a broker exists for one reason only: so it stops warning that
         // `secrets = [...]` goes undelivered when it no longer does. It is not an authority input —
         // the broker still refuses an outsider whatever this says.
@@ -286,7 +299,7 @@ pub async fn assemble(config: &Config) -> Result<Runner, StartupError> {
         )));
     }
 
-    Ok(Runner { router, control, fleet, secrets: secrets.map(|p| p.service), packages })
+    Ok(Runner { router, control, fleet, fetch, secrets: secrets.map(|p| p.service), packages })
 }
 
 /// Assemble, bind, and serve until the process ends.
@@ -524,6 +537,36 @@ mod tests {
 
         let runner = assemble(&config).await.unwrap();
         assert!(!runner.fleet.agent().capabilities().admits_untrusted());
+    }
+
+    /// The operator's reclamation setting has to reach the broker that owns the store, and one line
+    /// in [`assemble`] is the whole of that journey.
+    ///
+    /// Worth its own test because of how this fails: a broker built without the policy still fetches,
+    /// still verifies, still stores, and still passes every test in this repository — it just never
+    /// sweeps, and the symptom arrives weeks later as a full disk on a runner whose configuration
+    /// says otherwise. Asserted on the *assembled* runner rather than on a broker built here, since a
+    /// rebuilt copy would prove only that `with_reclaim` works.
+    #[tokio::test]
+    async fn the_operators_reclamation_setting_reaches_the_store_that_grows() {
+        let (_d, mut config) = dirs();
+        config.sandbox = SandboxChoice::LocalProcess;
+        config.allow_unsandboxed = true;
+        config.reclaim_retention = std::time::Duration::from_secs(3 * 24 * 60 * 60);
+
+        let on = assemble(&config).await.unwrap();
+        let policy = *on.fetch.broker().reclaim_config();
+        assert!(policy.enabled, "reclamation is on unless an operator turns it off");
+        assert_eq!(policy.tree_retention, config.reclaim_retention, "the configured retention, not a default");
+        assert!(!policy.cooldown.is_zero(), "a burst of commits must not become a burst of walks");
+
+        config.reclaim = false;
+        let off = assemble(&config).await.unwrap();
+        assert!(
+            !off.fetch.broker().reclaim_config().enabled,
+            "HULL_CI_RECLAIM=off must reach the broker: an operator who turned the reaper off and \
+             got one anyway is worse served than one who never had it"
+        );
     }
 
     /// GET a path on an assembled runner's router, optionally presenting the admin token.

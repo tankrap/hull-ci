@@ -112,10 +112,14 @@ admin grant rather than a string a pipeline can claim.
   an inode and an inode carries the mode, so a content-only key would flip the executable bit of a
   file whose executable bit keel *addresses*, and that tree would stop hashing to the id it is filed
   under. Cross-tenant sharing stays impossible rather than merely off: the blob store lives inside the
-  tenant scope, so identical bytes in two tenants are two inodes. **Reclamation** is built —
-  retention over recorded use for trees, `st_nlink == 1` for blobs, and a pin carried from the store
-  through the fetch seam to the last read so a queued job never loses its tree — but nothing calls it
-  yet, so the store still grows; see the known gaps. Still to come: affinity scheduling, warm pools.
+  tenant scope, so identical bytes in two tenants are two inodes. **Reclamation** is built and
+  wired: trees go once their last recorded *use* is older than the retention, then any blob with
+  `st_nlink == 1` goes too, and a pin carried from the store through the fetch seam to the last read
+  means a queued job never loses its tree. It runs where the store grows — a commit that publishes a
+  tree sweeps that tenant, at most once per cooldown, on a blocking worker rather than on the fetch
+  that triggered it, so no job ever waits on housekeeping and there is no timer or background task to
+  own. On by default with a 14-day retention (`HULL_CI_RECLAIM=off`,
+  `HULL_CI_RECLAIM_RETENTION_DAYS`). Still to come: affinity scheduling, warm pools.
 - **M5 — scale-out.** Multi-replica control, autoscaling with cache-aware drain, sharding by history.
   Mostly not here, and **state is still in memory**, which is why there is no horizontal scaling: the
   fair-share clocks and the job store are process-local. What *is* here is the part a restart made
@@ -142,20 +146,27 @@ Kept here rather than in a tracker, because a runner's honest limits belong next
   a node that crashes and does not come back leaves a job's process running with its workspace still
   mounted, and no other node will clean it up, because the label is deliberately scoped so one
   runner cannot reap another's.
-- **The content store can now reclaim disk, and nothing calls it.** `ContentStore::reclaim` is
-  built: trees go once their last recorded *use* is older than the policy's retention, and then any
-  blob with `st_nlink == 1` goes too, because one name means no tree references it — a property of
+- **The content store reclaims disk, but only while trees are being committed to it.**
+  `ContentStore::reclaim` removes trees whose last recorded *use* is older than the retention, and
+  then any blob with `st_nlink == 1`, because one name means no tree references it — a property of
   the layout, so there is no index to build or to get wrong. "Last used" is a stamp the store writes
   at every cache hit, not the filesystem's `atime`, which `relatime`/`noatime` make either a no-op
   or a reaper that deletes the hottest trees. What it did is reported (trees and blobs removed,
   bytes actually returned, and what was skipped and why) because a reclaimer that silently reclaims
   nothing leaves a store that is perfectly correct and still full.
 
-  **What is missing is the caller: nothing invokes `reclaim`** — no timer, no background task, no
-  size ceiling — so the store still grows without bound. When it runs, and against what policy, is a
-  composition-root decision, and it is the only thing left between here and a bounded runner.
+  **It is called from the one place the store grows** — a commit that publishes a tree — rather than
+  from a timer, so there is no background task to own, supervise or shut down. That is the residual:
+  the sweep is amortized onto growth, so **a runner that goes idle keeps whatever it was holding**
+  until the next tree is published. An idle store is bounded by exactly what it already holds, which
+  is why this is the shape of the control rather than a hole in it, but a runner parked at 90% full
+  will stay there. The rate limit is the other half: at most one sweep per tenant per cooldown, so a
+  12-way sharded fan-out costs one walk and not twelve, and a burst therefore *delays* collection
+  rather than multiplying it. Reclaiming is not deleting data — a reclaimed tree is re-fetched from
+  `source_url` on the next dispatch that wants it — so being wrong here costs a cache miss, where
+  being wrong the other way costs a full disk on which every job fails.
 
-  A tree that is *in use* is safe, which is what makes the mechanism safe to switch on. A job can sit
+  A tree that is *in use* is safe, which is what makes the sweep safe to run at all. A job can sit
   queued between its fetch and its first step, and "retention > queue wait" is a comparison nothing
   enforces, so a tree in use is protected by an explicit RAII pin rather than by a generous
   retention. The pin travels into the control plane's `VerifiedTree` as an **opaque** keep-alive — no
@@ -215,6 +226,11 @@ HULL_CI_ADMIN_TOKEN=…             # read-only operator panel on /admin; unset 
 HULL_CI_MEMO=on                   # step memo (design §6.1): steps declaring `inputs` may resolve from a previous run
 HULL_CI_PROXY=on                  # package proxy — the only egress a sandbox gets (§14.3)
 HULL_CI_SECRETS=infisical         # tenant secrets with KEKs in Infisical KMS; needs --features hull-ci-server/infisical
+
+# On unless you turn them off — each one is a thing the runner needs to keep working, not a feature.
+HULL_CI_JOURNAL=off               # stop recording dispatches durably; a restart then strands in-flight jobs
+HULL_CI_RECLAIM=off               # stop reclaiming the content store; it then grows until the disk does not
+HULL_CI_RECLAIM_RETENTION_DAYS=14 # how long an unused tree is kept. Shorter frees disk and costs cache hits
 cargo run -p hull-ci-server
 ```
 
