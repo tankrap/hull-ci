@@ -62,19 +62,51 @@ half of the results.
 **`fake-ci.py` does not pass.** That is a finding about the reference, not a broken harness — see
 [Baseline](#baseline-what-fake-cipy-actually-does) below.
 
-### (b) Against our service, later
+### (b) Against our service
+
+Both halves, as actually run — 27/27 on 2026-08-08. The suite is only half of it, and the two
+mistakes below are the ones that cost time, because **both fail quietly**.
 
 ```sh
+# terminal 1 — the service under test, on a cold store
+cargo build --release -p hull-ci-server
+HULL_CI_BIND=127.0.0.1:8080 \
+HULL_CI_SECRET=conformance-secret \
+HULL_CI_SANDBOX=container \
+HULL_CI_IMAGE=hull-ci/m1:latest \
+HULL_CI_TRUSTED_TENANTS=tankrap \
+HULL_CI_STORE_ROOT=$(mktemp -d) \
+HULL_CI_WORK_ROOT=$(mktemp -d) \
+./target/release/hull-ci-server
+
+# terminal 2 — the suite
 cd hull-ci/tests
-HULL_CI_ENDPOINT=http://127.0.0.1:8080/dispatch \
-HULL_CI_SECRET=$(pass hull/ci-secret) \
+HULL_CI_ENDPOINT=http://127.0.0.1:8080/hull \
+HULL_CI_SECRET=conformance-secret \
 HULL_CI_TREE_ID=keel \
 cargo test --features keel --no-fail-fast
 ```
 
-The only requirements on the service are that it listens on plain HTTP at that URL (the harness is
-loopback-only, by design — put a TLS terminator in front if you must) and that it is configured with
-the same shared secret. Everything else the suite provides for itself.
+**The path is `/hull`, not `/dispatch`.** The server logs the route it bound ("listening on POST
+/hull") — read it rather than assuming. Point the suite at the wrong path and every request 404s,
+which is *worse than a red suite*: the refusal-shaped tests assert a non-2xx, so they pass on a 404,
+and a total miss presents as a partial score you can mistake for partial progress.
+
+**`HULL_CI_TRUSTED_TENANTS=tankrap` is required**, and the value is not arbitrary: the suite dispatches
+`tankrap/hull-<token>`, one repo per scenario (§9 de-duplicates on `(repo, tree_id)`), so the tenant is
+`tankrap`. No backend reports `admits_untrusted()` yet — the container backend leaves §14.1's
+microVM-class boundary unmet — so without this the node refuses every assignment and the suite fails
+exactly one test, `spec_11_3_does_not_report_errored_for_a_well_formed_tree`, with 26 green around it.
+One failure looks like a bug in the runner; it is a runner correctly refusing to run untrusted work on
+a backend that cannot contain it (design D§13).
+
+Beyond that the requirements are only that the service listens on plain HTTP at that URL (the harness
+is loopback-only by design — put a TLS terminator in front if you must) and shares the secret.
+
+A cold `HULL_CI_STORE_ROOT` matters: several cases assert fetch-shaped behaviour, and a warm store
+skips the fetch entirely. Some journal entries surviving in `$HULL_CI_STORE_ROOT/journal` afterwards
+is **correct** — the stub Hull's ephemeral ports close when its test ends, so those last callbacks
+genuinely fail, and the outbox is supposed to keep the debt.
 
 `HULL_CI_TREE_ID=keel` is **not optional for our runner**: `hull-ci` re-hashes every archive to
 `tree_id` with keel's real encoding and refuses a mismatch (design D§4.2), so in the default mode it
