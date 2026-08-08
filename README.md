@@ -119,7 +119,33 @@ admin grant rather than a string a pipeline can claim.
   tree sweeps that tenant, at most once per cooldown, on a blocking worker rather than on the fetch
   that triggered it, so no job ever waits on housekeeping and there is no timer or background task to
   own. On by default with a 14-day retention (`HULL_CI_RECLAIM=off`,
-  `HULL_CI_RECLAIM_RETENTION_DAYS`). Still to come: affinity scheduling, warm pools.
+  `HULL_CI_RECLAIM_RETENTION_DAYS`).
+  **Warm sandbox pools** are in: a node keeps a few containers pre-created and started per hot
+  configuration, so starting a job is "move the workspace in and exec" rather than "create a
+  container and boot" — design §6.4 puts that at ~40 ms against ~200 ms. **This is not sandbox reuse
+  and cannot become it**: a member has never run a job, is handed to exactly one, and is destroyed
+  afterwards, so §14.1's prohibition on reuse *across jobs* is untouched — which is what the
+  conformance table means by "warm pools are pre-boot, not reuse". Docker fixes a container's mounts
+  at create time, so each member is created with its own empty host directory bind-mounted at the
+  workdir, and the job's workspace is *moved* into it when the member is claimed — O(top-level
+  entries) rather than O(tree), because a byte copy would cost more than the boot it saves. A member
+  is only ever given to a job whose image, network posture, resource ceilings, user, seccomp profile
+  and workdir are identical to the ones it was created with, and that is structural rather than
+  checked: the pool key **is** the recipe a member is built from, so "created on this network" and
+  "claimed for this network" are one value read twice, and both directions of the network
+  translation are exhaustive matches that a new mode breaks at compile time. Handing a no-egress job
+  a member sitting on the package-proxy network would be a silent §14.3 escape, and it is the
+  mismatch the whole design is shaped around. Live tests assert that a pooled sandbox is
+  control-for-control identical to a cold one from the inside — uid, read-only rootfs, dropped
+  capabilities, `NoNewPrivs`, cgroup ceilings, no egress, no metadata endpoint, nothing surviving
+  into the next job — and that the hit was real, from a counter and from the daemon's own container
+  listing taken before the job existed, never from a stopwatch. Exhaustion is a cold create and
+  never a queue; the pool is bounded per key and in total; refill is amortized onto teardown, the
+  way reclamation is amortized onto commit, so there is no timer to own; and every member carries
+  the runner label, so the reaper that collects a crashed node's job containers collects its idle
+  members too. Off by default (`HULL_CI_POOL_DEPTH`, `HULL_CI_POOL_TOTAL`) — an idle member holds
+  its configured memory whether or not a job ever arrives.
+  Still to come: affinity scheduling.
 - **M5 — scale-out.** Multi-replica control, autoscaling with cache-aware drain, sharding by history.
   Mostly not here, and **state is still in memory**, which is why there is no horizontal scaling: the
   fair-share clocks and the job store are process-local. What *is* here is the part a restart made
@@ -146,6 +172,37 @@ Kept here rather than in a tracker, because a runner's honest limits belong next
   a node that crashes and does not come back leaves a job's process running with its workspace still
   mounted, and no other node will clean it up, because the label is deliberately scoped so one
   runner cannot reap another's.
+
+  **Warm pool members widen that window rather than opening a new one.** An idle member is the one
+  container `--rm` can never help with, because AutoRemove fires when a container *exits* and a
+  member is deliberately one that does not — so a crash with the pool on leaves up to
+  `HULL_CI_POOL_TOTAL` idle containers, plus their (empty) mount directories, until this runner
+  starts again. They hold no job's work and are on the same network every job of their shape would
+  have been on, so what is leaked is memory and disk rather than isolation; the reaper removes them
+  all at the next start, and a live test asserts exactly that.
+
+- **A warm pool learns its hot configurations from what just ran, and never forgets on its own.**
+  Design §6.4 sizes a pool by predicting demand from the last hour's image mix with a floor of 1 for
+  anything seen in 24 h. What is here instead is "warm what just finished": the first job of a shape
+  misses and takes the cold path, and its teardown warms one member for the next. That needs no
+  history, no persistence and no clock, and it reaches the configured depth after that many jobs —
+  but it means a node coming back from a restart is cold for one job per shape, and a *fleet* that
+  scales out is cold on every new node's first job. The other half of the same simplification: a
+  configuration that stops being used keeps its idle members until the total cap needs the room for
+  a different one. That eviction is what bounds it — the oldest member of some other key goes, so a
+  node whose workload shifts converges — but nothing reclaims idle members on a node that has simply
+  gone quiet, exactly as nothing sweeps the content store on a node that has stopped fetching.
+
+- **Pooling is a latency trade that depends on one path being configured correctly, and it fails
+  quietly in the direction of "no pool".** Claiming a member moves the job's workspace into the
+  member's mount directory, and `rename(2)` refuses to cross filesystems — so a pool root on a
+  different filesystem from the work root warms members perfectly and never hits a single one. The
+  composition root derives the pool root from `HULL_CI_WORK_ROOT` so the two share a filesystem by
+  construction, and a failed move is reported at `error` with both paths, but an operator who sets
+  the paths some other way gets a runner that is slightly *slower* than one with no pool at all.
+  That is why `hull_ci_node::PoolStats` counts hits, misses, warms and every kind of failure
+  separately: a pool that silently never warms is otherwise indistinguishable, from the outside,
+  from one that is working.
 - **The content store reclaims disk, but only while trees are being committed to it.**
   `ContentStore::reclaim` removes trees whose last recorded *use* is older than the retention, and
   then any blob with `st_nlink == 1`, because one name means no tree references it — a property of
@@ -226,6 +283,8 @@ HULL_CI_ADMIN_TOKEN=…             # read-only operator panel on /admin; unset 
 HULL_CI_MEMO=on                   # step memo (design §6.1): steps declaring `inputs` may resolve from a previous run
 HULL_CI_PROXY=on                  # package proxy — the only egress a sandbox gets (§14.3)
 HULL_CI_SECRETS=infisical         # tenant secrets with KEKs in Infisical KMS; needs --features hull-ci-server/infisical
+HULL_CI_POOL_DEPTH=1              # warm sandbox pool (design §6.4): containers kept pre-created per hot configuration
+HULL_CI_POOL_TOTAL=8              # …and across all of them. Each idle member holds its configured memory resident.
 
 # On unless you turn them off — each one is a thing the runner needs to keep working, not a feature.
 HULL_CI_JOURNAL=off               # stop recording dispatches durably; a restart then strands in-flight jobs

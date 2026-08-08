@@ -24,6 +24,8 @@
 //! | `HULL_CI_JOURNAL` | **`on`** | `on` \| `off` — the write-ahead journal under `HULL_CI_STORE_ROOT/journal` ([`crate::journal`]). One of two switches here that default **on**: off means a restart strands every in-flight job |
 //! | `HULL_CI_RECLAIM` | **`on`** | `on` \| `off` — content-store reclamation, amortized over commits ([`crate::fetch::reclaim`]). The other default-**on** switch: off means the store grows until the disk does not |
 //! | `HULL_CI_RECLAIM_RETENTION_DAYS` | `14` | how long a stored tree survives after its last *use*. Longer keeps more cache hits and more disk |
+//! | `HULL_CI_POOL_DEPTH` | `0` (off) | warm sandboxes kept **per hot configuration** (design D§6.4, [`hull_ci_node::pool`]). Pre-boot, not reuse: a member has never run a job, is handed to exactly one, and is destroyed afterwards (§14.1) |
+//! | `HULL_CI_POOL_TOTAL` | `8` | warm sandboxes kept across **all** configurations. The other half of the bound |
 //!
 //! `HULL_CI_SECRET` deserves its own note: spec §8 makes configuring one a SHOULD, and this process
 //! treats a missing one as a loud warning rather than a refusal, because a loopback bring-up run
@@ -195,6 +197,23 @@ pub struct Config {
     /// configurable: it is a rate limit on our own housekeeping rather than a policy, and an operator
     /// whose store is too big wants a shorter retention, never a busier reaper.
     pub reclaim_retention: Duration,
+    /// How many sandboxes this node keeps pre-created **per hot configuration** (design D§6.4,
+    /// [`hull_ci_node::PoolConfig`]).
+    ///
+    /// **`0` — off — is the default.** A pool member is a container holding its configured memory
+    /// resident before any job exists to want it, and D§6.4 sizes the real cap as
+    /// `free_RAM / guest_RAM_per_job`; only the operator knows that number. Turning it on changes
+    /// latency and nothing else: a job that finds no member creates one the cold way, and a pool that
+    /// cannot warm at all costs an `error` line rather than a verdict.
+    ///
+    /// It is emphatically **not** sandbox reuse (§14.1): a member has never run a job, is handed to
+    /// exactly one, and is destroyed afterwards.
+    pub pool_depth: usize,
+    /// How many pre-created sandboxes this node keeps **in total**, across all configurations.
+    ///
+    /// The second half of "bounded". [`Self::pool_depth`] alone bounds one configuration, and a node
+    /// that sees several images would otherwise hold `depth × images` idle containers.
+    pub pool_total: usize,
 }
 
 impl Default for Config {
@@ -238,6 +257,9 @@ impl Default for Config {
             // number an operator reads back out of their configuration and it should not depend on a
             // default two crates away.
             reclaim_retention: Duration::from_secs(14 * 24 * 60 * 60),
+            // Off. Idle containers cost memory whether or not a job ever arrives; see the field.
+            pool_depth: 0,
+            pool_total: 8,
         }
     }
 }
@@ -300,8 +322,28 @@ impl Config {
             // field's doc for why the two ways of being wrong about this are not symmetrical.
             reclaim: reclaim_enabled(var("HULL_CI_RECLAIM").as_deref())?,
             reclaim_retention: reclaim_retention(var("HULL_CI_RECLAIM_RETENTION_DAYS").as_deref())?,
+            pool_depth: whole_number("HULL_CI_POOL_DEPTH", var("HULL_CI_POOL_DEPTH").as_deref(), d.pool_depth)?,
+            pool_total: whole_number("HULL_CI_POOL_TOTAL", var("HULL_CI_POOL_TOTAL").as_deref(), d.pool_total)?,
         })
     }
+}
+
+/// A count from the environment. Absent takes the default; **anything that is not a whole number
+/// refuses to start**.
+///
+/// The same rule [`reclaim_retention`] applies, and for the same reason: a number silently defaulted
+/// after a typo is a runner whose behaviour is not what its configuration says. `HULL_CI_POOL_DEPTH=on`
+/// is somebody trying to turn warm pools on and getting a node with no pool at all, which is exactly
+/// the failure the counters in `hull_ci_node::PoolStats` exist to make visible — better to refuse at
+/// startup, where it is cheap to notice.
+fn whole_number(name: &'static str, raw: Option<&str>, default: usize) -> Result<usize, ConfigError> {
+    let Some(raw) = raw else { return Ok(default) };
+    raw.trim().parse().map_err(|_| ConfigError::Value {
+        // An operator's own text out of this process's environment, never a byte from a dispatch, so
+        // echoing it is safe and is what makes the mistake findable.
+        var: name,
+        detail: format!("expected a whole number, got `{raw}`"),
+    })
 }
 
 /// Is the write-ahead journal on? The `HULL_CI_JOURNAL` rule, as a function of the raw value.
@@ -504,7 +546,7 @@ mod journal_switch_tests {
 /// they are functions rather than expressions inside `from_env`.
 #[cfg(test)]
 mod reclaim_switch_tests {
-    use super::{reclaim_enabled, reclaim_retention, Config};
+    use super::{reclaim_enabled, reclaim_retention, whole_number, Config};
     use std::time::Duration;
 
     const DAY: u64 = 24 * 60 * 60;
@@ -530,6 +572,32 @@ mod reclaim_switch_tests {
         let d = Config::default();
         assert_eq!(d.reclaim, reclaim_enabled(None).unwrap());
         assert_eq!(d.reclaim_retention, reclaim_retention(None).unwrap());
+        assert_eq!(d.pool_depth, whole_number("HULL_CI_POOL_DEPTH", None, d.pool_depth).unwrap());
+    }
+
+    #[test]
+    fn the_warm_pool_is_off_until_an_operator_asks_for_it() {
+        // Design §6.4 sizes a pool as `free_RAM / guest_RAM_per_job`, and this process cannot see the
+        // operator's RAM budget. An idle member holds its configured memory whether or not a job ever
+        // arrives, so a deployment that configured nothing gets no idle containers.
+        assert_eq!(Config::default().pool_depth, 0);
+        assert!(!hull_ci_node::PoolConfig { depth: 0, ..Default::default() }.enabled());
+    }
+
+    #[test]
+    fn a_pool_size_that_is_not_a_number_refuses_to_start() {
+        // The same rule the retention follows, and for the same reason: `HULL_CI_POOL_DEPTH=on` is
+        // somebody trying to turn warm pools on and silently getting a node with no pool at all —
+        // which is exactly the failure that is invisible from the outside, since every job would
+        // still run, just cold.
+        assert_eq!(whole_number("HULL_CI_POOL_DEPTH", Some("2"), 0).unwrap(), 2);
+        assert_eq!(whole_number("HULL_CI_POOL_DEPTH", Some(" 4 "), 0).unwrap(), 4);
+        // Zero is a legitimate setting and means off, which is why it is not refused.
+        assert_eq!(whole_number("HULL_CI_POOL_DEPTH", Some("0"), 3).unwrap(), 0);
+        for raw in ["on", "true", "-1", "1.5", "many"] {
+            let err = whole_number("HULL_CI_POOL_DEPTH", Some(raw), 0).expect_err("must not be guessed at");
+            assert!(err.to_string().contains("HULL_CI_POOL_DEPTH"), "must name the variable: {err}");
+        }
     }
 
     #[test]

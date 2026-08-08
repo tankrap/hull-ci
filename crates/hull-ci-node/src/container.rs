@@ -47,12 +47,14 @@
 //!   [`EnforcedControls::unmet_clauses`].
 
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 use hull_ci_proto::IsolationTier;
 
 use crate::capture::{CapturedOutput, OutputCapture};
 use crate::controls::EnforcedControls;
+use crate::pool::{PoolConfig, PoolKey, PoolMember, PoolStats, SandboxPool};
 use crate::process::{command_from_argv, run_to_completion};
 use crate::sandbox::{
     validate_exec, validate_spec, BoxFuture, ExecOutcome, ExecRequest, ExecStatus, Lifecycle,
@@ -315,6 +317,13 @@ pub struct ContainerConfig {
     ///
     /// Defaults to [`DEFAULT_RUNNER_ID`].
     pub runner_id: String,
+    /// Warm sandbox pooling (D§6.4, [`crate::pool`]).
+    ///
+    /// **Off by default.** A pool member is a container holding its configured memory resident before
+    /// any job exists to want it, so a deployment that did not ask for that does not get it. Turning
+    /// it on changes latency and nothing else: a job that finds no member creates one the cold way,
+    /// and a pool that cannot warm at all costs an `error` line rather than a verdict.
+    pub pool: PoolConfig,
 }
 
 impl Default for ContainerConfig {
@@ -326,6 +335,7 @@ impl Default for ContainerConfig {
             seccomp_profile: None,
             control_timeout: Duration::from_secs(60),
             runner_id: DEFAULT_RUNNER_ID.into(),
+            pool: PoolConfig::default(),
         }
     }
 }
@@ -970,6 +980,12 @@ pub struct ContainerBackend {
     config: ContainerConfig,
     probe: DockerProbe,
     controls: EnforcedControls,
+    /// Pre-created sandboxes for this backend's hot configurations (D§6.4).
+    ///
+    /// `None` when the operator did not ask for one, which is the default. Every path through
+    /// [`spawn`](SandboxBackend::spawn) works identically with it absent — that is the property that
+    /// makes a pool safe to add to a backend whose job is enforcing §14.
+    pool: Option<Arc<SandboxPool>>,
 }
 
 impl ContainerBackend {
@@ -1053,7 +1069,21 @@ impl ContainerBackend {
     /// the capability mapping is verified on a host with no daemon.
     pub fn from_probe(config: ContainerConfig, probe: DockerProbe) -> Self {
         let controls = controls_for(&probe, &config);
-        ContainerBackend { config, probe, controls }
+        // Built from the *configuration*, not from whether the daemon answered: a backend with no
+        // daemon refuses to spawn long before a pool would matter, and a pool that quietly existed
+        // only on some hosts would be one more thing whose absence is invisible.
+        let pool = config.pool.enabled().then(|| {
+            tracing::info!(
+                depth = config.pool.depth,
+                total = config.pool.total,
+                root = %config.pool.root.display(),
+                "warm sandbox pool on: this node pre-creates sandboxes per hot configuration and \
+                 hands each to exactly one job before destroying it. Pre-boot, not reuse (D§6.4, \
+                 §14.1). A job that finds no member creates one the cold way and never waits."
+            );
+            Arc::new(SandboxPool::new(config.pool.clone(), config.control_timeout))
+        });
+        ContainerBackend { config, probe, controls, pool }
     }
 
     pub fn probe(&self) -> &DockerProbe {
@@ -1062,6 +1092,25 @@ impl ContainerBackend {
 
     pub fn config(&self) -> &ContainerConfig {
         &self.config
+    }
+
+    /// What the warm pool has actually done (D§6.4).
+    ///
+    /// `None` means there is no pool. The counters exist because of one specific way a pool fails:
+    /// **a pool that silently never warms passes every functional test**, since every job takes the
+    /// cold path and works. A hit has to be an asserted fact, never a stopwatch.
+    pub fn pool_stats(&self) -> Option<PoolStats> {
+        self.pool.as_ref().map(|p| p.stats())
+    }
+
+    /// Destroy every idle pool member. For a node shutting down cleanly.
+    ///
+    /// Not the guarantee — [`reap_orphans`] at the next node start is, because a `SIGKILL` runs no
+    /// shutdown code. Every member carries the runner label, so the reaper finds them all.
+    pub async fn drain_pool(&self) {
+        if let Some(pool) = &self.pool {
+            pool.drain().await;
+        }
     }
 
     /// What was observed about the sandbox network, when there is one to observe.
@@ -1222,7 +1271,7 @@ pub fn create_argv(
 /// `extra_env` is added to the **CLI's own** environment, not the job's. It exists for exactly one
 /// caller: `create`, which passes broker-delivered secrets by name (`--env NAME`) so the values never
 /// appear in an argv any other user on the host can read. Everything else passes an empty slice.
-async fn control_command(
+pub(crate) async fn control_command(
     config: &ContainerConfig,
     argv: Vec<String>,
     extra_env: &[(String, String)],
@@ -1272,21 +1321,87 @@ impl SandboxBackend for ContainerBackend {
                     unlimited.join(", ")
                 )));
             }
-            let name = format!("hull-ci-{}-{}", sanitize_name(&spec.job_id), short_id());
-            // `spawn` reserves the box; the container itself is created on the single `exec`, because
-            // a docker container's argv is fixed at `create` time and the argv is not known until
-            // then. The single-use guarantee is unaffected — the guard admits exactly one `exec`, so
-            // exactly one container is ever created under this name.
+            // D§6.4. `key` is the *complete recipe* a member is built from, so a member can only be
+            // reached by a job whose configuration is identical — including the network posture,
+            // which is the one a mismatch would silently un-enforce (§14.3). See [`crate::pool`].
+            let key = PoolKey::for_job(&self.config, spec);
+            let slot = match &self.pool {
+                Some(pool) => self.claim_warm(pool, &key, spec).await,
+                None => Slot::Cold,
+            };
+
+            let name = match &slot {
+                // A member's name was chosen when it was created, before this job existed.
+                Slot::Warm(member) => member.name().to_string(),
+                Slot::Cold => format!("hull-ci-{}-{}", sanitize_name(&spec.job_id), short_id()),
+            };
+            // On the cold path `spawn` only reserves the box: the container is created on the single
+            // `exec`, because a docker container's argv is fixed at `create` time and the argv is not
+            // known until then. A warm member's container already exists — which is the whole point —
+            // and its argv arrives through `docker exec`. Either way the single-use guarantee is
+            // untouched: the guard admits exactly one `exec` (§14.1).
+            let created = matches!(slot, Slot::Warm(_));
             Ok(Box::new(ContainerInstance {
                 guard: UseGuard::new(name.clone(), spec.job_id.clone()),
                 name,
-                config: self.config.clone(),
+                config: match &slot {
+                    // The member's own configuration, rebuilt from its key — not the backend's. They
+                    // agree today; taking the member's means they cannot come apart tomorrow.
+                    Slot::Warm(member) => member.config().clone(),
+                    Slot::Cold => self.config.clone(),
+                },
                 spec: spec.clone(),
                 capture: None,
-                created: false,
+                created,
+                slot,
+                pool: self.pool.clone().map(|p| (p, key)),
             }) as Box<dyn SandboxInstance>)
         })
     }
+}
+
+impl ContainerBackend {
+    /// Try to take a warm member for this job, and give it its workspace.
+    ///
+    /// **Every failure here is a [`Slot::Cold`], never an error.** D§6.4 buys latency; a pool that
+    /// could fail a job would be trading a verdict for it. The one exception is documented on
+    /// [`crate::pool::adopt_workspace`] and needs a filesystem that has started refusing renames in
+    /// both directions, at which point the workspace is genuinely unusable.
+    async fn claim_warm(&self, pool: &Arc<SandboxPool>, key: &PoolKey, spec: &SandboxSpec) -> Slot {
+        let Some(member) = pool.claim(key).await else { return Slot::Cold };
+        // The step D§6.4 calls "bind the workspace": the mount was fixed at `create`, so the
+        // contents move into it rather than the mount point moving to them.
+        match crate::pool::adopt_workspace(&spec.workspace, member.mount_dir()) {
+            Ok(()) => Slot::Warm(Box::new(member)),
+            Err(e) => {
+                tracing::error!(
+                    container = %member.name(),
+                    error = %e,
+                    "could not move the workspace into a warm sandbox; this job takes the cold path \
+                     (is the pool root on the same filesystem as the work root?)"
+                );
+                pool.discard_claimed(member).await;
+                Slot::Cold
+            }
+        }
+    }
+}
+
+/// Where this sandbox's container came from.
+///
+/// An enum rather than an `Option<PoolMember>` so that every place that has to behave differently —
+/// `exec`, `destroy`, `Drop` — is a `match` a new variant would break, rather than an `if let` a new
+/// variant would quietly fall through.
+enum Slot {
+    /// Nothing exists yet; `exec` creates the container.
+    Cold,
+    /// A sandbox created before this job existed, handed to this job alone, destroyed afterwards
+    /// (D§6.4 — pre-boot, not reuse).
+    ///
+    /// Boxed because a [`PoolMember`] carries a whole [`ContainerConfig`] and `Cold` carries
+    /// nothing; every `ContainerInstance` would otherwise pay for the pooled case whether or not it
+    /// is in it, including on a node with no pool at all.
+    Warm(Box<PoolMember>),
 }
 
 fn sanitize_name(job_id: &str) -> String {
@@ -1304,7 +1419,7 @@ fn sanitize_name(job_id: &str) -> String {
     }
 }
 
-fn short_id() -> String {
+pub(crate) fn short_id() -> String {
     // Not cryptographic — it only has to make a name unique on one node. But "unique" has to actually
     // hold: the clock alone does not.
     //
@@ -1334,6 +1449,15 @@ struct ContainerInstance {
     spec: SandboxSpec,
     capture: Option<CapturedOutput>,
     created: bool,
+    slot: Slot,
+    /// The pool this sandbox's key belongs to, so teardown can top it back up (D§6.4).
+    ///
+    /// Present on **cold** instances too, and deliberately: a miss is exactly the signal that this
+    /// configuration is hot and has nothing warm, so the first job of a key is what causes the pool
+    /// to learn it. That is the whole of the demand prediction — D§6.4 describes a per-image mix over
+    /// the last hour, and what is here instead is "warm what just ran", which needs no history, no
+    /// persistence and no clock.
+    pool: Option<(Arc<SandboxPool>, PoolKey)>,
 }
 
 impl SandboxInstance for ContainerInstance {
@@ -1354,43 +1478,81 @@ impl SandboxInstance for ContainerInstance {
             validate_exec(req)?;
             self.guard.begin_exec(&req.job_id)?;
 
-            let create = create_argv(&self.config, &self.spec, &self.name, &req.argv);
-            // The one place a delivered secret is materialized on this host: the `create` CLI's own
-            // environment, for the length of that one process. `create_argv` named the variables;
-            // this supplies the values out of band (see the `--env NAME` block there).
+            // The one place a delivered secret is materialized on this host: the CLI's own
+            // environment, for the length of that one process. The argv builders name the variables;
+            // this supplies the values out of band (see the `--env NAME` block in `create_argv`).
             let secrets: Vec<(String, String)> =
                 self.spec.secret_env.iter().map(|(n, v)| (n.clone(), v.to_string())).collect();
 
-            // **Before** the create, not after it, and this ordering is the whole point.
-            //
-            // `self.created` gates whether `destroy` issues an `rm` at all, and it used to be set
-            // from the CLI's exit status. But the CLI's exit status is a statement about the CLI: a
-            // `create` that hits `control_timeout` while the daemon goes on to create the container
-            // exits non-zero, leaves `created = false`, and `destroy` then skips the `rm` for a
-            // container that exists. The daemon's work is not observable from a process we killed,
-            // so the flag has to mean "an attempt was made that the daemon may have completed"
-            // rather than "the CLI said yes".
-            //
-            // The cost of the conservative reading is one `rm` against a container that was never
-            // created, and that costs nothing: `docker rm --force` on a missing container exits 0
-            // (verified against docker 28.0.4), so a failed create still ends in a clean `destroy`.
-            self.created = true;
-            let (status, out) = control_command(&self.config, create, &secrets).await?;
-            if status != ExecStatus::Exited(0) {
-                return Err(SandboxError::Runtime(create_failure(&self.spec.image, status, &out)));
-            }
+            // Two shapes, and the `match` is what keeps them from drifting into one another.
+            let run = match &self.slot {
+                Slot::Cold => {
+                    let create = create_argv(&self.config, &self.spec, &self.name, &req.argv);
+                    // **Before** the create, not after it, and this ordering is the whole point.
+                    //
+                    // `self.created` gates whether `destroy` issues an `rm` at all, and it used to be
+                    // set from the CLI's exit status. But the CLI's exit status is a statement about
+                    // the CLI: a `create` that hits `control_timeout` while the daemon goes on to
+                    // create the container exits non-zero, leaves `created = false`, and `destroy`
+                    // then skips the `rm` for a container that exists. The daemon's work is not
+                    // observable from a process we killed, so the flag has to mean "an attempt was
+                    // made that the daemon may have completed" rather than "the CLI said yes".
+                    //
+                    // The cost of the conservative reading is one `rm` against a container that was
+                    // never created, and that costs nothing: `docker rm --force` on a missing
+                    // container exits 0 (verified against docker 28.0.4), so a failed create still
+                    // ends in a clean `destroy`.
+                    self.created = true;
+                    let (status, out) = control_command(&self.config, create, &secrets).await?;
+                    if status != ExecStatus::Exited(0) {
+                        return Err(SandboxError::Runtime(create_failure(
+                            &self.spec.image,
+                            status,
+                            &out,
+                        )));
+                    }
+                    vec![
+                        self.config.runtime.clone(),
+                        "start".into(),
+                        "--attach".into(),
+                        self.name.clone(),
+                    ]
+                }
+                // The container was created and started before this job existed, so there is nothing
+                // to create: the argv goes straight in (D§6.4's "bind the workspace and exec"). The
+                // workspace was moved into the member's mount directory at `spawn`.
+                Slot::Warm(_) => exec_argv(&self.config, &self.spec, &self.name, &req.argv),
+            };
 
-            let start = vec![
-                self.config.runtime.clone(),
-                "start".into(),
-                "--attach".into(),
-                self.name.clone(),
-            ];
-            let mut cmd = command_from_argv(&start, &runtime_env())?;
+            let warm = matches!(self.slot, Slot::Warm(_));
+            // On the cold path the values went in at `create` and the `start` CLI needs none of
+            // them; on the warm path this *is* the create-equivalent, so they go here.
+            //
+            // `docker exec --env NAME` copies the value out of the CLI's own environment exactly as
+            // `docker create --env NAME` does — verified against docker 28.0.4. Without it the
+            // pooled path would have to pass secrets as `NAME=VALUE` in an argv every local user can
+            // read out of `/proc`, which is the disclosure the by-name channel exists to prevent.
+            let env = if warm { &secrets[..] } else { &[][..] };
+            let mut runtime_env = runtime_env();
+            runtime_env.extend_from_slice(env);
+            let mut cmd = command_from_argv(&run, &runtime_env)?;
             let child = cmd.spawn()?;
             let mut capture = OutputCapture::new(req.caps);
             let outcome = run_to_completion(child, req.timeout, &mut capture).await?;
-            self.capture = Some(capture.finish());
+            let captured = capture.finish();
+            let text = captured.text().to_string();
+            self.capture = Some(captured);
+
+            // On the cold path a command the image does not have fails at `create`/`start` and is an
+            // `errored` verdict. Through `docker exec` the same mistake is exit **126** with the
+            // runtime's own line on stderr, which would otherwise be reported as the *job* exiting
+            // 126 — a `red` verdict about code nobody ran. §7 is unambiguous that we must not do
+            // that, so the two paths are brought back into agreement here.
+            if warm {
+                if let Some(why) = exec_never_started(outcome.status, &text) {
+                    return Err(SandboxError::Runtime(why));
+                }
+            }
 
             if outcome.status == ExecStatus::TimedOut {
                 // Killing the CLI we attached with does not stop the container: the daemon owns it.
@@ -1415,6 +1577,11 @@ impl SandboxInstance for ContainerInstance {
         // §14.1: "Destroy the whole microVM/rootfs after each job so nothing (a planted binary, a
         // poisoned cache, a lingering process) survives into the next job." `rm --force --volumes`
         // takes the writable layer with it.
+        //
+        // A warm member is destroyed by exactly the same call, which is what makes D§6.4 conformant:
+        // a pool member is single-use, and this is its one use ending. Its mount directory — which by
+        // now holds the job's whole workspace — goes with it, which is D§6.2's "teardown = drop the
+        // snapshot" for the pooled path.
         let argv = vec![
             self.config.runtime.clone(),
             "rm".into(),
@@ -1423,6 +1590,11 @@ impl SandboxInstance for ContainerInstance {
             self.name.clone(),
         ];
         let created = self.created;
+        let mount_dir = match &self.slot {
+            Slot::Warm(member) => Some(member.mount_dir().to_path_buf()),
+            Slot::Cold => None,
+        };
+        let pool = self.pool.take();
         Box::pin(async move {
             let result = if created {
                 match control_command(&self.config, argv, &[]).await {
@@ -1435,10 +1607,89 @@ impl SandboxInstance for ContainerInstance {
             } else {
                 Ok(())
             };
+            if let Some(dir) = &mount_dir {
+                crate::pool::remove_mount_dir(dir);
+            }
+            // D§6.4's refill, amortized onto teardown in this repo's established style — the way
+            // `hull-ci-fetch` sweeps at commit and the memo evicts at accept. There is no timer to
+            // own, supervise or shut down, and this runs *after* the job's output has been collected,
+            // so nothing waits on it. It never returns an error and never fails a verdict.
+            if let Some((pool, key)) = pool {
+                pool.refill(&key).await;
+            }
             self.guard.mark_destroyed();
             result
         })
     }
+}
+
+/// The `docker exec` argv for a job running in a pre-created pool member (D§6.4).
+///
+/// The counterpart to [`create_argv`], and deliberately much shorter: every §14.4 control — the
+/// user, the read-only rootfs, the dropped capabilities, `no-new-privileges`, the seccomp profile,
+/// the cgroup ceilings — is a property of the **container**, and an exec joins it rather than
+/// re-declaring it. Verified against docker 28.0.4 inside a member created by `create_argv`: `id -u`
+/// is the configured user, `CapEff` and `CapBnd` are zero, `NoNewPrivs` is `1`, `/` is read-only,
+/// `--network none` still refuses egress, and `memory.max`/`pids.max` are the container's.
+///
+/// What that leaves is the three things an exec must supply, and one flag it must never pass:
+///
+/// * `--workdir`, because an exec starts in the image's working directory rather than the
+///   container's configured one.
+/// * `--env NAME=VALUE` for the allowlisted job environment (§14.2), which a member created before
+///   the job existed could not have.
+/// * `--env NAME` for broker-delivered secrets, so the value travels through the CLI's own
+///   environment and never through an argv (D§7.4).
+/// * **Never `--user`.** `docker exec --user 0:0` really does run the exec as uid 0 — verified — so
+///   the one flag that could undo §14.4's non-root control on this path is the one flag that is not
+///   here. Omitting it means the exec inherits the container's user, which is the control.
+///
+/// The `--` terminator is here for the same reason it is in [`create_argv`]: `argv[0]` is a
+/// pipeline-controlled string, and a flag list that is explicitly ended cannot be extended by it.
+pub fn exec_argv(
+    config: &ContainerConfig,
+    spec: &SandboxSpec,
+    name: &str,
+    argv: &[String],
+) -> Vec<String> {
+    let mut a = vec![config.runtime.clone(), "exec".into(), "--workdir".into(), spec.workdir.clone()];
+    for (k, v) in &spec.env {
+        a.push("--env".into());
+        a.push(format!("{k}={v}"));
+    }
+    for secret in spec.secret_names() {
+        a.push("--env".into());
+        a.push(secret.to_string());
+    }
+    a.push("--".into());
+    a.push(name.to_string());
+    a.extend(argv.iter().cloned());
+    a
+}
+
+/// Did `docker exec` fail to *start* the command, rather than the command failing?
+///
+/// The distinction is §7's, and it is the difference between `errored` and `red`. On the cold path a
+/// command the image does not have is a `create`/`start` failure and can only be `errored`; through
+/// an exec it is exit 126 (or 127) with the runtime's own line on stderr, which without this would be
+/// reported as the *job* exiting 126 — a red verdict about code that never ran.
+///
+/// The match is on docker's own `OCI runtime exec failed` prefix, and it is only ever used to turn a
+/// verdict *towards* `errored`, which is the direction §7 says to be wrong in. A phrasing change in a
+/// future runtime costs the distinction, not correctness.
+fn exec_never_started(status: ExecStatus, output: &str) -> Option<String> {
+    if !matches!(status, ExecStatus::Exited(126) | ExecStatus::Exited(127)) {
+        return None;
+    }
+    output
+        .lines()
+        .find(|l| l.contains("OCI runtime exec failed") || l.contains("exec failed:"))
+        .map(|line| {
+            format!(
+                "the sandbox could not start the command ({status:?}); this is an infrastructure \
+                 failure and not a test result. Runtime said: {line}"
+            )
+        })
 }
 
 impl Drop for ContainerInstance {
@@ -1475,6 +1726,13 @@ impl Drop for ContainerInstance {
         let config = self.config.clone();
         let name = self.name.clone();
         let job = self.guard.job_id().to_string();
+        // A warm member's mount directory holds the job's workspace by this point, so it goes the
+        // same way the container does — and it is removed *after* the container, so nothing is
+        // reading it.
+        let mount_dir = match &self.slot {
+            Slot::Warm(member) => Some(member.mount_dir().to_path_buf()),
+            Slot::Cold => None,
+        };
         match tokio::runtime::Handle::try_current() {
             Ok(handle) => {
                 tracing::warn!(
@@ -1500,6 +1758,9 @@ impl Drop for ContainerInstance {
                             container = %name, error = %e,
                             "best-effort removal of a dropped sandbox failed; it will be reaped at next node start"
                         ),
+                    }
+                    if let Some(dir) = &mount_dir {
+                        crate::pool::remove_mount_dir(dir);
                     }
                 });
             }
@@ -3293,6 +3554,717 @@ probe_done=1
         assert!(reaped.removed.is_empty());
         assert_eq!(reaped.failures.len(), 1, "an orphan we could not remove is still an orphan");
         assert!(reaped.failures[0].contains("stuck1"));
+    }
+
+    // ── D§6.4 warm pools: the parts that can be settled without a daemon ───────────────────────
+    //
+    // The live probes further down settle what a *container* does. These settle our control flow:
+    // which argv is issued for a warm slot, that a member never gets the one flag that could weaken
+    // it, and that the whole miss → warm → hit → destroy cycle really runs — because the way a warm
+    // pool fails is that it silently never warms, and every job then works perfectly on the cold
+    // path.
+
+    #[test]
+    fn an_exec_supplies_the_job_and_inherits_every_control_from_the_container() {
+        // The three things a member created before the job existed could not have, and the one flag
+        // that must never appear. `docker exec --user 0:0` really does run as uid 0 (verified against
+        // docker 28.0.4), so it is the single flag on this path that could undo §14.4's non-root
+        // control — and it is not here.
+        let t = tempfile::tempdir().unwrap();
+        let mut s = spec(t.path());
+        s.broker_authorised = vec!["NPM_TOKEN".into()];
+        s.secret_env = vec![("NPM_TOKEN".into(), zeroize::Zeroizing::new("npm_s3cr3tvalue".into()))];
+
+        let argv = exec_argv(
+            &ContainerConfig::default(),
+            &s,
+            "hull-ci-warm-1",
+            &["cargo".into(), "test".into()],
+        );
+        let joined = argv.join(" ");
+
+        assert!(joined.contains("exec --workdir /workspace"), "{joined}");
+        assert!(argv.windows(2).any(|w| w[0] == "--env" && w[1] == "CI=true"));
+        // Delivered secrets travel by name, exactly as they do at `create`: `--env NAME=VALUE` puts
+        // the plaintext in an argv every other local user can read out of `/proc`.
+        assert!(argv.windows(2).any(|w| w[0] == "--env" && w[1] == "NPM_TOKEN"));
+        assert!(!joined.contains("npm_s3cr3tvalue"), "the value reached an argv: {joined}");
+        assert!(
+            !argv.iter().any(|a| a == "--user"),
+            "an exec must never re-declare the user: `--user 0:0` runs as root ({joined})"
+        );
+        assert!(
+            !argv.iter().any(|a| a == "--privileged" || a == "--cap-add"),
+            "nor anything that could add back what the container dropped: {joined}"
+        );
+        assert!(!argv.iter().any(|a| a == "sh" || a == "-c"), "no shell, ever (D§7.2)");
+
+        // The flag list is terminated before the container name, so a pipeline-controlled argv[0]
+        // lands where flags are no longer being parsed — the same reason `create_argv` does it.
+        let end = argv.iter().position(|a| a == "--").expect("the flag list must be terminated");
+        assert_eq!(argv[end + 1], "hull-ci-warm-1");
+        assert_eq!(&argv[end + 2..], &["cargo".to_string(), "test".to_string()]);
+    }
+
+    #[test]
+    fn a_command_the_image_does_not_have_is_errored_rather_than_a_red_verdict() {
+        // On the cold path this is a `create`/`start` failure and can only be `errored`. Through an
+        // exec it is exit 126 with the runtime's own line, which without this would be reported as
+        // the *job* exiting 126 — a red verdict about code that never ran (§7).
+        let oci = "OCI runtime exec failed: exec failed: unable to start container process: exec: \
+                   \"cargo\": executable file not found in $PATH: unknown";
+        let why = exec_never_started(ExecStatus::Exited(126), oci).expect("must be recognised");
+        assert!(why.contains("infrastructure failure and not a test result"), "{why}");
+        assert!(why.contains("executable file not found"), "the runtime's own text survives: {why}");
+
+        // …and the control: a job that genuinely exits 126 is a job that exited 126.
+        assert!(exec_never_started(ExecStatus::Exited(126), "permission denied\n").is_none());
+        assert!(exec_never_started(ExecStatus::Exited(1), oci).is_none());
+        assert!(exec_never_started(ExecStatus::Exited(0), "").is_none());
+    }
+
+    /// A runtime stand-in that answers everything the pool asks: `create`, `start`, `inspect`
+    /// (running), `exec` and `rm`. Every call is recorded, so "did a warm container get created, and
+    /// did the next job run inside it" is a question about the log rather than about timing.
+    #[cfg(unix)]
+    fn pooling_runtime(dir: &Path, log: &Path) -> String {
+        fake_runtime(
+            dir,
+            &format!(
+                "#!/bin/sh\necho \"$@\" >> {log}\n\
+                 if [ \"$1\" = inspect ]; then echo true; fi\nexit 0\n",
+                log = log.display()
+            ),
+        )
+    }
+
+    #[cfg(unix)]
+    fn pooled_config(runtime: String, root: &Path, depth: usize) -> ContainerConfig {
+        ContainerConfig {
+            runtime,
+            runner_id: "node-pooled".into(),
+            control_timeout: Duration::from_secs(5),
+            pool: PoolConfig { depth, total: 4, root: root.to_path_buf(), ..PoolConfig::default() },
+            ..Default::default()
+        }
+    }
+
+    /// Run one whole job — spawn, exec, collect, destroy — and hand back the sandbox's id.
+    #[cfg(unix)]
+    async fn run_one(backend: &ContainerBackend, spec: &SandboxSpec) -> String {
+        let mut sbx = backend.spawn(spec).await.expect("spawn");
+        let id = sbx.id().to_string();
+        let req = ExecRequest {
+            job_id: spec.job_id.clone(),
+            argv: vec!["/bin/true".into()],
+            timeout: Duration::from_secs(5),
+            caps: crate::capture::OutputCaps::default(),
+        };
+        sbx.exec(&req).await.expect("exec");
+        sbx.collect().await.expect("collect");
+        sbx.destroy().await.expect("destroy");
+        id
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_pool_warms_at_teardown_and_the_next_job_runs_in_a_container_that_already_existed() {
+        // The whole cycle, asserted rather than inferred: the first job misses and takes the cold
+        // path, teardown warms one member, and the second job of the same shape runs in **the
+        // container that was created during the first job's teardown**.
+        //
+        // That last clause is the one that matters. A pool that silently never warms passes every
+        // functional test — every job takes the cold path and works — so the hit is established from
+        // the recorded call log (this name was created before this job was spawned) and from the
+        // counters, never from a stopwatch.
+        let t = tempfile::tempdir().unwrap();
+        let log = t.path().join("calls.log");
+        let root = t.path().join("pool");
+        let config = pooled_config(pooling_runtime(t.path(), &log), &root, 1);
+        let backend = ContainerBackend::from_probe(config, linux_probe());
+
+        let ws1 = tempfile::tempdir().unwrap();
+        let mut first = spec(ws1.path());
+        first.image = "alpine:3".into();
+        let cold_id = run_one(&backend, &first).await;
+
+        let stats = backend.pool_stats().expect("a pool was configured");
+        assert_eq!(stats.misses, 1, "the first job of a shape has nothing warm: {stats:?}");
+        assert_eq!(stats.hits, 0);
+        assert_eq!(stats.warmed, 1, "…and teardown warmed one for the next: {stats:?}");
+
+        // The log as it stood *before* the second job was spawned. Everything asserted below about
+        // "already existed" is a statement about this snapshot.
+        let before = recorded(&log);
+        assert!(before.contains(&format!("start --attach {cold_id}")), "the first job ran cold");
+
+        let ws2 = tempfile::tempdir().unwrap();
+        let mut second = spec(ws2.path());
+        second.image = "alpine:3".into();
+        second.job_id = "job-2".into();
+        let warm_id = run_one(&backend, &second).await;
+
+        let stats = backend.pool_stats().unwrap();
+        assert_eq!(stats.hits, 1, "the second job must have found the member: {stats:?}");
+        assert_ne!(warm_id, cold_id);
+        assert!(
+            before.contains(&format!("create --name {warm_id}")),
+            "the container the second job ran in was created before that job was spawned: {before}"
+        );
+
+        let after = recorded(&log);
+        assert!(
+            after.contains("exec --workdir /workspace") && after.contains(&warm_id),
+            "the job's argv went in through `docker exec`: {after}"
+        );
+        assert_eq!(
+            after.matches(&format!("create --name {warm_id}")).count(),
+            1,
+            "the member was created once, not once per job: {after}"
+        );
+        // §14.1: the member is destroyed after its one job.
+        assert!(
+            after.contains(&format!("rm --force --volumes {warm_id}")),
+            "a member must be destroyed after its one job: {after}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_member_is_handed_to_one_job_and_the_next_job_gets_a_different_one() {
+        // §14.1's prohibition, at the level the pool could break it: not "can this sandbox run twice"
+        // (the `UseGuard` settles that) but "can the pool hand the same container to two jobs". It
+        // cannot, because `claim` removes what it hands over and there is no path that puts one back.
+        let t = tempfile::tempdir().unwrap();
+        let log = t.path().join("calls.log");
+        let root = t.path().join("pool");
+        let config = pooled_config(pooling_runtime(t.path(), &log), &root, 1);
+        let backend = ContainerBackend::from_probe(config, linux_probe());
+
+        let mut ids = Vec::new();
+        for n in 0..4 {
+            let ws = tempfile::tempdir().unwrap();
+            let mut s = spec(ws.path());
+            s.image = "alpine:3".into();
+            s.job_id = format!("job-{n}");
+            ids.push(run_one(&backend, &s).await);
+        }
+        let unique: std::collections::BTreeSet<&String> = ids.iter().collect();
+        assert_eq!(unique.len(), ids.len(), "a container served two jobs: {ids:?}");
+
+        let stats = backend.pool_stats().unwrap();
+        assert_eq!(stats.hits, 3, "three of the four found a member: {stats:?}");
+        assert_eq!(stats.misses, 1);
+        assert_eq!(stats.warmed, 4, "and each teardown warmed exactly one replacement");
+        // Every container this backend touched was removed, warm or cold.
+        let calls = recorded(&log);
+        for id in &ids {
+            assert!(calls.contains(&format!("rm --force --volumes {id}")), "{id} survived: {calls}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_job_whose_shape_has_nothing_warm_creates_a_container_rather_than_waiting() {
+        // Exhaustion is a cold create, never a queue: D§6.4 buys latency, and a pool that made a job
+        // wait for a refill would be spending the thing it exists to save.
+        let t = tempfile::tempdir().unwrap();
+        let log = t.path().join("calls.log");
+        let root = t.path().join("pool");
+        let config = pooled_config(pooling_runtime(t.path(), &log), &root, 1);
+        let backend = ContainerBackend::from_probe(config, linux_probe());
+
+        // Warm a member for one shape…
+        let ws = tempfile::tempdir().unwrap();
+        let mut alpine = spec(ws.path());
+        alpine.image = "alpine:3".into();
+        run_one(&backend, &alpine).await;
+        assert_eq!(backend.pool_stats().unwrap().warmed, 1);
+
+        // …then run a job of a *different* shape. Nothing warm matches it, and it still runs.
+        let ws = tempfile::tempdir().unwrap();
+        let mut other = spec(ws.path());
+        other.image = "debian:12".into();
+        other.job_id = "job-other".into();
+        let id = run_one(&backend, &other).await;
+
+        let stats = backend.pool_stats().unwrap();
+        assert_eq!(stats.hits, 0, "a member for another image must not have been used: {stats:?}");
+        assert_eq!(stats.misses, 2);
+        let calls = recorded(&log);
+        assert!(
+            calls.contains(&format!("create --name {id}")) && calls.contains("debian:12"),
+            "the job created its own container the cold way: {calls}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_pool_that_cannot_warm_costs_latency_and_never_a_job() {
+        // The requirement that outranks the feature: warming is housekeeping, and housekeeping must
+        // not be able to fail a verdict. Here `create` fails for every warm attempt (the runtime
+        // refuses anything whose name starts `hull-ci-warm-`) and every job still runs.
+        let t = tempfile::tempdir().unwrap();
+        let log = t.path().join("calls.log");
+        let runtime = fake_runtime(
+            t.path(),
+            &format!(
+                "#!/bin/sh\necho \"$@\" >> {log}\n\
+                 case \"$*\" in *hull-ci-warm-*) exit 125;; esac\n\
+                 if [ \"$1\" = inspect ]; then echo true; fi\nexit 0\n",
+                log = log.display()
+            ),
+        );
+        let config = pooled_config(runtime, &t.path().join("pool"), 1);
+        let backend = ContainerBackend::from_probe(config, linux_probe());
+
+        for n in 0..2 {
+            let ws = tempfile::tempdir().unwrap();
+            let mut s = spec(ws.path());
+            s.image = "alpine:3".into();
+            s.job_id = format!("job-{n}");
+            run_one(&backend, &s).await;
+        }
+        let stats = backend.pool_stats().unwrap();
+        assert_eq!(stats.warmed, 0, "nothing could be warmed: {stats:?}");
+        assert_eq!(stats.warm_failures, 2, "…and the operator is told, twice: {stats:?}");
+        assert_eq!(stats.hits, 0);
+        assert_eq!(stats.misses, 2, "every job took the cold path and every job ran");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_pooled_job_takes_its_workspace_with_it_and_leaves_the_mount_directory_gone() {
+        // D§6.2's "teardown = drop the snapshot", on the pooled path. The workspace moves *into* the
+        // member's mount directory at claim, so destroying the member has to take that directory
+        // with it — otherwise a node accumulates one checkout per pooled job on disk.
+        let t = tempfile::tempdir().unwrap();
+        let log = t.path().join("calls.log");
+        let root = t.path().join("pool");
+        let config = pooled_config(pooling_runtime(t.path(), &log), &root, 1);
+        let backend = ContainerBackend::from_probe(config, linux_probe());
+
+        let ws1 = tempfile::tempdir().unwrap();
+        let mut first = spec(ws1.path());
+        first.image = "alpine:3".into();
+        run_one(&backend, &first).await;
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 1, "one member is waiting");
+
+        let ws2 = tempfile::tempdir().unwrap();
+        std::fs::write(ws2.path().join("Cargo.toml"), b"[package]").unwrap();
+        let mut second = spec(ws2.path());
+        second.image = "alpine:3".into();
+        second.job_id = "job-2".into();
+
+        let mut sbx = backend.spawn(&second).await.expect("spawn");
+        assert_eq!(backend.pool_stats().unwrap().hits, 1);
+        // The job's tree really did move into the member's directory — this is D§6.4's "bind the
+        // workspace", done the only way docker allows.
+        let member_dir = std::fs::read_dir(&root)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .find(|p| p.join("Cargo.toml").exists())
+            .expect("the workspace must be inside a member's mount directory");
+        assert_eq!(std::fs::read_dir(ws2.path()).unwrap().count(), 0, "and out of the caller's");
+
+        let req = ExecRequest {
+            job_id: second.job_id.clone(),
+            argv: vec!["/bin/true".into()],
+            timeout: Duration::from_secs(5),
+            caps: crate::capture::OutputCaps::default(),
+        };
+        sbx.exec(&req).await.expect("exec");
+        sbx.destroy().await.expect("destroy");
+        assert!(!member_dir.exists(), "the job's workspace must die with its sandbox (§14.1, D§6.2)");
+    }
+
+    // ── D§6.4 warm pools, against a real daemon ────────────────────────────────────────────────
+    //
+    // The unit tests above settle our control flow against a stand-in runtime. These settle the two
+    // things only a daemon can answer: that a container created *before* a job existed can be given
+    // that job's workspace and argv at all, and that doing so leaves every §14 control exactly where
+    // the cold path leaves it. The second is the one that matters — a fast sandbox that is not a
+    // sandbox is worse than a slow one — so the isolation probes below are the same assertions the
+    // cold-path probes at the top of this file make, re-run through a pool member.
+    //
+    // Each also asserts the **hit** from a counter and from the container's identity, never from a
+    // clock: a pool that silently never warms would otherwise pass every one of them, because every
+    // job would simply take the cold path and work.
+
+    /// A [`ContainerConfig`] with a warm pool, on a runner id unique to this call.
+    fn live_pooled_config(root: &Path, depth: usize) -> ContainerConfig {
+        ContainerConfig {
+            pool: PoolConfig {
+                depth,
+                total: 4,
+                root: root.to_path_buf(),
+                ..PoolConfig::default()
+            },
+            ..live_config()
+        }
+    }
+
+    /// Every container this runner currently has, by name.
+    async fn container_names(config: &ContainerConfig) -> Vec<String> {
+        let argv = vec![
+            config.runtime.clone(),
+            "ps".into(),
+            "--all".into(),
+            "--filter".into(),
+            format!("label={}", config.runner_label()),
+            "--format".into(),
+            "{{.Names}}".into(),
+        ];
+        match control_command(config, argv, &[]).await {
+            Ok((ExecStatus::Exited(0), out)) => {
+                out.lines().map(str::trim).filter(|l| !l.is_empty()).map(str::to_string).collect()
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    /// Which docker network a container is actually attached to.
+    async fn container_network(config: &ContainerConfig, name: &str) -> String {
+        let argv = vec![
+            config.runtime.clone(),
+            "inspect".into(),
+            name.to_string(),
+            "--format".into(),
+            "{{range $k, $v := .NetworkSettings.Networks}}{{$k}}{{end}}".into(),
+        ];
+        match control_command(config, argv, &[]).await {
+            Ok((ExecStatus::Exited(0), out)) => out.trim().to_string(),
+            _ => String::new(),
+        }
+    }
+
+    /// One whole job on an existing backend: spawn, exec, collect, destroy. Returns the sandbox id
+    /// and what the job printed.
+    async fn run_job(backend: &ContainerBackend, spec: &SandboxSpec, argv: &[&str]) -> (String, String) {
+        let mut sbx = backend.spawn(spec).await.expect("spawn");
+        let id = sbx.id().to_string();
+        let req = ExecRequest {
+            job_id: spec.job_id.clone(),
+            argv: argv.iter().map(|a| a.to_string()).collect(),
+            timeout: Duration::from_secs(120),
+            caps: crate::capture::OutputCaps::default(),
+        };
+        let _ = sbx.exec(&req).await.expect("exec");
+        let out = sbx.collect().await.unwrap().text().to_string();
+        sbx.destroy().await.expect("destroy");
+        (id, out)
+    }
+
+    /// A job spec of a given shape, with its own workspace directory.
+    fn live_job(ws: &Path, job_id: &str) -> SandboxSpec {
+        let mut s = spec(ws);
+        s.image = "alpine:3".into();
+        s.job_id = job_id.into();
+        s
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a running container daemon and the alpine image"]
+    async fn live_a_pooled_job_runs_in_a_container_that_existed_before_it_and_never_a_second_job() {
+        // D§6.4's claim, made checkable: the second job of a shape runs in a container the daemon
+        // already had, and that container is gone afterwards.
+        //
+        // "Already had" is established from the daemon's own listing taken *before* the job was
+        // spawned — a causal ordering, not an elapsed time. Nothing here is timed.
+        let root = tempfile::tempdir().unwrap();
+        let config = live_pooled_config(root.path(), 1);
+        let backend = ContainerBackend::detect(config.clone()).await.expect("daemon");
+
+        let ws1 = tempfile::tempdir().unwrap();
+        let (cold_id, out) = run_job(&backend, &live_job(ws1.path(), "job-1"), &["/bin/echo", "one"]).await;
+        assert!(out.contains("one"), "the first job must run: {out}");
+        let stats = backend.pool_stats().expect("a pool was configured");
+        assert_eq!(stats.misses, 1, "nothing was warm for the first job of a shape: {stats:?}");
+        assert_eq!(stats.warmed, 1, "…and its teardown warmed one: {stats:?}");
+
+        // What the daemon had before the second job existed.
+        let before = container_names(&config).await;
+        assert!(!before.contains(&cold_id), "the first job's container is gone (§14.1)");
+        assert_eq!(before.len(), 1, "exactly one idle member is waiting: {before:?}");
+
+        let ws2 = tempfile::tempdir().unwrap();
+        let (warm_id, out) = run_job(&backend, &live_job(ws2.path(), "job-2"), &["/bin/echo", "two"]).await;
+        assert!(out.contains("two"), "the pooled job must run: {out}");
+        let stats = backend.pool_stats().unwrap();
+        assert_eq!(stats.hits, 1, "the second job must have found the member: {stats:?}");
+        assert!(
+            before.contains(&warm_id),
+            "the pooled job ran in a container the daemon did not already have: {warm_id} not in {before:?}"
+        );
+
+        // §14.1: one job, then destroyed. Never handed to a second.
+        assert!(!container_exists(&config, &warm_id).await, "a used member must not survive its job");
+        let ws3 = tempfile::tempdir().unwrap();
+        let (third_id, _) = run_job(&backend, &live_job(ws3.path(), "job-3"), &["/bin/echo", "three"]).await;
+        assert_ne!(third_id, warm_id, "a member was handed to a second job (§14.1)");
+        assert_eq!(backend.pool_stats().unwrap().hits, 2, "…and it was still a pooled run");
+
+        backend.drain_pool().await;
+        assert!(container_names(&config).await.is_empty(), "nothing of this runner's is left");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a running container daemon and the alpine image"]
+    async fn live_a_pooled_sandbox_is_still_a_sandbox() {
+        // **The test that decides whether this feature may ship.** A pre-created container is only
+        // acceptable if `docker exec` inherits every control the cold path gets at `create`, so this
+        // re-runs the §14 probes from the top of this file *through a pool member* — and asserts the
+        // hit first, because a pool that silently never warms would otherwise make this a very
+        // thorough test of the cold path.
+        let root = tempfile::tempdir().unwrap();
+        let config = live_pooled_config(root.path(), 1);
+        let backend = ContainerBackend::detect(config.clone()).await.expect("daemon");
+        assert!(backend.controls().egress_deny, "the backend claims `--network none`");
+
+        // The probe. Identical for both runs, so "the pooled sandbox is the same sandbox" is one
+        // string compared twice rather than two lists of assertions that could drift.
+        const PROBE: &[&str] = &[
+            "/bin/sh",
+            "-c",
+            "echo uid=$(id -u); \
+             touch /planted 2>/dev/null; echo ro_rc=$?; \
+             touch /tmp/scratch 2>/dev/null; echo tmp_rc=$?; \
+             wget -q -T 2 -O- http://1.1.1.1 >/dev/null 2>&1; echo raw_rc=$?; \
+             wget -q -T 2 -O- http://example.com >/dev/null 2>&1; echo dns_rc=$?; \
+             wget -q -T 2 -O- http://169.254.169.254/latest/meta-data/ >/dev/null 2>&1; echo meta_rc=$?; \
+             echo nnp=$(grep ^NoNewPrivs /proc/self/status | tr -d ' \\t' ); \
+             echo caps=$(grep ^CapEff /proc/self/status | tr -d ' \\t'); \
+             echo mem=$(cat /sys/fs/cgroup/memory.max 2>/dev/null); \
+             echo pids=$(cat /sys/fs/cgroup/pids.max 2>/dev/null); \
+             echo planted > /tmp/evidence; \
+             cat /tmp/evidence",
+        ];
+
+        // 1. Cold, to establish what the probe says about a sandbox this crate already trusts.
+        let ws1 = tempfile::tempdir().unwrap();
+        let (_, cold) = run_job(&backend, &live_job(ws1.path(), "job-cold"), PROBE).await;
+        assert_eq!(backend.pool_stats().unwrap().misses, 1, "the first job of a shape is cold");
+
+        // 2. Pooled — and it really is pooled, asserted before anything is concluded from it.
+        let ws2 = tempfile::tempdir().unwrap();
+        let (warm_id, warm) = run_job(&backend, &live_job(ws2.path(), "job-warm"), PROBE).await;
+        assert_eq!(
+            backend.pool_stats().unwrap().hits,
+            1,
+            "this job took the cold path, so nothing below says anything about pooling"
+        );
+
+        // §14.4: non-root, read-only rootfs, writable tmpfs scratch, capabilities gone,
+        // no-new-privileges, and the cgroup ceilings.
+        assert!(warm.contains("uid=65534"), "a pooled job must not run as root: {warm}");
+        assert!(warm.contains("ro_rc=1"), "the root filesystem must be read-only: {warm}");
+        assert!(warm.contains("tmp_rc=0"), "…but /tmp must be writable: {warm}");
+        assert!(warm.contains("nnp=NoNewPrivs:1"), "no-new-privileges must survive an exec: {warm}");
+        assert!(
+            warm.contains("caps=CapEff:0000000000000000"),
+            "every capability must still be dropped: {warm}"
+        );
+        assert!(warm.contains("mem=4294967296"), "the memory ceiling is the container's: {warm}");
+        assert!(warm.contains("pids=2048"), "the pid ceiling is the container's: {warm}");
+
+        // §14.2/§14.3: no egress, no name resolution, no metadata endpoint.
+        assert!(warm.contains("raw_rc=1"), "a pooled job must have no egress to a raw IP: {warm}");
+        assert!(warm.contains("dns_rc=1"), "…nor to a public name: {warm}");
+        assert!(warm.contains("meta_rc=1"), "…nor to the cloud metadata endpoint: {warm}");
+        assert!(!warm.contains("ami-"), "and nothing resembling instance metadata came back: {warm}");
+
+        // The strongest form of all of the above: the pooled sandbox and the cold one are
+        // indistinguishable from inside. If a future flag stops being inherited by an exec, this
+        // fails without anyone having had to think of that flag in advance.
+        assert_eq!(
+            cold.trim(),
+            warm.trim(),
+            "a pooled sandbox must be the same sandbox as a cold one, control for control"
+        );
+
+        // §14.1: nothing the pooled job planted survives, and nothing of it is left on the daemon or
+        // on disk.
+        assert!(warm.contains("planted"), "the job did write its marker: {warm}");
+        assert!(!container_exists(&config, &warm_id).await, "the member must be gone");
+        let ws3 = tempfile::tempdir().unwrap();
+        let (_, next) = run_job(
+            &backend,
+            &live_job(ws3.path(), "job-after"),
+            &["/bin/sh", "-c", "cat /tmp/evidence 2>&1; echo rc=$?"],
+        )
+        .await;
+        assert_eq!(backend.pool_stats().unwrap().hits, 2, "…and this one was pooled too");
+        assert!(next.contains("rc=1"), "a pooled sandbox must not carry the last job's writes: {next}");
+
+        backend.drain_pool().await;
+        // Every member's mount directory is gone too: the workspace dies with the sandbox (D§6.2).
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0, "mount directories survived");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a running container daemon, the alpine image, and network creation rights"]
+    async fn live_a_member_created_for_one_network_is_never_handed_to_a_job_needing_the_other() {
+        // The failure this module is built to make unrepresentable: a job that must have no network
+        // handed a container sitting on the package-proxy network. §14.3's guarantee would be gone,
+        // and silently — the posture probe that would have caught it ran at creation, against a
+        // different container.
+        //
+        // Both postures are warmed into **one pool**, so the negative result cannot be "the pool was
+        // empty": the member is right there, on the other key, and the claim still comes back empty.
+        let net = LiveNetwork::internal(stub_port()).await;
+        let root = tempfile::tempdir().unwrap();
+        let base = live_pooled_config(root.path(), 1);
+        let no_network = base.clone();
+        let proxied =
+            ContainerConfig { network: NetworkMode::ProxyOnly(net.proxy_network()), ..base.clone() };
+
+        let ws = tempfile::tempdir().unwrap();
+        let quiet = PoolKey::for_job(&no_network, &live_job(ws.path(), "job-1"));
+        let networked = PoolKey::for_job(&proxied, &live_job(ws.path(), "job-1"));
+        assert_ne!(quiet, networked);
+
+        let pool = SandboxPool::new(base.pool.clone(), base.control_timeout);
+        pool.refill(&quiet).await;
+        pool.refill(&networked).await;
+        assert_eq!(pool.stats().warmed, 2, "both members must exist for this to prove anything");
+
+        // Each member really is on the network its key names — the fact the whole comparison rests
+        // on, taken from the daemon rather than from our own bookkeeping.
+        let members = container_names(&base).await;
+        assert_eq!(members.len(), 2, "{members:?}");
+        let mut networks: Vec<String> = Vec::new();
+        for name in &members {
+            networks.push(container_network(&base, name).await);
+        }
+        networks.sort();
+        assert_eq!(networks, vec![net.name.clone(), "none".to_string()].tap_sorted());
+
+        // The test proper, in both directions. A claim gets its own posture's member and only ever
+        // that one; taking it does not make the *other* posture's member available.
+        let first = pool.claim(&quiet).await.expect("its own key finds it");
+        assert_eq!(container_network(&base, first.name()).await, "none");
+        assert!(
+            pool.claim(&quiet).await.is_none(),
+            "a job needing no network was given the member sitting on the proxy network (§14.3)"
+        );
+        let second = pool.claim(&networked).await.expect("the other key finds the other member");
+        assert_eq!(container_network(&base, second.name()).await, net.name);
+        assert!(pool.claim(&networked).await.is_none());
+
+        let stats = pool.stats();
+        assert_eq!(stats.hits, 2);
+        assert_eq!(stats.misses, 2, "and both refusals were misses, so both jobs go cold: {stats:?}");
+        assert_eq!(stats.key_mismatches, 0, "nothing was filed wrongly; the keys simply differ");
+
+        pool.discard_claimed(first).await;
+        pool.discard_claimed(second).await;
+        pool.drain().await;
+        net.destroy().await;
+        assert!(container_names(&base).await.is_empty());
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a running container daemon and the alpine image"]
+    async fn live_idle_pool_members_are_removed_by_the_reaper_at_node_start() {
+        // An idle member is the one container `--rm` can never collect: AutoRemove fires when a
+        // container *exits*, and a member is deliberately one that does not. So a `SIGKILL` leaves
+        // every idle member running with a host directory mounted into it, and `reap_orphans` at the
+        // next node start is the only thing that removes them.
+        //
+        // Paired with its control, in one run: the same reaper, the same probe, one thing changed —
+        // the runner id it is asked about.
+        let root = tempfile::tempdir().unwrap();
+        let config = live_pooled_config(root.path(), 2);
+        let ws = tempfile::tempdir().unwrap();
+        let key = PoolKey::for_job(&config, &live_job(ws.path(), "job-1"));
+
+        let pool = SandboxPool::new(config.pool.clone(), config.control_timeout);
+        pool.refill(&key).await;
+        pool.refill(&key).await;
+        assert_eq!(pool.stats().warmed, 2, "two idle members: {:?}", pool.stats());
+
+        let members = container_names(&config).await;
+        assert_eq!(members.len(), 2, "{members:?}");
+        for name in &members {
+            // Alive, idle, and therefore beyond AutoRemove's reach — which is why the reaper matters.
+            assert!(container_running(&config, name).await, "{name} is not running");
+        }
+
+        // Control: another runner's reaper must leave them alone. Without this, "gone after the
+        // reap" could equally mean "never there".
+        let someone_else = ContainerConfig { runner_id: live_config().runner_id, ..config.clone() };
+        let swept = reap_orphans(&someone_else).await.expect("reap");
+        assert!(swept.removed.is_empty(), "another runner's reaper removed something: {swept:?}");
+        assert_eq!(container_names(&config).await.len(), 2, "…and they are still there");
+
+        // The test proper: this runner's node start removes every one of its idle members.
+        let reaped = reap_orphans(&config).await.expect("reap");
+        assert_eq!(reaped.removed.len(), 2, "the reaper must find idle pool members: {reaped:?}");
+        assert!(reaped.failures.is_empty(), "{reaped:?}");
+        assert!(container_names(&config).await.is_empty(), "…and the same probe finds nothing");
+
+        pool.drain().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a running container daemon and the alpine image"]
+    async fn live_an_exhausted_pool_falls_back_to_a_cold_create_and_the_job_still_runs() {
+        // Exhaustion must never be a queue. Two jobs of one shape are spawned while only one member
+        // is warm: the first takes it, the second creates its own, and both produce a verdict.
+        let root = tempfile::tempdir().unwrap();
+        let config = live_pooled_config(root.path(), 1);
+        let backend = ContainerBackend::detect(config.clone()).await.expect("daemon");
+
+        // One member, warmed by the first job's teardown.
+        let ws0 = tempfile::tempdir().unwrap();
+        run_job(&backend, &live_job(ws0.path(), "job-0"), &["/bin/echo", "zero"]).await;
+        assert_eq!(backend.pool_stats().unwrap().warmed, 1);
+
+        // Two sandboxes held open at once, so the second genuinely finds the pool empty.
+        let ws1 = tempfile::tempdir().unwrap();
+        let ws2 = tempfile::tempdir().unwrap();
+        let first_spec = live_job(ws1.path(), "job-1");
+        let second_spec = live_job(ws2.path(), "job-2");
+        let mut first = backend.spawn(&first_spec).await.expect("spawn");
+        let mut second = backend.spawn(&second_spec).await.expect("spawn");
+
+        let stats = backend.pool_stats().unwrap();
+        assert_eq!(stats.hits, 1, "exactly one of the two found a member: {stats:?}");
+        assert_eq!(stats.misses, 2, "…and the other missed rather than waiting: {stats:?}");
+
+        for (spec, sbx, word) in [
+            (&first_spec, &mut first, "one"),
+            (&second_spec, &mut second, "two"),
+        ] {
+            let req = ExecRequest {
+                job_id: spec.job_id.clone(),
+                argv: vec!["/bin/echo".into(), word.into()],
+                timeout: Duration::from_secs(120),
+                caps: crate::capture::OutputCaps::default(),
+            };
+            let outcome = sbx.exec(&req).await.expect("exec");
+            assert_eq!(outcome.status, ExecStatus::Exited(0), "the {word} job must run");
+            assert!(sbx.collect().await.unwrap().text().contains(word));
+        }
+        let (a, b) = (first.id().to_string(), second.id().to_string());
+        assert_ne!(a, b);
+        first.destroy().await.expect("destroy");
+        second.destroy().await.expect("destroy");
+        assert!(!container_exists(&config, &a).await);
+        assert!(!container_exists(&config, &b).await);
+
+        backend.drain_pool().await;
+    }
+
+    /// Sort a `Vec<String>` inline, so an expectation reads as one expression.
+    trait TapSorted {
+        fn tap_sorted(self) -> Self;
+    }
+    impl TapSorted for Vec<String> {
+        fn tap_sorted(mut self) -> Self {
+            self.sort();
+            self
+        }
     }
 
     #[tokio::test]
