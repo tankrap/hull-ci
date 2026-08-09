@@ -1,59 +1,36 @@
-//! Job storage and the idempotency rule — design D§4.1 step 3, spec §9.
+//! Job storage — the **record** of a job, held by the one replica driving it.
 //!
-//! Spec §9 is blunt about whose problem duplicate dispatch is: Hull's in-flight de-dup is
-//! "best-effort (in-memory)", so **our** system "SHOULD itself be idempotent per `(tree_id)`", and a
-//! duplicate dispatch "MUST be safe to run". The key is `(repo, tree_id)`: `tree_id` alone would
-//! collide two tenants' identical trees into one job — which is both a correctness bug (one
-//! callback_url wins) and a cross-tenant channel (design D§1's threat table).
+//! ## What used to be here, and where it went
 //!
-//! Two duplicate cases, both cheap:
+//! This module used to own two maps: the job records, and the `(repo, tree_id) → job_id` index that
+//! makes spec §9's duplicate dispatch safe. The index has moved to [`crate::claims`], and that split
+//! is the whole of M5 phase 1. The short version, with the long one in that module:
 //!
-//! * a duplicate for a **live** job attaches to it — same job id, no second pipeline, one verdict;
-//! * a duplicate for a **finished** job re-sends the recorded verdict, which is how a lost callback
-//!   heals itself without re-running a single step.
+//! * the **index** is contended by every replica — one tree, one job, and with two processes that
+//!   race is arbitrated by an atomic insert-or-attach, not by a mutex neither of them shares;
+//! * the **record** is written by exactly one replica, *because* of the index, so it can stay where
+//!   it is: a `HashMap` behind a `Mutex`, mutated by ~39 read-modify-write call sites in
+//!   [`crate::control`] which would every one have to become a committable operation before a remote
+//!   store could serve them correctly.
 //!
-//! Storage is in-memory for M1 (single-replica bring-up). The design's `INSERT … ON CONFLICT DO
-//! NOTHING` lands with Postgres; the shape here — one atomic admit that either creates or reports a
-//! duplicate — is the same shape, so the swap does not move the decision anywhere.
+//! Splitting them rather than putting this type behind a trait is what keeps those 39 call sites
+//! honest. A trait that handed out `&mut Job` across a network would be a lost update wearing a
+//! seam's clothes.
+//!
+//! What remains here is storage and **retention**: hold the record while a duplicate might still be
+//! answered from it, and bound the process so a long-lived runner does not grow until it dies holding
+//! every verdict it ever computed.
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
-use hull_ci_proto::{AuthorClass, Dispatch, Verdict};
+use hull_ci_proto::{AuthorClass, Dispatch};
 
-use crate::ids::new_job_id;
 use crate::model::{Job, JobId};
-
-/// What admitting a dispatch did.
-#[derive(Debug, Clone)]
-pub enum Admit {
-    /// First time we have seen `(repo, tree_id)`. The caller starts the pipeline.
-    Created { job_id: JobId },
-    /// A job for this tree is already in flight. Attach; the one verdict will serve both dispatches.
-    Live { job_id: JobId },
-    /// Already decided. The caller re-sends `verdict` (spec §9: a duplicate "simply re-affirms the
-    /// same verdict") without re-running anything.
-    Finished { job_id: JobId, verdict: Box<Verdict> },
-}
-
-impl Admit {
-    pub fn job_id(&self) -> &str {
-        match self {
-            Admit::Created { job_id } | Admit::Live { job_id } => job_id,
-            Admit::Finished { job_id, .. } => job_id,
-        }
-    }
-
-    pub fn is_duplicate(&self) -> bool {
-        !matches!(self, Admit::Created { .. })
-    }
-}
 
 #[derive(Default)]
 pub struct JobStore {
     by_id: HashMap<JobId, Job>,
-    /// The idempotency index: `(repo, tree_id) → job_id`.
-    by_key: HashMap<(String, String), JobId>,
 }
 
 impl JobStore {
@@ -61,37 +38,27 @@ impl JobStore {
         Self::default()
     }
 
-    /// Insert-or-attach, atomically with respect to this store's lock.
-    pub fn admit(
+    /// Record a job whose claim this replica has already won.
+    ///
+    /// Deliberately *not* an insert-or-attach: whether this `(repo, tree_id)` is new work is
+    /// [`JobClaims::admit`](crate::claims::JobClaims::admit)'s decision, because it is the only one
+    /// that can be made atomically across replicas. By the time this is called the answer is already
+    /// "yes, and this process drives it", and `job_id` is the id the claim issued — never one minted
+    /// here, or the shared index and the local record would disagree about what the winning job is
+    /// called.
+    ///
+    /// Idempotent on `job_id`, so a re-record cannot silently discard a job that already has steps.
+    pub fn insert(
         &mut self,
+        job_id: JobId,
         dispatch: Dispatch,
         author_class: AuthorClass,
         now: Instant,
         job_timeout: Duration,
-    ) -> Admit {
-        let key = (dispatch.repo.clone(), dispatch.tree_id.clone());
-
-        if let Some(existing_id) = self.by_key.get(&key).cloned() {
-            if let Some(job) = self.by_id.get_mut(&existing_id) {
-                // The work is a duplicate; the *destination* may not be. A second change sharing this
-                // tree carries its own `callback_url`, and dropping it would leave that change waiting
-                // forever on an answer delivered elsewhere (see `Job::callback_urls`).
-                job.add_callback_url(&dispatch.callback_url);
-                return match (job.state.is_finished(), job.verdict.clone()) {
-                    (true, Some(v)) => Admit::Finished { job_id: job.id.clone(), verdict: Box::new(v) },
-                    // Finished-but-verdictless cannot happen through the driver; treat it as live
-                    // rather than inventing a verdict for it.
-                    _ => Admit::Live { job_id: job.id.clone() },
-                };
-            }
-            // Index entry with no job behind it: heal by falling through to a fresh insert.
-        }
-
-        let id = new_job_id();
-        let job = Job::new(id.clone(), dispatch, author_class, now, job_timeout);
-        self.by_key.insert(key, id.clone());
-        self.by_id.insert(id.clone(), job);
-        Admit::Created { job_id: id }
+    ) -> &mut Job {
+        self.by_id
+            .entry(job_id.clone())
+            .or_insert_with(|| Job::new(job_id, dispatch, author_class, now, job_timeout))
     }
 
     pub fn get(&self, job_id: &str) -> Option<&Job> {
@@ -121,7 +88,13 @@ impl JobStore {
     }
 
     /// Drop settled jobs that are older than `retention`, then, if still over `max_jobs`, the oldest
-    /// settled ones until the cap is met. Returns how many were removed.
+    /// settled ones until the cap is met. Returns the ids removed.
+    ///
+    /// The ids rather than a count, because forgetting a job now has a second half: its
+    /// [claim](crate::claims) holds the `(repo, tree_id)` index, and a record dropped here while its
+    /// claim stood would leave the tree pointing at a job this process no longer has — a duplicate
+    /// dispatch would be told "already running" about work nobody is doing. The caller
+    /// ([`Control::accept`](crate::control::Control::accept)) closes that with `claims.forget`.
     ///
     /// **A live job is never evicted**, at any pressure. That is enforced structurally rather than by
     /// a check: eviction candidates are those with a `settled_at`, and only a terminal transition
@@ -163,25 +136,25 @@ impl JobStore {
     /// absolutely — turns a Hull that refuses every callback while continuing to dispatch (a wrong
     /// secret, a 404 route) into an unbounded store and eventually a runner that dies holding every
     /// verdict it ever computed, which is strictly worse than losing the oldest few.
-    pub fn evict(&mut self, now: Instant, retention: Duration, max_jobs: usize) -> usize {
+    pub fn evict(&mut self, now: Instant, retention: Duration, max_jobs: usize) -> Vec<JobId> {
         // The two classes, each oldest-first so both passes below take from the same end.
         let paid = self.settled_oldest_first(false);
         let owed = self.settled_oldest_first(true);
 
-        let mut removed = 0;
+        let mut evicted: Vec<JobId> = Vec::new();
         for (settled_at, id) in &paid {
             let too_old = now.duration_since(*settled_at) >= retention;
-            let over_cap = self.by_id.len() - removed > max_jobs;
+            let over_cap = self.by_id.len() - evicted.len() > max_jobs;
             if !too_old && !over_cap {
                 break;
             }
             self.remove(id);
-            removed += 1;
+            evicted.push(id.clone());
         }
 
         // Debts, and only under the hard cap. No retention clause: see the note above.
         for (_, id) in &owed {
-            if self.by_id.len() - removed <= max_jobs {
+            if self.by_id.len() - evicted.len() <= max_jobs {
                 break;
             }
             // Alert level, because this is the one path in the system that gives up on answering a
@@ -196,7 +169,7 @@ impl JobStore {
                  restart will answer it from the journal"
             );
             self.remove(id);
-            removed += 1;
+            evicted.push(id.clone());
         }
 
         if self.by_id.len() > max_jobs {
@@ -206,7 +179,7 @@ impl JobStore {
                 "job store is over its cap with nothing settled to evict — every job is still live"
             );
         }
-        removed
+        evicted
     }
 
     /// Settled jobs that do (or do not) still owe Hull an answer, oldest settlement first.
@@ -224,109 +197,44 @@ impl JobStore {
         out
     }
 
-    /// Forget one job and its index entry.
+    /// Forget one job's record.
     ///
     /// Crate-internal because there is exactly one legitimate caller outside eviction: the rollback in
     /// [`Control::accept`] when the write-ahead journal refuses a freshly created job. That job has no
-    /// driver, no steps and no verdict, and leaving it would hold the `(repo, tree_id)` index against
-    /// work nobody will ever do — so the dispatcher's retry would come back as `Admit::Live` and get
-    /// acked for a job that is not running.
+    /// driver, no steps and no verdict, and leaving it would hold the `(repo, tree_id)` claim against
+    /// work nobody will ever do — so the dispatcher's retry would come back attached to a job that is
+    /// not running, and get acked for it.
+    ///
+    /// **The record only.** Releasing the `(repo, tree_id)` claim is
+    /// [`JobClaims::forget`](crate::claims::JobClaims::forget)'s, and both callers do both — see
+    /// [`JobStore::evict`]'s note on why the ids come back.
     ///
     /// [`Control::accept`]: crate::control::Control::accept
     pub(crate) fn remove(&mut self, job_id: &str) {
-        if let Some(job) = self.by_id.remove(job_id) {
-            // Only clear the index if it still points at *this* job. A later job for the same
-            // (repo, tree_id) — which exists precisely because an earlier one was evicted — must not
-            // have its index entry removed by its predecessor's cleanup.
-            let key = job.key();
-            if self.by_key.get(&key).map(|id| id == job_id).unwrap_or(false) {
-                self.by_key.remove(&key);
-            }
-        }
+        self.by_id.remove(job_id);
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::model::JobState;
-    use crate::testing::dispatch;
-
-    fn store() -> JobStore {
-        JobStore::new()
-    }
-
-    #[test]
-    fn a_duplicate_dispatch_for_a_live_tree_attaches_instead_of_starting_a_second_job() {
-        let mut s = store();
-        let now = Instant::now();
-        let a = s.admit(dispatch("t/r", "tree1"), AuthorClass::Outsider, now, Duration::from_secs(60));
-        let b = s.admit(dispatch("t/r", "tree1"), AuthorClass::Outsider, now, Duration::from_secs(60));
-
-        assert!(matches!(a, Admit::Created { .. }));
-        assert!(matches!(b, Admit::Live { .. }));
-        assert_eq!(a.job_id(), b.job_id(), "one tree, one job");
-        assert_eq!(s.len(), 1, "a duplicate must not double the work (spec §9)");
-    }
-
-    #[test]
-    fn a_duplicate_for_a_finished_job_returns_the_recorded_verdict_to_re_report() {
-        let mut s = store();
-        let now = Instant::now();
-        let id = s
-            .admit(dispatch("t/r", "tree1"), AuthorClass::Outsider, now, Duration::from_secs(60))
-            .job_id()
-            .to_string();
-        {
-            let job = s.get_mut(&id).unwrap();
-            job.state = JobState::Green;
-            job.verdict = Some(Verdict::green("42 tests, 0 failed"));
-        }
-
-        match s.admit(dispatch("t/r", "tree1"), AuthorClass::Outsider, now, Duration::from_secs(60)) {
-            Admit::Finished { job_id, verdict } => {
-                assert_eq!(job_id, id);
-                assert_eq!(verdict.summary.as_deref(), Some("42 tests, 0 failed"));
-            }
-            other => panic!("expected Finished, got {other:?}"),
-        }
-        assert_eq!(s.len(), 1);
-    }
-
-    #[test]
-    fn the_key_is_repo_and_tree_not_tree_alone() {
-        // Two tenants with an identical tree are two jobs with two callback_urls. Collapsing them
-        // would send one tenant's verdict to the other (design D§1: log/summary bleed).
-        let mut s = store();
-        let now = Instant::now();
-        let a = s.admit(dispatch("acme/api", "same"), AuthorClass::Outsider, now, Duration::from_secs(60));
-        let b = s.admit(dispatch("other/api", "same"), AuthorClass::Outsider, now, Duration::from_secs(60));
-        assert_ne!(a.job_id(), b.job_id());
-        assert_eq!(s.len(), 2);
-    }
-
-    #[test]
-    fn a_different_change_over_the_same_tree_is_the_same_work() {
-        // Spec §1.2: "the change is the unit of work, the tree is the identity."
-        let mut s = store();
-        let now = Instant::now();
-        let mut d2 = dispatch("t/r", "tree1");
-        d2.change = "a-different-change".into();
-        let a = s.admit(dispatch("t/r", "tree1"), AuthorClass::Outsider, now, Duration::from_secs(60));
-        let b = s.admit(d2, AuthorClass::Outsider, now, Duration::from_secs(60));
-        assert_eq!(a.job_id(), b.job_id());
-    }
-}
+// The idempotency tests that used to live here are in [`crate::claims`], with the index they were
+// testing. What is left is retention, which is this type's remaining job.
 
 #[cfg(test)]
 mod retention_tests {
     use super::*;
+    use crate::ids::new_job_id;
     use crate::model::JobState;
     use crate::testing::dispatch;
 
+    /// A job recorded the way [`Control`](crate::control::Control) records one: with an id its claim
+    /// already issued.
+    fn record(store: &mut JobStore, repo: &str, tree: &str, at: Instant) -> JobId {
+        let id = new_job_id();
+        store.insert(id.clone(), dispatch(repo, tree), AuthorClass::Member, at, Duration::from_secs(60));
+        id
+    }
+
     fn settled_job(store: &mut JobStore, repo: &str, tree: &str, at: Instant) -> JobId {
-        let admit = store.admit(dispatch(repo, tree), AuthorClass::Member, at, Duration::from_secs(60));
-        let id = admit.job_id().to_string();
+        let id = record(store, repo, tree, at);
         let job = store.get_mut(&id).unwrap();
         for s in [JobState::Fetching, JobState::Planning, JobState::Running, JobState::Green, JobState::Reported] {
             job.transition_at(s, at).unwrap();
@@ -343,10 +251,10 @@ mod retention_tests {
         let mut store = JobStore::new();
         let t0 = Instant::now();
         for i in 0..5 {
-            store.admit(dispatch("t/r", &format!("tree{i}")), AuthorClass::Member, t0, Duration::from_secs(60));
+            record(&mut store, "t/r", &format!("tree{i}"), t0);
         }
         let removed = store.evict(t0 + Duration::from_secs(86_400), Duration::from_secs(1), 1);
-        assert_eq!(removed, 0, "no live job may be evicted");
+        assert_eq!(removed.len(), 0, "no live job may be evicted");
         assert_eq!(store.len(), 5, "and the store stays over its cap rather than losing work");
     }
 
@@ -358,7 +266,7 @@ mod retention_tests {
         settled_job(&mut store, "t/r", "new", t0 + Duration::from_secs(50));
 
         let removed = store.evict(t0 + Duration::from_secs(60), Duration::from_secs(30), usize::MAX);
-        assert_eq!(removed, 1, "only the one past retention");
+        assert_eq!(removed.len(), 1, "only the one past retention");
         assert_eq!(store.len(), 1);
     }
 
@@ -371,31 +279,31 @@ mod retention_tests {
         settled_job(&mut store, "t/r", "c", t0 + Duration::from_secs(2));
 
         let removed = store.evict(t0 + Duration::from_secs(3), Duration::from_secs(3600), 2);
-        assert_eq!(removed, 1);
+        assert_eq!(removed.len(), 1);
         assert!(store.get(&oldest).is_none(), "the oldest settled job goes first");
         assert_eq!(store.len(), 2);
     }
 
     #[test]
-    fn an_evicted_tree_dispatched_again_is_new_work_not_a_half_found_duplicate() {
-        // The cost of eviction, asserted rather than assumed: the index goes with the job, so this
-        // re-runs instead of re-reporting. A wasted run, not a wrong answer — Hull owns the real memo
-        // (spec §9). What must NOT happen is `Admit::Finished` pointing at a job that no longer
-        // exists, which is why `remove` clears both maps together.
+    fn eviction_names_what_it_dropped_so_the_claim_can_be_released_too() {
+        // The cost of eviction, asserted rather than assumed: the tree becomes new work again, which
+        // means a re-run instead of a re-report. A wasted run, not a wrong answer — Hull owns the real
+        // memo (spec §9). What must NOT happen is the *claim* outliving the record: the tree would
+        // then point at a job this process no longer has, and the next dispatch would be told
+        // "already running" about work nobody is doing. So `evict` names its casualties and
+        // `Control::accept` forgets their claims.
         let mut store = JobStore::new();
         let t0 = Instant::now();
-        settled_job(&mut store, "t/r", "tree1", t0);
-        store.evict(t0 + Duration::from_secs(7200), Duration::from_secs(3600), usize::MAX);
+        let id = settled_job(&mut store, "t/r", "tree1", t0);
+        let removed = store.evict(t0 + Duration::from_secs(7200), Duration::from_secs(3600), usize::MAX);
 
-        let again = store.admit(dispatch("t/r", "tree1"), AuthorClass::Member, t0, Duration::from_secs(60));
-        assert!(matches!(again, Admit::Created { .. }), "got {again:?}");
-        assert!(store.get(again.job_id()).is_some(), "and the new job is really there");
+        assert_eq!(removed, vec![id.clone()]);
+        assert!(store.get(&id).is_none());
     }
 
     /// A job parked in `report_failed`: settled, but Hull never heard the verdict.
     fn undelivered_job(store: &mut JobStore, repo: &str, tree: &str, at: Instant) -> JobId {
-        let admit = store.admit(dispatch(repo, tree), AuthorClass::Member, at, Duration::from_secs(60));
-        let id = admit.job_id().to_string();
+        let id = record(store, repo, tree, at);
         let job = store.get_mut(&id).unwrap();
         for s in [JobState::Fetching, JobState::Planning, JobState::Running, JobState::Green, JobState::ReportFailed] {
             job.transition_at(s, at).unwrap();
@@ -419,7 +327,7 @@ mod retention_tests {
         let owed = undelivered_job(&mut store, "t/r", "undelivered", t0);
 
         let removed = store.evict(t0 + Duration::from_secs(7200), Duration::from_secs(3600), usize::MAX);
-        assert_eq!(removed, 1, "only the job Hull has already heard about");
+        assert_eq!(removed.len(), 1, "only the job Hull has already heard about");
         assert!(store.get(&paid).is_none());
         assert!(store.get(&owed).is_some(), "an undelivered verdict must still be retryable");
     }
@@ -440,18 +348,18 @@ mod retention_tests {
         settled_job(&mut store, "t/r", "c", t0 + Duration::from_secs(2));
 
         let removed = store.evict(t0 + Duration::from_secs(3), Duration::from_secs(3600), 2);
-        assert_eq!(removed, 1);
+        assert_eq!(removed.len(), 1);
         assert!(store.get(&newer_paid).is_none(), "the oldest *delivered* job goes first");
         assert!(store.get(&owed).is_some(), "even though the debt is older still");
 
         // Pressed again, the last delivered job goes and the debt still does not.
-        assert_eq!(store.evict(t0 + Duration::from_secs(4), Duration::from_secs(3600), 1), 1);
+        assert_eq!(store.evict(t0 + Duration::from_secs(4), Duration::from_secs(3600), 1).len(), 1);
         assert!(store.get(&owed).is_some(), "a debt is the last thing in the store to be given up");
 
         // Only when it is the sole thing between this process and its ceiling. That drop is logged at
         // alert level, because it is the one path in the system that gives up on answering a dispatch
         // we acked — and its journal entry survives, so a restart still answers it. Nothing else will.
-        assert_eq!(store.evict(t0 + Duration::from_secs(5), Duration::from_secs(3600), 0), 1);
+        assert_eq!(store.evict(t0 + Duration::from_secs(5), Duration::from_secs(3600), 0).len(), 1);
         assert!(store.get(&owed).is_none());
         assert!(store.is_empty());
     }
@@ -463,8 +371,7 @@ mod retention_tests {
         // job least worth holding on to.
         let mut store = JobStore::new();
         let t0 = Instant::now();
-        let admit = store.admit(dispatch("t/r", "tree1"), AuthorClass::Member, t0, Duration::from_secs(60));
-        let id = admit.job_id().to_string();
+        let id = record(&mut store, "t/r", "tree1", t0);
         let job = store.get_mut(&id).unwrap();
         for s in [JobState::Fetching, JobState::Planning, JobState::Running, JobState::Green] {
             job.transition_at(s, t0).unwrap();

@@ -31,8 +31,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use hull_ci_proto::{
-    sanitize_summary, Assignment, Dispatch, IsolationTier, Reason, StepOutcome, StepReport, Verdict,
-    SUMMARY_MAX_CHARS,
+    sanitize_summary, Assignment, AuthorClass, Dispatch, IsolationTier, Reason, StepOutcome,
+    StepReport, Verdict, SUMMARY_MAX_CHARS,
 };
 use tokio::sync::Notify;
 
@@ -40,16 +40,19 @@ use crate::aggregate::{fold, Decision, Fold};
 use crate::callback::{
     deliver_reporting, CallbackRequest, CallbackTransport, Delivery, DeliveryProgress, RetryPolicy,
 };
+use crate::claims::{
+    now_ms, renew_every, Admitted, ClaimError, DriveLease, JobClaims, StepClaim, TreeKey,
+};
 use crate::fairshare::{Admission, Depth, FairQueue, FairShare, Grant, JobView, StepView};
 use crate::graph;
-use crate::ids::new_step_id;
+use crate::ids::{new_job_id, new_step_id};
 use crate::journal::{now_unix, JobIntent, Journal, JournalError};
 use crate::memo::{plan_step_keys, JobKeyContext, MemoConfig, MemoOutcome, StepKey};
 use crate::model::{Job, JobId, JobState, Step, StepId, StepSpec, StepState};
 use crate::seams::{
     Fetcher, FetchRequest, Membership, NodeError, NodeSink, Planner, VerifiedTree,
 };
-use crate::store::{Admit, JobStore};
+use crate::store::JobStore;
 use crate::timeouts::{expiry_verdict, next_step_deadline, sweep, Expiry, Timeouts};
 
 /// Everything the control plane is configured with, minus the listen address.
@@ -99,6 +102,18 @@ pub struct ControlConfig {
     /// **Disabled by default**, because its default digester refuses every glob. A deployment that
     /// has not wired one behaves exactly as it did before layer 2 existed: every step runs.
     pub memo: MemoConfig,
+    /// How long this replica's claim on a job is good for without a renewal — design D§4.5, see
+    /// [`crate::claims`].
+    ///
+    /// Only meaningful with a shared claim store. It is the bound on the *other* failure this phase
+    /// introduces: a replica that dies holding a tree keeps the `(repo, tree_id)` claim, and a forced
+    /// re-check would come back attached to a job nobody is driving. After this long the claim is
+    /// takeable, so the next dispatch for that tree is new work.
+    ///
+    /// A heartbeat renews at a third of it ([`renew_every`]), so two consecutive lost renewals are
+    /// survivable. With [`LocalClaims`](crate::claims::LocalClaims) nothing renews and nothing
+    /// expires, because nothing else can hold the claim.
+    pub claim_ttl: Duration,
 }
 
 impl Default for ControlConfig {
@@ -125,6 +140,7 @@ impl Default for ControlConfig {
             redeliver_interval: Duration::from_secs(60),
             fair_share: FairShare::default(),
             memo: MemoConfig::default(),
+            claim_ttl: crate::claims::DEFAULT_LEASE,
         }
     }
 }
@@ -144,6 +160,14 @@ pub struct Deps {
     /// had before the journal existed — a restart strands in-flight jobs — so wiring a real one is an
     /// operator's decision rather than a new failure mode nobody asked for.
     pub journal: Arc<dyn Journal>,
+    /// The `(repo, tree_id)` index and the step claims — the only state two replicas contend over
+    /// ([`crate::claims`]).
+    ///
+    /// A seam like the others, and for the same reasons: this crate holds no connection string, and
+    /// the default is the process-local implementation that behaves exactly as the job store's own
+    /// index did before it moved. Wiring a shared one is what makes a second replica possible; not
+    /// wiring one changes nothing.
+    pub claims: Arc<dyn JobClaims>,
 }
 
 /// What the ingest handler answers with.
@@ -157,11 +181,20 @@ pub struct Accepted {
 
 /// Why a dispatch was **not** accepted.
 ///
-/// One variant, and it is the only one that can exist here: everything else a dispatch can be wrong
-/// about is decided in [`crate::ingest`] before this point. This is the failure of our own storage,
-/// which is why it becomes a 503 (try us again) rather than a 4xx (you are wrong).
+/// Two variants, and both are the same kind of thing: everything a dispatch can be *wrong* about is
+/// decided in [`crate::ingest`] before this point, so what is left is the failure of our own storage.
+/// Both become a 503 (try us again) rather than a 4xx (you are wrong).
 #[derive(Debug, thiserror::Error)]
 pub enum AcceptError {
+    /// The shared claim store could not say whether this `(repo, tree_id)` is already ours.
+    ///
+    /// **We do not ack**, for the same reason as [`NotDurable`](AcceptError::NotDurable) and one
+    /// more. Guessing "new work" would run a tree another replica is already running — two jobs, two
+    /// verdicts, and a fleet paying twice; guessing "duplicate" would ack a dispatch nothing is
+    /// driving, which spec §10 turns into a permanently wedged tree. There is no safe guess, so the
+    /// dispatcher gets a 503 and retries.
+    #[error("the dispatch could not be claimed: {0}")]
+    NotClaimed(#[from] ClaimError),
     /// The write-ahead journal refused the entry, so this job would not survive a restart.
     ///
     /// **We do not ack.** Spec §5 makes a 2xx mean *accepted* — Hull tells the user "dispatched" and
@@ -224,6 +257,19 @@ pub struct Control {
     trees: Mutex<HashMap<JobId, VerifiedTree>>,
     /// One waker per live job, so a step report wakes its driver instead of the driver polling.
     wakers: Mutex<HashMap<JobId, Arc<Notify>>>,
+    /// The drive lease for every job **this replica** is driving — the fence it presents to claim a
+    /// step (design D§4.5, [`crate::claims`]).
+    ///
+    /// Written when the claim is won in [`Control::accept`] and dropped in [`Control::retire`], which
+    /// spans exactly the window in which a step of this job may be handed to the fleet. Its presence
+    /// is also what the heartbeat runs off: no entry, no renewal, so a finished job stops paying for
+    /// a lease it no longer needs.
+    ///
+    /// A job we have a record of but **no** lease for is one another replica drives (we attached a
+    /// `callback_url` to it) or one whose verdict is already delivered. Either way nothing here may
+    /// dispatch its work, and the absence of the lease is what makes that structural rather than
+    /// remembered.
+    leases: Mutex<HashMap<JobId, DriveLease>>,
 }
 
 impl Control {
@@ -236,6 +282,7 @@ impl Control {
             queue: Mutex::new(queue),
             trees: Mutex::new(HashMap::new()),
             wakers: Mutex::new(HashMap::new()),
+            leases: Mutex::new(HashMap::new()),
         })
     }
 
@@ -258,40 +305,153 @@ impl Control {
     ///
     /// Must be called from a tokio context; the pipeline runs on a spawned task so the ack is not
     /// behind any work.
+    ///
+    /// # Which of the four things this dispatch is
+    ///
+    /// The `(repo, tree_id)` decision is [`JobClaims::admit`]'s, because it is the only one that can
+    /// be made atomically when a second replica is asking the same question at the same moment. What
+    /// this method adds is the *local* half — do we hold the record for the job the claim named? —
+    /// and the two answers multiply out to four cases:
+    ///
+    /// | claim | record here | what happens |
+    /// |---|---|---|
+    /// | created | (ours to make) | record it, journal it, drive it |
+    /// | attached | yes, live | attach the `callback_url`, re-journal, ack |
+    /// | attached | yes, decided | re-report the recorded verdict (spec §9) |
+    /// | attached | no | another replica is driving it, or its verdict outlived our record |
+    ///
+    /// The last row is the new one, and it is why the `callback_url` is attached inside the claim's
+    /// own commit rather than only on the local record: the replica that will deliver may not be the
+    /// one that took this dispatch, and a URL recorded only here would leave that change waiting
+    /// forever on an answer delivered somewhere else.
     pub fn accept(self: &Arc<Self>, dispatch: Dispatch) -> Result<Accepted, AcceptError> {
         let author_class = self.deps.membership.classify(&dispatch.repo, &dispatch.author);
         let repo = dispatch.repo.clone();
         let tree_id = dispatch.tree_id.clone();
+        let now = Instant::now();
 
-        let admit = {
-            let now = Instant::now();
-            let mut jobs = self.lock_jobs();
-            // Amortized retention: eviction pressure is applied where new work arrives, so the store
-            // is bounded without a background task to own, supervise, and shut down. Cheap — it is a
-            // scan of settled jobs under a lock we are already holding — and it runs before `admit`
-            // so a duplicate of a just-evicted tree is treated as new rather than half-found.
-            let evicted = jobs.evict(now, self.config.job_retention, self.config.max_jobs);
-            if evicted > 0 {
-                tracing::debug!(evicted, remaining = jobs.len(), "evicted settled jobs");
+        // Amortized retention: eviction pressure is applied where new work arrives, so the store is
+        // bounded without a background task to own, supervise, and shut down. Cheap — a scan of
+        // settled jobs — and it runs before the admit below so a duplicate of a just-evicted tree is
+        // treated as new rather than half-found.
+        //
+        // The claim goes with the record. A claim outliving its record would point the tree at a job
+        // this process no longer has, and the next dispatch would be acked as a duplicate of work
+        // nobody is doing — spec §10's wedge, self-inflicted.
+        let evicted = self.lock_jobs().evict(now, self.config.job_retention, self.config.max_jobs);
+        for id in &evicted {
+            self.deps.claims.forget(id);
+        }
+        if !evicted.is_empty() {
+            tracing::debug!(
+                evicted = evicted.len(),
+                remaining = self.lock_jobs().len(),
+                "evicted settled jobs"
+            );
+        }
+
+        // The proposal, not the answer: this id is used only if we win the claim. A loser is told the
+        // winner's id and never mints one of its own, or the shared index and the local record would
+        // disagree about what the job is called.
+        let proposed = new_job_id();
+        let admission = self.deps.claims.admit(
+            &TreeKey::new(repo.clone(), tree_id.clone()),
+            &proposed,
+            &dispatch.callback_url,
+            now_ms(),
+            self.config.claim_ttl.as_millis() as i64,
+            self.config.job_retention.as_millis() as i64,
+        );
+        let admission = match admission {
+            Ok(a) => a,
+            Err(e) => {
+                // No safe guess — see `AcceptError::NotClaimed`.
+                tracing::error!(
+                    %repo, %tree_id, error = %e,
+                    "refusing a dispatch we could not claim — not acking"
+                );
+                return Err(AcceptError::NotClaimed(e));
             }
-            jobs.admit(dispatch, author_class, now, self.config.timeouts.job)
         };
+        let job_id = admission.job_id().to_string();
+        let duplicate = admission.is_duplicate();
 
-        let job_id = admit.job_id().to_string();
+        /// What `accept` does after the claim has spoken. One value rather than a pile of booleans,
+        /// so the journal decision and the action decision cannot drift apart.
+        enum Next {
+            /// We won the claim and hold the only lease.
+            Drive,
+            /// A job we hold the record for, still running.
+            AttachedHere,
+            /// A job another replica holds. Nothing to start here; our `callback_url` is on the claim.
+            AttachedElsewhere,
+            /// A verdict exists and this dispatch should re-hear it.
+            ReReport,
+        }
+
+        let next = match &admission {
+            Admitted::Created { lease } => {
+                self.leases
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(job_id.clone(), lease.clone());
+                self.lock_jobs().insert(
+                    job_id.clone(),
+                    dispatch.clone(),
+                    author_class,
+                    now,
+                    self.config.timeouts.job,
+                );
+                Next::Drive
+            }
+            Admitted::Attached { owner, verdict, .. } => {
+                // The work is a duplicate; the *destination* may not be. A second change sharing this
+                // tree carries its own `callback_url` (see `Job::callback_urls`) — already recorded on
+                // the claim, and recorded here too when the record is ours, because the journal entry
+                // is built from the record.
+                let local = self.with_job_mut(&job_id, |job| {
+                    job.add_callback_url(&dispatch.callback_url);
+                    job.state.is_finished() && job.verdict.is_some()
+                });
+                match (local, verdict) {
+                    (Some(true), _) => Next::ReReport,
+                    (Some(false), _) => Next::AttachedHere,
+                    // No local record. If the claim carries a verdict we can answer this dispatch
+                    // from it without re-running a step — even though this replica never ran the job.
+                    // That is the whole point of putting the verdict on the claim.
+                    (None, Some(v)) => {
+                        self.record_foreign_verdict(&job_id, &dispatch, author_class, now, v);
+                        Next::ReReport
+                    }
+                    (None, None) => {
+                        tracing::info!(
+                            %job_id, %repo, %tree_id, %owner,
+                            "duplicate dispatch attached to a job held elsewhere"
+                        );
+                        Next::AttachedElsewhere
+                    }
+                }
+            }
+        };
 
         // ── The durable record, before the ack and before the driver (design D§4.1) ───────────────
         //
-        // Written for `Created` *and* for `Live`. `Live` is the case that is easy to skip and wrong to
-        // skip: it attached a second `callback_url` to a job we already know about, and an entry that
-        // still carried only the first URL would, after a restart, answer one dispatcher and leave the
-        // other waiting forever on a verdict delivered somewhere else. The journal has to carry the
-        // full current URL set, so the second dispatch rewrites the entry.
+        // Written for a job we drive *and* for one we hold a live record of. The second is the case
+        // that is easy to skip and wrong to skip: it attached a second `callback_url` to a job we
+        // already know about, and an entry that still carried only the first URL would, after a
+        // restart, answer one dispatcher and leave the other waiting forever on a verdict delivered
+        // somewhere else. The journal carries the full current URL set, so the second dispatch
+        // rewrites the entry.
         //
-        // `Finished` needs no entry: it re-reports a verdict that is already in memory, and either the
-        // job's own entry is still outstanding (delivery has not been confirmed, so the debt is
-        // already recorded) or it was forgotten because the verdict reached Hull. Recording a fresh
-        // one would resurrect a paid debt as an unpaid one.
-        if !matches!(admit, Admit::Finished { .. }) {
+        // Not written for a re-report: that verdict is already in memory, and either the job's own
+        // entry is still outstanding (delivery unconfirmed, so the debt is already recorded) or it was
+        // forgotten because the verdict reached Hull. A fresh entry would resurrect a paid debt.
+        //
+        // Not written for a job held elsewhere either, and that one is new. The debt belongs to the
+        // replica driving it; an entry here would make *our* next start report `errored` for a job
+        // that replica may have answered perfectly well — a fabricated verdict for a tree Hull
+        // memoizes (spec §7), which is the one failure the journal exists to avoid.
+        if matches!(next, Next::Drive | Next::AttachedHere) {
             if let Err(e) = self.journal_record(&job_id, None) {
                 // Not acked. See `AcceptError::NotDurable`: an ack Hull believes for a job we can lose
                 // wedges the tree until a human forces a rerun, which is strictly worse than a visible
@@ -300,25 +460,27 @@ impl Control {
                     %job_id, %repo, %tree_id, error = %e,
                     "refusing a dispatch we could not record durably — not acking"
                 );
-                if matches!(admit, Admit::Created { .. }) {
-                    // Undo the admission. The driver was never spawned, so nothing is running; leaving
-                    // the record would hold the `(repo, tree_id)` index against a job nobody will ever
-                    // answer, and the dispatcher's retry would come back as `Admit::Live` on it — an
-                    // ack for work that is not happening, which is the exact outcome the refusal
-                    // exists to prevent.
+                if matches!(next, Next::Drive) {
+                    // Undo the admission, **claim included**. The driver was never spawned, so nothing
+                    // is running; leaving the claim would hold the `(repo, tree_id)` index against a
+                    // job nobody will ever answer, and the dispatcher's retry would come back attached
+                    // to it — an ack for work that is not happening, which is the exact outcome the
+                    // refusal exists to prevent.
                     //
-                    // An `Admit::Live` failure is deliberately *not* rolled back: that job belongs to
-                    // an earlier dispatch that was recorded and is running, and tearing it down
-                    // because a later duplicate could not be journaled would turn one unacked dispatch
-                    // into two lost ones.
+                    // An attach failure is deliberately *not* rolled back: that job belongs to an
+                    // earlier dispatch that was recorded and is running, and tearing it down because a
+                    // later duplicate could not be journaled would turn one unacked dispatch into two
+                    // lost ones.
                     self.lock_jobs().remove(&job_id);
+                    self.leases.lock().unwrap_or_else(|e| e.into_inner()).remove(&job_id);
+                    self.deps.claims.forget(&job_id);
                 }
                 return Err(AcceptError::NotDurable(e));
             }
         }
 
-        match &admit {
-            Admit::Created { .. } => {
+        match next {
+            Next::Drive => {
                 self.wakers
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
@@ -328,10 +490,13 @@ impl Control {
                 let id = job_id.clone();
                 tokio::spawn(async move { drive(ctrl, id).await });
             }
-            Admit::Live { .. } => {
+            Next::AttachedHere => {
                 tracing::info!(%job_id, %repo, %tree_id, "duplicate dispatch attached to live job");
             }
-            Admit::Finished { .. } => {
+            // Logged where the case was decided, with the owner in hand. Nothing to start: the
+            // replica driving it re-reads the claim's destinations before it finishes.
+            Next::AttachedElsewhere => {}
+            Next::ReReport => {
                 // Cheap, and it heals a lost callback (design D§4.1).
                 //
                 // Behind the claim like every other sender. Losing it means a delivery for this job
@@ -358,7 +523,45 @@ impl Control {
         // own, supervise and shut down. Spawns; never waits (see `drain_undelivered`).
         self.drain_undelivered(&job_id);
 
-        Ok(Accepted { job_id, duplicate: admit.is_duplicate() })
+        Ok(Accepted { job_id, duplicate })
+    }
+
+    /// Record, locally, a verdict some **other** replica computed, so this process's callback sender
+    /// has something to deliver from.
+    ///
+    /// The job never ran here: there are no steps, no tree, and no driver, and the record exists only
+    /// to carry the verdict and the destination set into [`Control::report`]. It settles immediately
+    /// so retention treats it like any other finished job.
+    ///
+    /// Why a record at all, rather than delivering straight from the claim: everything about delivery
+    /// — the single-sender claim, the retry budget, the `ReportFailed` parking, the operator's view of
+    /// a stuck send — hangs off the job record. A second delivery path that skipped it would be a
+    /// second set of those rules, and the two would drift.
+    ///
+    /// The fields are assigned rather than transitioned through `queued → … → green`, because there
+    /// is no history here to replay; inventing one would put states in the operator panel that never
+    /// happened on this replica.
+    fn record_foreign_verdict(
+        &self,
+        job_id: &str,
+        dispatch: &Dispatch,
+        author_class: AuthorClass,
+        now: Instant,
+        verdict: &Verdict,
+    ) {
+        let mut jobs = self.lock_jobs();
+        let job = jobs.insert(
+            job_id.to_string(),
+            dispatch.clone(),
+            author_class,
+            now,
+            self.config.timeouts.job,
+        );
+        job.state = JobState::from_status(verdict.status);
+        job.verdict = Some(verdict.clone());
+        // Without this the record is "live" as far as eviction is concerned and would never be
+        // reclaimed — a replica that only ever answers other replicas' duplicates would grow forever.
+        job.settled_at = Some(now);
     }
 
     /// Hand a few verdicts Hull never received back to the callback sender.
@@ -620,6 +823,16 @@ impl Control {
     fn lock_jobs(&self) -> std::sync::MutexGuard<'_, JobStore> {
         // A panic in one job's bookkeeping must not take the whole runner's state down with it.
         self.jobs.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// This replica's drive lease for `job_id`, or `None` if it does not hold one.
+    ///
+    /// `None` is a complete answer, not a missing one: it means nothing about this job may be
+    /// dispatched from here. See the [`leases`](Control::leases) field.
+    ///
+    /// [`Control::leases`]: Control
+    fn lease(&self, job_id: &str) -> Option<DriveLease> {
+        self.leases.lock().unwrap_or_else(|e| e.into_inner()).get(job_id).cloned()
     }
 
     fn waker(&self, job_id: &str) -> Arc<Notify> {
@@ -938,9 +1151,77 @@ impl Control {
                 self.lock_queue().release(&grant.job_id, &grant.step_id, now);
                 continue;
             };
+            // **The step claim, immediately before the only call that can start work.**
+            //
+            // This is the second thing M5 shares (design D§4.5, [`crate::claims`]). Everything above
+            // — the graph, the fold, the fair queue — is this replica's private opinion about what
+            // should run; two replicas can hold the same opinion at the same instant and neither
+            // would know. The claim is where exactly one of them is told to go ahead.
+            //
+            // Held *across* `assign`, not taken after it. Taken after, the window between the two
+            // calls is precisely the window in which the other replica also assigns.
+            let Some(lease) = self.lease(&grant.job_id) else {
+                // No lease means this replica is not the driver of that job — it holds the record
+                // only because it attached a duplicate, or the job has already retired. Either way
+                // its steps are not ours to dispatch.
+                self.lock_queue().release(&grant.job_id, &grant.step_id, now);
+                continue;
+            };
+            match self.deps.claims.claim_step(&lease, &grant.step_id, now_ms()) {
+                Ok(StepClaim::Granted) => {}
+                Ok(StepClaim::Taken { by }) => {
+                    tracing::info!(
+                        job_id = %grant.job_id, step_id = %grant.step_id, %by,
+                        "another replica is already running this step — not dispatching it again"
+                    );
+                    self.lock_queue().release(&grant.job_id, &grant.step_id, now);
+                    continue;
+                }
+                Ok(StepClaim::Fenced { held_by }) => {
+                    // We were declared dead and someone took the job over. Stop driving it here —
+                    // *before* the fleet is called, which is what makes a resurrected replica unable
+                    // to run a second copy of anything (see `DriveLease`).
+                    tracing::error!(
+                        alert = true, job_id = %grant.job_id, step_id = %grant.step_id, %held_by,
+                        "our claim on this job was taken over; abandoning it rather than dispatching"
+                    );
+                    self.leases.lock().unwrap_or_else(|e| e.into_inner()).remove(&grant.job_id);
+                    self.lock_queue().release(&grant.job_id, &grant.step_id, now);
+                    continue;
+                }
+                Err(e) => {
+                    // **Fail closed.** A claim we could not take is not a claim we do not need: the
+                    // step may already be running elsewhere. Requeued rather than errored, so the
+                    // step keeps its place and only the queue-wait clock can turn the outage into a
+                    // verdict (design D§4.5).
+                    tracing::error!(
+                        job_id = %grant.job_id, step_id = %grant.step_id, error = %e,
+                        "could not claim this step; leaving it queued rather than risking a second run"
+                    );
+                    self.lock_queue().requeue(
+                        &grant.job_id,
+                        &grant.step_id,
+                        &assignment.step_name,
+                        now,
+                    );
+                    continue;
+                }
+            }
             // Outside the store lock: the fleet is somebody else's process, and blocking every
             // job's bookkeeping on it would be a self-inflicted outage.
             let result = self.deps.node.assign(&assignment, &tree);
+            if matches!(result, Err(NodeError::NoCapacity)) {
+                // The step never went out, so its claim must go back: it will be granted again on a
+                // later pass, and a claim held for a step nobody dispatched would mean it never runs.
+                // Every other outcome — leased, or rejected and errored — keeps the claim forever,
+                // which is what stops a second dispatch of work that did reach a node.
+                if let Err(e) = self.deps.claims.release_step(&lease, &grant.step_id) {
+                    tracing::warn!(
+                        job_id = %grant.job_id, step_id = %grant.step_id, error = %e,
+                        "could not release the claim on a step the fleet had no room for"
+                    );
+                }
+            }
             let moved = self.settle_assignment(&grant, &assignment, result);
             if !moved {
                 continue;
@@ -1062,6 +1343,15 @@ impl Control {
         // holds its own clone of the tree, because `NodeSink::assign` runs the placement on a task
         // that outlives this call.
         self.trees.lock().unwrap_or_else(|e| e.into_inner()).remove(job_id);
+        // And the drive lease, which stops the heartbeat and makes any further step dispatch for this
+        // job impossible from here. Safe at exactly this point and no earlier: `pump` needs the lease
+        // to claim a step, and the driver has finished, so no further step will be granted.
+        //
+        // The **claim itself stays**, carrying the verdict (see `finish`). It is what lets a duplicate
+        // dispatch arriving at any replica be answered without re-running the work, and it is dropped
+        // by the retention sweep like the record it belongs to. Dropping it here would make the very
+        // next duplicate re-run a job we had just finished.
+        self.leases.lock().unwrap_or_else(|e| e.into_inner()).remove(job_id);
         self.lock_queue().forget_job(job_id, now);
         self.pump(None);
     }
@@ -1161,6 +1451,30 @@ impl Control {
             // sends `errored` for a job that had a real verdict — bad, but strictly better than
             // sending nothing at all.
             let decided = self.with_job(job_id, |job| job.verdict.clone()).flatten();
+
+            // **Publish the verdict onto the shared claim, before retiring and before delivery.**
+            //
+            // This is what makes spec §9's "a duplicate simply re-affirms the same verdict" true
+            // across replicas rather than only within one: a duplicate dispatch arriving at a replica
+            // that never ran this job finds the answer on the claim and re-reports it, instead of
+            // re-running every step of a tree that has already been decided.
+            //
+            // It also closes the takeover window: a claim carrying a verdict is never adopted, so the
+            // job cannot be handed to another replica while this one is still delivering — which is
+            // why it goes before `retire` drops our lease rather than after.
+            //
+            // A failure is logged, not fatal, exactly as the journal write below is: we hold the
+            // verdict and are about to deliver it. The cost of a lost publish is that a duplicate
+            // re-runs the tree — a wasted run, never a wrong answer.
+            if let (Some(lease), Some(v)) = (self.lease(job_id), decided.as_ref()) {
+                if let Err(e) = self.deps.claims.settle(&lease, v, now_ms()) {
+                    tracing::error!(
+                        %job_id, error = %e,
+                        "could not publish the verdict to the shared claim; a duplicate dispatch will re-run this tree"
+                    );
+                }
+            }
+
             if let Err(e) = self.journal_record(job_id, decided) {
                 tracing::error!(
                     %job_id, error = %e,
@@ -1219,6 +1533,32 @@ impl Control {
         // answer delivered somewhere else — a change that hangs unverified, which is the same wedge
         // one level down. Terminates: the URL set is finite and de-duplicated.
         loop {
+            // **The destinations another replica attached.** Work is deduplicated by `(repo,
+            // tree_id)` and delivery is not, so a duplicate dispatch that landed on a *different*
+            // replica put its `callback_url` on the claim and nowhere else. Reading only the local
+            // record would leave that change waiting forever on an answer delivered somewhere else —
+            // the same wedge as dropping a URL, one process over.
+            //
+            // Merged into the record rather than used directly, so everything downstream — the
+            // de-duplication, the journal entry, the operator's view — still has one destination set
+            // to look at. With the process-local claim store this is the set the record already has,
+            // so a single-replica deployment merges nothing and behaves identically.
+            match self.deps.claims.destinations(job_id) {
+                Ok(urls) => {
+                    self.with_job_mut(job_id, |job| {
+                        for url in &urls {
+                            job.add_callback_url(url);
+                        }
+                    });
+                }
+                // Not fatal: we still hold the local set, and delivering to the destinations we know
+                // about beats delivering to none because a lookup failed.
+                Err(e) => tracing::warn!(
+                    %job_id, error = %e,
+                    "could not read the shared destination set; delivering to the ones recorded here"
+                ),
+            }
+
             let Some(Some(reqs)) = self.with_job(job_id, |job| {
                 job.verdict.clone().map(|verdict| {
                     job.callback_urls
@@ -1315,6 +1655,15 @@ impl Control {
 async fn drive(ctrl: Arc<Control>, job_id: JobId) {
     let Some(dispatch) = ctrl.with_job(&job_id, |j| j.dispatch.clone()) else { return };
 
+    // Keep the drive lease alive for as long as this driver runs — and only a shared claim store
+    // needs it (see `JobClaims::needs_renewal`), so a single-process deployment spawns nothing extra
+    // and keeps exactly the task graph it had.
+    if ctrl.deps.claims.needs_renewal() {
+        let ctrl = Arc::clone(&ctrl);
+        let id = job_id.clone();
+        tokio::spawn(async move { heartbeat(ctrl, id).await });
+    }
+
     // The broker's answer is the thread the rest of the pipeline hangs from: the planner reads the
     // tree at this path and the fleet materializes a workspace from it (design D§4.4, D§6.2).
     let tree = match ctrl.phase_fetch(&job_id, &dispatch).await {
@@ -1335,6 +1684,42 @@ async fn drive(ctrl: Arc<Control>, job_id: JobId) {
     // However the run ended — verdict, timeout, or a job that vanished under us — the quota it was
     // holding belongs to its tenant again, and to whoever the fair order says is next.
     ctrl.retire(&job_id);
+}
+
+/// Renew this replica's drive lease while it drives a job — design D§4.5, [`crate::claims`].
+///
+/// It exists to answer a liveness problem, not a correctness one. Correctness is the fence: a replica
+/// whose lease lapsed cannot dispatch a step even if it wakes up believing it still owns the job
+/// ([`StepClaim::Fenced`]). What a lapse would cost without a heartbeat is the *job* — a long fetch
+/// or a slow step would let another replica adopt a tree that is being worked on perfectly well, and
+/// the work so far would be thrown away.
+///
+/// Ends when the lease does. [`Control::retire`] removes it, so nothing has to be told to stop and a
+/// finished job stops paying for renewals immediately.
+async fn heartbeat(ctrl: Arc<Control>, job_id: JobId) {
+    let ttl = ctrl.config.claim_ttl;
+    let every = renew_every(ttl);
+    loop {
+        tokio::time::sleep(every).await;
+        let Some(lease) = ctrl.lease(&job_id) else { return };
+        match ctrl.deps.claims.renew(&lease, now_ms(), ttl.as_millis() as i64) {
+            Ok(true) => {}
+            Ok(false) => {
+                // Fenced: another replica holds this job. Give up the lease here so `pump` stops
+                // trying, and say so loudly — the work this driver is doing is now somebody else's.
+                tracing::error!(
+                    alert = true, %job_id,
+                    "lost this job's claim to another replica; this driver's work will be discarded"
+                );
+                ctrl.leases.lock().unwrap_or_else(|e| e.into_inner()).remove(&job_id);
+                return;
+            }
+            // Keep trying. One failed renewal is not a lost lease — that is why the interval is a
+            // third of the TTL — and giving the job up on the first blip would make an outage of the
+            // claim store into a cancelled build.
+            Err(e) => tracing::warn!(%job_id, error = %e, "could not renew this job's claim"),
+        }
+    }
 }
 
 /// The `log_key` we are willing to remember for a step, from the one a node reported.

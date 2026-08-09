@@ -41,8 +41,13 @@
 //!
 //! # What M1 does not do
 //!
-//! No pipeline file (M2), no step memo or cache (M4), no fair-share queue, no Postgres — the job store
-//! is in memory. And one node: [`node::InProcessFleet`] runs assignments here, in this process.
+//! No pipeline file (M2), no step memo or cache (M4), no fair-share queue. And one node:
+//! [`node::InProcessFleet`] runs assignments here, in this process.
+//!
+//! Postgres is now optional rather than absent, and only for the two things a second replica cannot
+//! decide alone — the `(repo, tree_id)` claim and the step claim ([`claims`], M5 phase 1). The job
+//! record itself is still this process's. Off unless `HULL_CI_POSTGRES_URL` says otherwise, and the
+//! default build does not link a driver.
 //!
 //! What a restart forgets is now a **choice**, not a fact. The line above used to end "…and a restart
 //! forgets in-flight jobs, which is survivable because Hull re-dispatches a tree with no verdict",
@@ -52,6 +57,7 @@
 //! off by default for compatibility, and drained at startup by [`journal::recover`] when it is on.
 
 pub mod admin;
+pub mod claims;
 pub mod config;
 pub mod fetch;
 pub mod journal;
@@ -106,6 +112,14 @@ pub enum StartupError {
     /// lose a feature, it loses jobs.
     #[error("could not open the write-ahead journal: {0}")]
     Journal(#[from] hull_ci_control::JournalError),
+    /// The shared claim store was asked for and could not be had — see [`claims::assemble`].
+    ///
+    /// The refusal *is* the feature. Every other way of handling a misconfigured claim store ends
+    /// with two replicas that each believe they are the only one: every tree dispatched twice, every
+    /// step run twice, two verdicts racing to one `callback_url`, and nothing in the logs to say so.
+    /// A runner that will not start is loud, immediate, and fixable.
+    #[error("could not set up the shared claim store: {0}")]
+    Claims(String),
     #[error("could not bind {addr}: {source}")]
     Bind { addr: std::net::SocketAddr, source: std::io::Error },
     #[error("server failed: {0}")]
@@ -253,6 +267,9 @@ pub async fn assemble(config: &Config) -> Result<Runner, StartupError> {
         transport: Arc::clone(&transport),
         membership: Arc::new(config.trusted.clone()),
         journal: Arc::clone(&journal),
+        // The `(repo, tree_id)` index and the step claims — process-local unless this deployment has
+        // told us there is a second replica (design D§4.5, [`claims`]).
+        claims: claims::assemble(config)?,
     };
 
     // **Answer last run's debts before taking this run's work.** Spec §10: Hull does not poll us and
@@ -970,6 +987,7 @@ mod concurrency_tests {
             node,
             transport: Arc::new(SilentTransport),
             membership: Arc::new(Everyone),
+            claims: Arc::new(hull_ci_control::LocalClaims::new()),
             journal: Arc::new(hull_ci_control::NoJournal),
         };
         Control::new(config, deps)

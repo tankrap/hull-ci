@@ -24,12 +24,17 @@
 //!
 //! ## What M1 is, and is not
 //!
-//! The job store is in memory: one replica, no Postgres (design D§13 — M1 is a single-tenant bring-up
-//! scaffold). The idempotency decision has the same shape it will have against `INSERT … ON CONFLICT
-//! DO NOTHING`, so moving it later does not move any logic. What must **not** be only in memory is the
-//! promise that every accepted dispatch is answered — spec §10 leaves both the timeout and the
-//! recovery to us, and an unanswered job wedges its tree — so that promise has a durable record of its
-//! own behind the [`journal`] seam. Steps are scheduled as a DAG ([`graph`],
+//! The job **record** is in memory, and stays there: it is written by exactly one replica, through
+//! ~39 read-modify-write call sites in [`control`] that a remote store could not serve without every
+//! one of them first becoming a committable operation (see [`store`]). What is *not* in memory any
+//! more is the `(repo, tree_id)` index and the step claims — the two decisions two replicas genuinely
+//! contend over — which moved behind the [`claims`] seam and are decided by an atomic
+//! insert-or-attach. The default implementation is still process-local, so a single-replica
+//! deployment behaves exactly as it did.
+//!
+//! What must **not** be only in memory is the promise that every accepted dispatch is answered — spec
+//! §10 leaves both the timeout and the recovery to us, and an unanswered job wedges its tree — so that
+//! promise has a durable record of its own behind the [`journal`] seam. Steps are scheduled as a DAG ([`graph`],
 //! design D§6.5); which of the ready ones actually goes out, and in what order, is the multi-tenant
 //! scheduler's answer ([`fairshare`], design D§4.5). There is still no step memo.
 //!
@@ -43,12 +48,13 @@
 //! | POSTs to the exact `callback_url`, echoing the secret | [`callback`] |
 //! | `errored`, not `red`, for infrastructure failures | [`aggregate`], [`timeouts`] |
 //! | Ignores unknown dispatch fields | `hull_ci_proto::Dispatch` |
-//! | Safe under duplicate dispatch and duplicate callback | [`store`], [`callback`] |
+//! | Safe under duplicate dispatch and duplicate callback | [`claims`], [`callback`] |
 //! | Enforces its own job timeout and answers every accepted dispatch (§10) | [`timeouts`], [`journal`] |
 
 pub mod aggregate;
 pub mod auth;
 pub mod callback;
+pub mod claims;
 pub mod control;
 pub mod fairshare;
 pub mod graph;
@@ -69,6 +75,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
+pub use claims::{Admitted, ClaimError, DriveLease, JobClaims, LocalClaims, StepClaim, TreeKey};
 pub use control::{Accepted, AcceptError, Control, ControlConfig, Deps, ReportRejected};
 pub use fairshare::{Admission, Depth, FairShare, Prioritizer, Priority, TenantPlan};
 pub use journal::{JobIntent, Journal, JournalError, NoJournal};
@@ -108,6 +115,12 @@ impl Default for Deps {
             // for a journal would be an outage introduced by a feature nobody enabled — see
             // [`journal::NoJournal`].
             journal: Arc::new(journal::NoJournal),
+            // The other default that is not a loud failure, and for a stronger reason than the
+            // journal's: this *is* the behaviour, not a stand-in for it. The process-local claim
+            // store is the `(repo, tree_id)` index the job store used to own, moved out so it has one
+            // owner. A single-replica deployment that never configures a shared one is not degraded —
+            // it is exactly where it was (see [`claims::LocalClaims`]).
+            claims: Arc::new(claims::LocalClaims::new()),
         }
     }
 }

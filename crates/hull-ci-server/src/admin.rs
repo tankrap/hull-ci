@@ -592,6 +592,7 @@ mod tests {
             membership: Arc::new(Everyone),
             // The panel is a reader; durability is not what these tests are about.
             journal: Arc::new(hull_ci_control::NoJournal),
+            claims: Arc::new(hull_ci_control::LocalClaims::new()),
         };
         (dir, Control::new(config, deps))
     }
