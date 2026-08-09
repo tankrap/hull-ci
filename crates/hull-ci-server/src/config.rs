@@ -27,6 +27,8 @@
 //! | `HULL_CI_RECLAIM_RETENTION_DAYS` | `14` | how long a stored tree survives after its last *use*. Longer keeps more cache hits and more disk |
 //! | `HULL_CI_POOL_DEPTH` | `0` (off) | warm sandboxes kept **per hot configuration** (design D§6.4, [`hull_ci_node::pool`]). Pre-boot, not reuse: a member has never run a job, is handed to exactly one, and is destroyed afterwards (§14.1) |
 //! | `HULL_CI_POOL_TOTAL` | `8` | warm sandboxes kept across **all** configurations. The other half of the bound |
+//! | `HULL_CI_POSTGRES_URL` | *none* | the **shared claim store** two or more replicas contend on ([`crate::claims`]). Needs a binary built with `--features postgres`, and `HULL_CI_REPLICA_ID`; without either the runner refuses to start rather than becoming a second replica that believes it is alone |
+//! | `HULL_CI_REPLICA_ID` | *none* | this replica's identity on every claim it holds. **No default**: two replicas sharing an id would take each other's leases |
 //!
 //! `HULL_CI_SECRET` deserves its own note: spec §8 makes configuring one a SHOULD, and this process
 //! treats a missing one as a loud warning rather than a refusal, because a loopback bring-up run
@@ -235,6 +237,24 @@ pub struct Config {
     /// The second half of "bounded". [`Self::pool_depth`] alone bounds one configuration, and a node
     /// that sees several images would otherwise hold `depth × images` idle containers.
     pub pool_total: usize,
+    /// Where the **shared claim store** lives, if this deployment has more than one replica
+    /// ([`hull_ci_control::claims`], design D§4.5).
+    ///
+    /// `None` — the default — keeps the process-local `(repo, tree_id)` index the job store has
+    /// always used. That is not a degraded mode; it is the single-replica behaviour, unchanged.
+    ///
+    /// Setting it is the operator saying "there is more than one of me", and it is checked hard at
+    /// startup: without the `postgres` feature, and without [`Self::replica_id`], the runner refuses
+    /// to start rather than becoming a second replica that believes it is alone. See
+    /// [`crate::claims::assemble`].
+    pub postgres_url: Option<String>,
+    /// This replica's identity, as recorded on every claim it holds.
+    ///
+    /// Required exactly when [`Self::postgres_url`] is set, and with no default on purpose. Two
+    /// replicas sharing an id could renew each other's leases and release each other's step claims —
+    /// a split brain that looks like correct bookkeeping — and there is no value this process can
+    /// derive that is guaranteed distinct from another container's.
+    pub replica_id: Option<String>,
 }
 
 impl Default for Config {
@@ -285,6 +305,11 @@ impl Default for Config {
             // Off. Idle containers cost memory whether or not a job ever arrives; see the field.
             pool_depth: 0,
             pool_total: 8,
+            // Off: one replica, and the `(repo, tree_id)` index in this process's memory — exactly
+            // what this runner has always done. Scale-out is opt-in and it has prerequisites; see
+            // `crate::claims::assemble`.
+            postgres_url: None,
+            replica_id: None,
         }
     }
 }
@@ -350,6 +375,8 @@ impl Config {
             reclaim_retention: reclaim_retention(var("HULL_CI_RECLAIM_RETENTION_DAYS").as_deref())?,
             pool_depth: whole_number("HULL_CI_POOL_DEPTH", var("HULL_CI_POOL_DEPTH").as_deref(), d.pool_depth)?,
             pool_total: whole_number("HULL_CI_POOL_TOTAL", var("HULL_CI_POOL_TOTAL").as_deref(), d.pool_total)?,
+            postgres_url: var("HULL_CI_POSTGRES_URL"),
+            replica_id: var("HULL_CI_REPLICA_ID"),
         })
     }
 }

@@ -465,6 +465,9 @@ pub fn harness_full(
         transport: transport.clone(),
         membership: std::sync::Arc::new(AlwaysMember),
         journal,
+        // The process-local index, which is what every one of these tests was already exercising when
+        // it lived inside the job store.
+        claims: std::sync::Arc::new(crate::claims::LocalClaims::new()),
     };
     Harness { control: Control::new(config, deps), transport, node }
 }

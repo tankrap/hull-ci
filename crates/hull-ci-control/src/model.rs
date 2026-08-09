@@ -478,8 +478,12 @@ impl Job {
     }
 
     /// The idempotency key of spec §9 / design D§4.1: `(repo, tree_id)`.
-    pub fn key(&self) -> (String, String) {
-        (self.dispatch.repo.clone(), self.dispatch.tree_id.clone())
+    ///
+    /// Returns the [`TreeKey`](crate::claims::TreeKey) the claim store is keyed by rather than a bare
+    /// pair, so there is one type for this concept: the key crosses a process boundary now, and a
+    /// tuple that happened to be in the right order was fine while it never left this struct.
+    pub fn key(&self) -> crate::claims::TreeKey {
+        crate::claims::TreeKey::new(self.dispatch.repo.clone(), self.dispatch.tree_id.clone())
     }
 
     pub fn transition(&mut self, next: JobState) -> Result<(), StateError> {

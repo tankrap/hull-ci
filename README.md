@@ -147,15 +147,28 @@ admin grant rather than a string a pipeline can claim.
   its configured memory whether or not a job ever arrives.
   Still to come: affinity scheduling.
 - **M5 — scale-out.** Multi-replica control, autoscaling with cache-aware drain, sharding by history.
-  Mostly not here, and **state is still in memory**, which is why there is no horizontal scaling: the
-  fair-share clocks and the job store are process-local. What *is* here is the part a restart made
-  unsafe rather than merely slow. Every accepted dispatch is written to a durable outbox before it is
-  acked, because the thing that has to survive is the **obligation to answer**, not the work. A
-  forgotten job is not a lost job; it is a tree Hull holds in-flight forever, since spec §10 has Hull
-  neither polling nor timing out, and clearing that mark only on a callback. Reporting *something*
-  unwedges it, so the outbox drains from both ends — at startup, and again whenever a later dispatch
-  arrives — re-sending a recorded verdict when there is one and `errored` when there is not. On by
-  default; `HULL_CI_JOURNAL=off` turns it off.
+  Two pieces are here. The first is the part a restart made unsafe rather than merely slow: every
+  accepted dispatch is written to a durable outbox before it is acked, because the thing that has to
+  survive is the **obligation to answer**, not the work. A forgotten job is not a lost job; it is a
+  tree Hull holds in-flight forever, since spec §10 has Hull neither polling nor timing out, and
+  clearing that mark only on a callback. Reporting *something* unwedges it, so the outbox drains from
+  both ends — at startup, and again whenever a later dispatch arrives — re-sending a recorded verdict
+  when there is one and `errored` when there is not. On by default; `HULL_CI_JOURNAL=off` turns it off.
+
+  The second is the **shared claim**, and it is deliberately narrower than "the job store on
+  Postgres". Only two decisions genuinely cannot be made in one process's memory: *one tree, one job*
+  (spec §9's `(repo, tree_id)` idempotency) and *one replica, one step* (nothing may run twice). Both
+  are now single `INSERT … ON CONFLICT` statements against a shared table, with a fence that stops a
+  superseded replica dispatching anything, and every dispatcher's `callback_url` recorded on the claim
+  itself — so two replicas produce one job and *both* callers still get the verdict, from whichever
+  replica computed it. The job **record** stays process-local on purpose: `Control` mutates it through
+  ~39 read-modify-write call sites, and a trait handing out `&mut Job` over a network is a lost update
+  wearing a seam's clothes. Off by default and the default build needs no database
+  (`HULL_CI_POSTGRES_URL` + `HULL_CI_REPLICA_ID`, `--features postgres`); setting the URL without
+  either prerequisite refuses to start rather than quietly running as a replica that thinks it is
+  alone. **What still prevents a second replica:** the fair-share clocks are per replica, so two are
+  fair each but not fair together; a dead replica's tree is released after one lease TTL but only when
+  the next dispatch arrives, and nothing re-runs its work; and the outbox is still per-replica disk.
 
 The ordering is deliberate: multi-tenancy is the product, so isolation precedes the performance
 layer rather than following it.

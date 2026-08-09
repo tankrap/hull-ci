@@ -11,6 +11,16 @@ repository.workspace = true
 # crate is a real condition: without it the cfg silently never matches and the KMS arm is dead code
 # that looks wired — the "compiles, is tested, and is unreachable" failure this repo has hit before.
 infisical = ["hull-ci-secrets/infisical"]
+# The shared claim store two or more replicas contend on (design D§4.5, [`crate::claims`]). **Off by
+# default**, so the ordinary build needs no database and no driver: a single-replica runner keeps the
+# process-local `(repo, tree_id)` index it has always had.
+#
+# Declared here for exactly the reason `infisical` is. `HULL_CI_POSTGRES_URL` is recognised in *every*
+# build, and a binary without this feature must refuse to start rather than fall back to the local
+# index — a fallback would give an operator two replicas that each believe they are alone, which is
+# the failure this whole module exists to prevent. The cfg has to be a real condition for that refusal
+# to be reachable.
+postgres = ["dep:tokio-postgres"]
 
 [dependencies]
 hull-ci-proto = { path = "../hull-ci-proto" }
@@ -40,6 +50,11 @@ axum.workspace = true
 # the raw `reflink` call is used — the fallback to a byte copy is ours, in `workspace.rs`, so that no
 # clone failure can be fatal and the reason for one is recorded rather than swallowed.
 reflink-copy = "0.1.30"
+# The driver behind the `postgres` feature. Optional, so the default build neither compiles nor links
+# it. `NoTls` only: this connection carries no dispatch payload — a claim row holds ids, a URL set and
+# a verdict — and a deployment that needs the wire encrypted terminates TLS at the database's own
+# proxy, which is where its certificates already live.
+tokio-postgres = { version = "0.7", optional = true }
 
 [dev-dependencies]
 tempfile.workspace = true

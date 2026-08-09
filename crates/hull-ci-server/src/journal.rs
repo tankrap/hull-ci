@@ -669,6 +669,7 @@ mod tests {
                 node: Arc::new(StubNode),
                 transport,
                 membership: Arc::new(Everyone),
+                claims: Arc::new(hull_ci_control::LocalClaims::new()),
                 journal,
             };
             Control::new(

@@ -272,6 +272,7 @@ mod tests {
                     node: node.clone(),
                     transport: Arc::new(SilentTransport),
                     membership: Arc::new(Everyone),
+                    claims: Arc::new(hull_ci_control::LocalClaims::new()),
                     journal: Arc::new(hull_ci_control::NoJournal),
                 },
             );
